@@ -1,0 +1,36 @@
+{
+  "best_params": {
+    "lr": 6.839647835588333e-05,
+    "weight_decay": 0.00010979214543158697,
+    "n_iters": 7,
+    "n_node_features": 128,
+    "n_edge_features": 384,
+    "msg_net_size": 96,
+    "msg_net_dropout_p": 0.04561710273200902,
+    "gru_dropout_p": 0.08904846656472562,
+    "mamba_d_model": 192,
+    "mamba_d_state": 64,
+    "mamba_d_conv": 2,
+    "mamba_expand": 3,
+    "attention_mechanism": "channel_attention",
+    "lr_schedule": "constant",
+    "warmup_steps": 28,
+    "label_smoothing": 0.14171954912203874,
+    "gradient_clip": 4.039566817780428,
+    "residual_connections": 1,
+    "noise_injection": 0.005446402602129624,
+    "accumulation_steps": 1,
+    "mamba_layers": 1,
+    "se_reduction": 4
+  },
+  "training_results": {
+    "Optimized MGHD": {
+      "final_ler": 0.1
+    },
+    "Baseline MGHD": {
+      "final_ler": 0.1452
+    }
+  },
+  "strategy": "advanced",
+  "n_trials": 10
+}
