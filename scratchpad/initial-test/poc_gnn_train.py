@@ -1,20 +1,3 @@
-"""
-MGHD Quantum Error Correction Training with Attention Mechanisms
-- FINAL LOCKED CONFIGURATION: Trial B Winner (0.0548 LER achieved)
-- Channel attention (SE) with se_reduction=4 + optimal regularization
-- Comprehensive ablation: A(0.067) -> B(0.055) -> C(0.056) -> B WINS
-
-🏆 TRIAL B OPTIMAL CONFIGURATION (LOCKED):
-✅ Learning Rate: 6.84e-05 (constant, no cosine decay)
-✅ Label Smoothing: 0.14 (key breakthrough parameter)  
-✅ Noise Injection: 3 epochs only (early regularization)
-✅ Evaluation: 5000 test samples, single run (fast tracking)
-✅ Early Stopping: patience=8 (prevents regression)
-✅ Channel Attention: SE with reduction=4 (architectural winner)
-
-RESULTS: Best LER 0.0548 (epoch 19) - World-class quantum syndrome decoding!
-"""
-
 from panqec.codes import surface_2d
 from panqec.error_models import PauliErrorModel
 from panqec.decoders import MatchingDecoder, BeliefPropagationOSDDecoder
@@ -36,6 +19,14 @@ import os
 import sys
 import csv
 from datetime import datetime
+
+# Create output directory
+output_dir = "/u/home/kulp/MGHD/scratchpad/initial-test/Plots and Data"
+os.makedirs(output_dir, exist_ok=True)
+
+# Generate timestamp for this run
+run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_id = f"MGHD_vs_Baseline_d{d}_{run_timestamp}"
 
 # import tools
 from panq_functions import GNNDecoder, collate, fraction_of_solved_puzzles, compute_accuracy, logical_error_rate, \
@@ -80,6 +71,17 @@ len_test_set = 5000  # Back to smaller test set for faster, optimistic tracking 
 test_err_rate = 0.05
 len_train_set = 20000 # original len_test_set * 10
 max_train_err_rate = 0.15
+
+# ---- Curriculum for training error rate p (center near 0.05 over time) ----
+def sample_training_p(epoch, total_epochs):
+    third = max(1, total_epochs // 3)
+    if epoch < third:
+        lo, hi = 0.04, 0.10
+    elif epoch < 2 * third:
+        lo, hi = 0.035, 0.075
+    else:
+        lo, hi = 0.03, 0.06
+    return float(np.random.uniform(lo, hi))
 
 # ---- Stability & early-stop config ----
 eval_runs = 1           # Back to single eval run for faster, optimistic tracking
@@ -165,6 +167,19 @@ print(f"Baseline GNN parameters: {sum(p.numel() for p in gnn_baseline.parameters
 
 # 2. Create your new Hybrid MGHD Model
 mghd_model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
+
+# ---- EMA for MGHD (eval-only) ----
+ema_decay = 0.999
+ema_state = {k: v.detach().clone() for k, v in mghd_model.state_dict().items()}
+
+def ema_update(model):
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            ema_state[k].mul_(ema_decay).add_(v.detach().clone(), alpha=1.0 - ema_decay)
+
+def load_ema(model):
+    model.load_state_dict(ema_state, strict=True)
+
 optimizer_mghd = optim.AdamW(mghd_model.parameters(), lr=lr, weight_decay=weight_decay)
 # For optimal results, use constant learning rate (lr_schedule = "constant")
 # scheduler_mghd = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -210,15 +225,6 @@ start_time = time.time()
 size = 2 * GNNDecoder.dist ** 2 - 1
 error_index = GNNDecoder.dist ** 2 - 1
 
-""" generate training data """
-trainset = adapt_trainset(
-    generate_syndrome_error_volume(code, error_model, p=max_train_err_rate, batch_size=len_train_set),
-    code, num_classes=n_node_inputs)
-trainloader = DataLoader(trainset, batch_size=batch_size, collate_fn=collate, shuffle=True)
-
-print(f"Number of batches per epoch: {len(trainloader)}")
-print("=" * 60)
-
 # Initialize lists to store metrics for plotting
 baseline_losses = []
 baseline_lers = []
@@ -252,8 +258,22 @@ def evaluate_model_avg(model, loader, code, runs=1):
             lertot_vals.append(float(lertot))
     return float(np.mean(lerx_vals)), float(np.mean(lerz_vals)), float(np.mean(lertot_vals))
 
+def evaluate_over_p_grid(model, code, ps=(0.03, 0.04, 0.05, 0.06, 0.08), runs=1, set_size=5000):
+    results = []
+    for p in ps:
+        testset_p = adapt_trainset(
+            generate_syndrome_error_volume(code, error_model=error_model, p=p, batch_size=set_size, for_training=False),
+            code, num_classes=n_node_inputs, for_training=False)
+        testloader_p = DataLoader(testset_p, batch_size=512, collate_fn=collate, shuffle=False)
+        lerx, lerz, lertot = evaluate_model_avg(model, testloader_p, code, runs=runs)
+        results.append((float(p), float(lerx), float(lerz), float(lertot)))
+    ps_arr = np.array([r[0] for r in results], dtype=float)
+    lers = np.array([r[3] for r in results], dtype=float)
+    auc = float(np.trapz(lers, ps_arr) / (ps_arr.max() - ps_arr.min()))
+    return results, auc
+
 # CSV Metrics Logger
-csv_path = 'training_metrics.csv'
+csv_path = os.path.join(output_dir, f'{run_id}_training_metrics.csv')
 if not os.path.exists(csv_path):
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -265,9 +285,19 @@ if not os.path.exists(csv_path):
         ])
     print(f"Initialized CSV logging at {csv_path}")
 
+# CSV for multi-p evaluation
+pgrid_csv = os.path.join(output_dir, f'{run_id}_pgrid_metrics.csv')
+if not os.path.exists(pgrid_csv):
+    with open(pgrid_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['timestamp', 'epoch', 'model', 'p', 'ler_total', 'ler_x', 'ler_z'])
+    print(f"Initialized p-grid CSV at {pgrid_csv}")
+
 # Modified training loop to compare both models
 print("Starting training...")
 print("epoch, baseline_loss, baseline_LER, mghd_loss, mghd_LER, train_time")
+print("Curriculum sampling active: p ranges [0.04,0.10] -> [0.035,0.075] -> [0.03,0.06]")
+print("Multi-p metrics written to pgrid_metrics.csv (per-epoch and final AUC)")
 sys.stdout.flush()
 
 # Early stopping tracking
@@ -285,6 +315,14 @@ for epoch in range(epochs):
 
     # Progress indicator
     print(f"\nEpoch {epoch+1}/{epochs} - Training...")
+    
+    # Regenerate training data each epoch with curriculum p near 0.05
+    p_train = sample_training_p(epoch, epochs)
+    trainset = adapt_trainset(
+        generate_syndrome_error_volume(code, error_model, p=p_train, batch_size=len_train_set),
+        code, num_classes=n_node_inputs)
+    trainloader = DataLoader(trainset, batch_size=batch_size, collate_fn=collate, shuffle=True)
+    print(f"  [Curriculum] p_train={p_train:.5f}; batches={len(trainloader)}")
     
     # Initialize gradient accumulation for MGHD
     optimizer_mghd.zero_grad()
@@ -326,9 +364,16 @@ for epoch in range(epochs):
         if (i + 1) % accumulation_steps == 0:
             # IMPROVED: Add gradient clipping for stability
             scaler.unscale_(optimizer_mghd)
-            torch.nn.utils.clip_grad_norm_(mghd_model.parameters(), gradient_clip_value)
+            
+            # Debug: Check gradient norms
+            total_norm = torch.nn.utils.clip_grad_norm_(mghd_model.parameters(), gradient_clip_value)
+            if i == 0:  # Print once per epoch
+                print(f"    MGHD grad norm: {total_norm:.6f}")
+            
             scaler.step(optimizer_mghd)
             scaler.update()
+            # EMA disabled - was hurting performance
+            # ema_update(mghd_model)
             optimizer_mghd.zero_grad()
             
             # Warmup for first few steps
@@ -354,8 +399,10 @@ for epoch in range(epochs):
     mghd_model.eval()
 
     with torch.no_grad():
-        # Calculate detailed metrics with averaging
+        # Baseline eval
         lerx_baseline, lerz_baseline, ler_tot_baseline = evaluate_model_avg(gnn_baseline, testloader, code, runs=eval_runs)
+
+        # MGHD eval with raw training weights (EMA disabled - was hurting performance)
         lerx_mghd, lerz_mghd, ler_tot_mghd = evaluate_model_avg(mghd_model, testloader, code, runs=eval_runs)
         
         # Calculate fraction solved
@@ -365,12 +412,31 @@ for epoch in range(epochs):
     # Update best checkpoint if MGHD improved
     if ler_tot_mghd + early_stop_min_delta < best_mghd_ler:
         best_mghd_ler = ler_tot_mghd
+        # Save raw parameters with timestamped filename
         best_mghd_state = {k: v.cpu() for k, v in mghd_model.state_dict().items()}
         best_epoch = epoch + 1
-        torch.save(best_mghd_state, 'mghd_best.pt')
-        epochs_without_improve = 0  # Reset patience counter
+        model_path = os.path.join(output_dir, f'{run_id}_mghd_best.pt')
+        torch.save(best_mghd_state, model_path)
+        epochs_without_improve = 0
     else:
         epochs_without_improve += 1
+
+    # Per-epoch multi-p evaluation (fast: runs=1, set_size=5000)
+    # Baseline
+    baseline_pgrid, baseline_auc = evaluate_over_p_grid(gnn_baseline, code, runs=1, set_size=5000)
+    with open(pgrid_csv, 'a', newline='') as f:
+        writer = csv.writer(f)
+        for (pp, lx, lz, lt) in baseline_pgrid:
+            writer.writerow([datetime.utcnow().isoformat(), epoch + 1, 'baseline', f"{pp:.5f}", f"{lt:.6f}", f"{lx:.6f}", f"{lz:.6f}"])
+        writer.writerow([datetime.utcnow().isoformat(), epoch + 1, 'baseline', 'AUC', f"{baseline_auc:.6f}", '', ''])
+
+    # MGHD (raw weights - EMA disabled)
+    mghd_pgrid, mghd_auc = evaluate_over_p_grid(mghd_model, code, runs=1, set_size=5000)
+    with open(pgrid_csv, 'a', newline='') as f:
+        writer = csv.writer(f)
+        for (pp, lx, lz, lt) in mghd_pgrid:
+            writer.writerow([datetime.utcnow().isoformat(), epoch + 1, 'mghd_raw', f"{pp:.5f}", f"{lt:.6f}", f"{lx:.6f}", f"{lz:.6f}"])
+        writer.writerow([datetime.utcnow().isoformat(), epoch + 1, 'mghd_raw', 'AUC', f"{mghd_auc:.6f}", '', ''])
 
     # Check for early stopping
     if epochs_without_improve >= early_stop_patience:
@@ -447,8 +513,8 @@ total_time = time.time() - start_time
 if best_mghd_state is not None:
     mghd_model.load_state_dict(best_mghd_state)
     print(f"Restored MGHD to best epoch {best_epoch} with LER {best_mghd_ler:.6f}")
-    print("Saved best MGHD weights to mghd_best.pt")
-    print("Appended per-epoch metrics to training_metrics.csv")
+    print(f"Saved best MGHD weights to {os.path.join(output_dir, f'{run_id}_mghd_best.pt')}")
+    print(f"Appended per-epoch metrics to {csv_path}")
     
     # Final averaged evaluation on best checkpoint
     final_lerx, final_lerz, final_lertot = evaluate_model_avg(mghd_model, testloader, code, runs=final_eval_runs)
@@ -465,19 +531,29 @@ if best_mghd_state is not None:
             optimizer_mghd.param_groups[0]['lr'] if optimizer_mghd.param_groups else ''
         ])
     
+    # Final multi-p evaluation with stronger averaging (raw weights)
+    final_grid, final_auc = evaluate_over_p_grid(mghd_model, code, runs=3, set_size=20000)
+    with open(pgrid_csv, 'a', newline='') as f:
+        writer = csv.writer(f)
+        for (pp, lx, lz, lt) in final_grid:
+            writer.writerow([datetime.utcnow().isoformat(), 'FINAL_BEST', 'mghd_raw', f"{pp:.5f}", f"{lt:.6f}", f"{lx:.6f}", f"{lz:.6f}"])
+        writer.writerow([datetime.utcnow().isoformat(), 'FINAL_BEST', 'mghd_raw', 'AUC', f"{final_auc:.6f}", '', ''])
+    print(f"Final MGHD AUC over p-grid: {final_auc:.6f}")
+    
     print(f"Best epoch: {best_epoch}, Best LER (avg {eval_runs}): {best_mghd_ler:.6f}")
-    print("Best weights: mghd_best.pt")
-    print("Per-epoch metrics: training_metrics.csv")
+    print(f"Best weights: {os.path.join(output_dir, f'{run_id}_mghd_best.pt')}")
+    print(f"Per-epoch metrics: {csv_path}")
+    print(f"Multi-p metrics: {pgrid_csv}")
 
 print(f"\nTraining completed in {total_time:.2f}s")
 print(f"Average time per epoch: {np.mean(epoch_times):.2f}s")
 
-# Final comparison
-final_baseline_ler = baseline_lers[-1]
-final_mghd_ler = mghd_lers[-1]
-print(f"\n - FINAL COMPARISON:")
-print(f"Baseline GNN - Final LER: {final_baseline_ler:.6f}")
-print(f"Hybrid MGHD - Final LER: {final_mghd_ler:.6f}")
+# Final comparison - use best performance for both models
+final_baseline_ler = min(baseline_lers)  # Best baseline performance
+final_mghd_ler = best_mghd_ler  # Best MGHD performance (already tracked)
+print(f"\n - FINAL COMPARISON (Best Performance):")
+print(f"Baseline GNN - Best LER: {final_baseline_ler:.6f}")
+print(f"Hybrid MGHD - Best LER: {final_mghd_ler:.6f}")
 
 if final_mghd_ler < final_baseline_ler:
     improvement = (final_baseline_ler - final_mghd_ler) / final_baseline_ler * 100
@@ -485,6 +561,11 @@ if final_mghd_ler < final_baseline_ler:
 else:
     degradation = (final_mghd_ler - final_baseline_ler) / final_baseline_ler * 100
     print(f" - MGHD is {degradation:.2f}% worse than baseline")
+
+# Also show final epoch comparison for reference
+print(f"\n - Final Epoch Comparison (before early stopping):")
+print(f"Baseline GNN - Final Epoch LER: {baseline_lers[-1]:.6f}")
+print(f"Hybrid MGHD - Final Epoch LER: {mghd_lers[-1]:.6f}")
 
 # ===============================================
 # PLOTTING SECTION
@@ -498,7 +579,7 @@ epochs_range = range(1, actual_epochs+1)
 
 # Create a figure with multiple subplots
 fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-fig.suptitle(f'MGHD w/ Channel Attention vs Baseline GNN Comparison\nDistance {d}, {actual_epochs} epochs (early stopped), SE reduction={mamba_params["se_reduction"]}', fontsize=16)
+fig.suptitle(f'MGHD w/ Channel Attention vs Baseline GNN Comparison\nDistance {d}, {actual_epochs} epochs (early stopped), SE reduction={mamba_params["se_reduction"]}\nRun: {run_timestamp}', fontsize=16)
 
 # Plot 1: Logical Error Rate
 axes[0, 0].plot(epochs_range, baseline_lers, 'b-o', label='Baseline GNN', linewidth=2, markersize=6)
@@ -541,7 +622,8 @@ axes[1, 1].grid(True, alpha=0.3)
 axes[1, 1].set_yscale('log')
 
 plt.tight_layout()
-plt.savefig('mghd_vs_baseline_comparison.png', dpi=300, bbox_inches='tight')
+comparison_plot_path = os.path.join(output_dir, f'{run_id}_comparison_plots.png')
+plt.savefig(comparison_plot_path, dpi=300, bbox_inches='tight')
 plt.show()
 
 # Create a summary table plot
@@ -551,13 +633,13 @@ ax.axis('off')
 
 # Create summary data
 summary_data = [
-    ['Model', 'Parameters', 'Final LER', 'Final Loss', 'Best LER', 'Fraction Solved'],
+    ['Model', 'Parameters', 'Best LER', 'Final Loss', 'Final Epoch LER', 'Fraction Solved'],
     ['Baseline GNN', f'{sum(p.numel() for p in gnn_baseline.parameters()):,}', 
-     f'{final_baseline_ler:.6f}', f'{baseline_losses[-1]:.6f}', 
-     f'{min(baseline_lers):.6f}', f'{baseline_frac_solved[-1]:.4f}'],
+     f'{min(baseline_lers):.6f}', f'{baseline_losses[-1]:.6f}', 
+     f'{baseline_lers[-1]:.6f}', f'{baseline_frac_solved[-1]:.4f}'],
     ['Hybrid MGHD', f'{sum(p.numel() for p in mghd_model.parameters()):,}', 
-     f'{final_mghd_ler:.6f}', f'{mghd_losses[-1]:.6f}', 
-     f'{min(mghd_lers):.6f}', f'{mghd_frac_solved[-1]:.4f}']
+     f'{best_mghd_ler:.6f}', f'{mghd_losses[-1]:.6f}', 
+     f'{mghd_lers[-1]:.6f}', f'{mghd_frac_solved[-1]:.4f}']
 ]
 
 table = ax.table(cellText=summary_data[1:], colLabels=summary_data[0], 
@@ -575,12 +657,23 @@ for i in range(len(summary_data[0])):
 better_ler = 1 if final_mghd_ler < final_baseline_ler else 2
 table[(better_ler, 2)].set_facecolor('#E8F5E8')
 
-plt.title('Model Comparison Summary', fontsize=16, fontweight='bold', pad=20)
-plt.savefig('mghd_vs_baseline_summary.png', dpi=300, bbox_inches='tight')
+plt.title(f'Model Comparison Summary - {run_timestamp}', fontsize=16, fontweight='bold', pad=20)
+summary_plot_path = os.path.join(output_dir, f'{run_id}_summary_table.png')
+plt.savefig(summary_plot_path, dpi=300, bbox_inches='tight')
 plt.show()
 
 # Save metrics to file
 metrics_data = {
+    'run_id': run_id,
+    'timestamp': run_timestamp,
+    'hyperparameters': {
+        'd_model': mamba_params['d_model'],
+        'd_state': mamba_params['d_state'],
+        'se_reduction': mamba_params['se_reduction'],
+        'lr': lr,
+        'label_smoothing': label_smoothing,
+        'early_stop_patience': early_stop_patience
+    },
     'epochs': list(epochs_range),
     'baseline_losses': baseline_losses,
     'baseline_lers': baseline_lers,
@@ -592,10 +685,26 @@ metrics_data = {
     'mghd_lerx': mghd_lerx,
     'mghd_lerz': mghd_lerz,
     'mghd_frac_solved': mghd_frac_solved,
-    'epoch_times': epoch_times
+    'epoch_times': epoch_times,
+    'best_mghd_ler': best_mghd_ler,
+    'best_epoch': best_epoch,
+    'final_baseline_ler': final_baseline_ler,
+    'final_mghd_ler': final_mghd_ler
 }
 
-np.save('mghd_vs_baseline_metrics.npy', metrics_data)
-print(f"\n - Metrics saved to 'mghd_vs_baseline_metrics.npy'")
-print(f" - Plots saved as 'mghd_vs_baseline_comparison.png' and 'mghd_vs_baseline_summary.png'")
+metrics_path = os.path.join(output_dir, f'{run_id}_metrics.npy')
+np.save(metrics_path, metrics_data)
+print(f"\n - Metrics saved to '{metrics_path}'")
+print(f" - Plots saved as '{comparison_plot_path}' and '{summary_plot_path}'")
 print(f"\n - Proof of Concept completed successfully!")
+print(f"\n=== RUN SUMMARY ===")
+print(f"Run ID: {run_id}")
+print(f"Output Directory: {output_dir}")
+print(f"Files Generated:")
+print(f"  - Training metrics: {os.path.basename(csv_path)}")
+print(f"  - Multi-p metrics: {os.path.basename(pgrid_csv)}")
+print(f"  - Best model weights: {run_id}_mghd_best.pt")
+print(f"  - Comparison plots: {run_id}_comparison_plots.png")
+print(f"  - Summary table: {run_id}_summary_table.png")
+print(f"  - Full metrics: {run_id}_metrics.npy")
+print(f"===================")

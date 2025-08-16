@@ -3,23 +3,6 @@ import torch.nn as nn
 
 # --- Imports from our project ---
 from panq_functions import GNNDecoder # From the Astra codebase
-
-# ==============================================================================
-# === FAKE MAMBA BLOCK FOR MACOS DEVELOPMENT ===
-# ==============================================================================
-
-# class Mamba(nn.Module):
-#     def __init__(self, d_model, d_state, d_conv, expand):
-#         super().__init__()
-#         self.d_model = d_model
-#         # This layer ensures the output has the correct dimension.
-#         self.dummy_layer = nn.Linear(d_model, d_model)
-
-#     def forward(self, x):
-#         # This placeholder just passes the data through a linear layer.
-#         # The real Mamba would do complex sequence processing here.
-#         return self.dummy_layer(x)
-
 from mamba_ssm import Mamba
 
 # ==============================================================================
