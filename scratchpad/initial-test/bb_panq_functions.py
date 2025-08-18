@@ -203,7 +203,36 @@ def surface_code_edges(code):
     return src_ids, dst_ids
 
 
-def generate_syndrome_error_volume(code, error_model, p, batch_size, for_training=True):
+def generate_syndrome_error_volume(code, error_model, p, batch_size, for_training=True,
+                                   backend: str = "panqec",
+                                   cudaq_mode: str = "foundation",
+                                   cudaq_cfg: dict = None):
+    # CUDA-Q backend integration
+    if backend == "cudaq":
+        from cudaq_backend.syndrome_gen import sample_bb_cudaq
+        
+        if cudaq_cfg is None:
+            # Default configuration
+            cudaq_cfg = {
+                "mapping": {i: i for i in range(code.N)},  # Identity mapping
+                "T": 1,
+                "rng": np.random.default_rng(1234),
+                "bitpack": False
+            }
+        
+        # Use CUDA-Q sampler
+        batch = sample_bb_cudaq(
+            mode=cudaq_mode,
+            batch_size=batch_size,
+            T=cudaq_cfg.get("T", 1),
+            hx=code.hx, hz=code.hz,
+            mapping=cudaq_cfg["mapping"],
+            rng=cudaq_cfg.get("rng", np.random.default_rng()),
+            bitpack=cudaq_cfg.get("bitpack", False)
+        )
+        return batch
+    
+    # Original PanQEC backend
     d = code.D
     size = 2 * code.N
     syndrome_error_volume = np.zeros((batch_size, size), dtype='uint8')

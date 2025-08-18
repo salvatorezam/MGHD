@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
 
 # Reproducibility
 torch.manual_seed(42)
@@ -24,9 +25,83 @@ from datetime import datetime
 output_dir = "/u/home/kulp/MGHD/scratchpad/initial-test/Plots and Data"
 os.makedirs(output_dir, exist_ok=True)
 
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Train GNN decoder with optional CUDA-Q backend')
+parser.add_argument('--backend', choices=['panqec', 'cudaq'], default='panqec',
+                    help='Backend for syndrome generation (default: panqec)')
+parser.add_argument('--cudaq-mode', choices=['foundation', 'student'], default='foundation',
+                    help='CUDA-Q mode: foundation (device-agnostic) or student (device-specific)')
+parser.add_argument('--T-rounds', type=int, default=1,
+                    help='Number of syndrome extraction rounds for CUDA-Q (default: 1)')
+parser.add_argument('--bitpack', action='store_true',
+                    help='Store syndrome data as bit-packed uint8 (CUDA-Q only)')
+parser.add_argument('--d', type=int, default=3,
+                    help='Surface code distance (default: 3)')
+
+# Try to parse args, but provide defaults if running in notebook/interactive mode
+try:
+    args = parser.parse_args()
+    d = args.d
+    backend = args.backend
+    cudaq_mode = args.cudaq_mode
+    T_rounds = args.T_rounds
+    bitpack = args.bitpack
+except SystemExit:
+    # Fallback for interactive/notebook usage
+    class Args:
+        def __init__(self):
+            self.backend = 'panqec'
+            self.cudaq_mode = 'foundation'
+            self.T_rounds = 1
+            self.bitpack = False
+            self.d = 3
+    args = Args()
+    d = args.d
+    backend = args.backend
+    cudaq_mode = args.cudaq_mode
+    T_rounds = args.T_rounds
+    bitpack = args.bitpack
+
 # Generate timestamp for this run
 run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_id = f"MGHD_vs_Baseline_d{d}_{run_timestamp}"
+run_id = f"MGHD_vs_Baseline_d{d}_{backend}_{run_timestamp}"
+
+print(f"Configuration:")
+print(f"  Distance: {d}")
+print(f"  Backend: {backend}")
+if backend == 'cudaq':
+    print(f"  CUDA-Q Mode: {cudaq_mode}")
+    print(f"  Syndrome Rounds: {T_rounds}")
+    print(f"  Bit Packing: {bitpack}")
+
+# Setup CUDA-Q configuration if needed
+cudaq_cfg = None
+if backend == 'cudaq':
+    from cudaq_backend.circuits import make_surface_layout_d3_avoid_bad_edges
+    
+    if d == 3:
+        layout = make_surface_layout_d3_avoid_bad_edges()
+    else:
+        # For other distances, use a generic layout (simplified)
+        layout = {
+            'data': list(range(d*d)),
+            'ancilla_x': list(range(d*d, d*d + (d*d-1)//2)),
+            'ancilla_z': list(range(d*d + (d*d-1)//2, d*d + d*d-1)),
+            'cz_layers': [],
+            'prx_layers': [],
+            'total_qubits': 2*d*d - 1,
+            'distance': d
+        }
+    
+    cudaq_cfg = {
+        "layout": layout,
+        "T": T_rounds,
+        "rng": np.random.default_rng(1234),
+        "bitpack": bitpack
+    }
+    print(f"  Layout qubits: {layout['total_qubits']}")
+
+# Continue with original parameter setup...
 
 # import tools
 from panq_functions import GNNDecoder, collate, fraction_of_solved_puzzles, compute_accuracy, logical_error_rate, \
@@ -199,8 +274,8 @@ print(f"Hybrid MGHD parameters: {sum(p.numel() for p in mghd_model.parameters())
 # Generate the test data
 testset = adapt_trainset(
     generate_syndrome_error_volume(code, error_model=error_model, p=test_err_rate, batch_size=len_test_set,
-                                   for_training=False), code,
-    num_classes=n_node_inputs, for_training=False)
+                                   for_training=False, backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg), 
+    code, num_classes=n_node_inputs, for_training=False)
 testloader = DataLoader(testset, batch_size=512, collate_fn=collate, shuffle=False)
 
 print(f"Dataset size: {len_train_set}")
@@ -262,7 +337,8 @@ def evaluate_over_p_grid(model, code, ps=(0.03, 0.04, 0.05, 0.06, 0.08), runs=1,
     results = []
     for p in ps:
         testset_p = adapt_trainset(
-            generate_syndrome_error_volume(code, error_model=error_model, p=p, batch_size=set_size, for_training=False),
+            generate_syndrome_error_volume(code, error_model=error_model, p=p, batch_size=set_size, 
+                                           for_training=False, backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg),
             code, num_classes=n_node_inputs, for_training=False)
         testloader_p = DataLoader(testset_p, batch_size=512, collate_fn=collate, shuffle=False)
         lerx, lerz, lertot = evaluate_model_avg(model, testloader_p, code, runs=runs)
@@ -319,7 +395,8 @@ for epoch in range(epochs):
     # Regenerate training data each epoch with curriculum p near 0.05
     p_train = sample_training_p(epoch, epochs)
     trainset = adapt_trainset(
-        generate_syndrome_error_volume(code, error_model, p=p_train, batch_size=len_train_set),
+        generate_syndrome_error_volume(code, error_model, p=p_train, batch_size=len_train_set,
+                                       backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg),
         code, num_classes=n_node_inputs)
     trainloader = DataLoader(trainset, batch_size=batch_size, collate_fn=collate, shuffle=True)
     print(f"  [Curriculum] p_train={p_train:.5f}; batches={len(trainloader)}")
