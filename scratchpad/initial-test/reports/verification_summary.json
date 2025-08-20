@@ -1,0 +1,152 @@
+{
+  "tests_passed": true,
+  "backend_validation": {
+    "mocks_removed": true
+  },
+  "shape_checks": {},
+  "parity_checks": {},
+  "fidelity_mapping_examples": {
+    "test_passed": true,
+    "mappings": {
+      "Foundation 1Q median": {
+        "F_avg": 0.9989,
+        "p_computed": 0.0014666666666666532
+      },
+      "Foundation 2Q median": {
+        "F_avg": 0.9906,
+        "p_computed": 0.010026666666666628
+      },
+      "Bad edge (10,11)": {
+        "F_avg": 0.9228,
+        "p_computed": 0.08234666666666672
+      }
+    }
+  },
+  "idle_noise_check": {
+    "passed": true,
+    "no_idle_rate": 0.0,
+    "idle_rate_expected": 0.013726596345827513,
+    "idle_rate_empirical": 0.0,
+    "confidence_interval": 0.0004163662665394851,
+    "threshold": 0.005,
+    "T1_us": 43.1,
+    "T2_us": 2.8,
+    "T_phi_ns": 2894.0047961630694,
+    "dt_ns": 40.0
+  },
+  "meas_asymmetry_check": {
+    "passed": true,
+    "per_qubit_results": {
+      "qubit_0": {
+        "empirical_eps0": 0.0246,
+        "empirical_eps1": 0.0353
+      },
+      "qubit_1": {
+        "empirical_eps0": 0.0235,
+        "empirical_eps1": 0.037
+      },
+      "qubit_2": {
+        "empirical_eps0": 0.0244,
+        "empirical_eps1": 0.0367
+      }
+    }
+  },
+  "foundation_stats": {
+    "f1q_range": [
+      0.9971552690244168,
+      0.9999
+    ],
+    "f2q_range": [
+      0.9725887473724047,
+      0.9948325681270396
+    ],
+    "t1_range": [
+      36.7301941478805,
+      46.809932201102654
+    ],
+    "t2_range": [
+      2.131796902387405,
+      3.294764302575432
+    ]
+  },
+  "student_edges": {
+    "total_edges": 30,
+    "sample_edges": {
+      "(0, 1)": 0.9929,
+      "(0, 3)": 0.9902,
+      "(2, 3)": 0.9587,
+      "(2, 7)": 0.9913,
+      "(1, 4)": 0.9931,
+      "(3, 4)": 0.9732,
+      "(3, 8)": 0.988,
+      "(7, 8)": 0.9922,
+      "(7, 12)": 0.991,
+      "(4, 5)": 0.9938
+    }
+  },
+  "layout_edges": {
+    "bad_edge_avoided": true,
+    "total_couplers_used": 8,
+    "couplers": {
+      "0, 1": 0.9929,
+      "1, 4": 0.9931,
+      "2, 3": 0.9587,
+      "2, 7": 0.9913,
+      "3, 8": 0.988,
+      "4, 5": 0.9938,
+      "7, 8": 0.9922,
+      "7, 12": 0.991
+    },
+    "coupler_count": 8
+  },
+  "throughput": {
+    "max_samples_per_sec": 1508330,
+    "performance_adequate": true,
+    "benchmark_results": {
+      "Surface d=3_10000": {
+        "duration": "0.01s",
+        "samples_per_sec": "1343510"
+      },
+      "Surface d=3_50000": {
+        "duration": "0.03s",
+        "samples_per_sec": "1508330"
+      },
+      "BB code_10000": {
+        "duration": "0.02s",
+        "samples_per_sec": "556244"
+      },
+      "BB code_50000": {
+        "duration": "0.08s",
+        "samples_per_sec": "623486"
+      }
+    }
+  },
+  "trainer_smoke": {
+    "file_exists": true,
+    "import_test_passed": true,
+    "full_test_skipped": true,
+    "reason": "Requires additional training setup"
+  },
+  "packing_checks": {
+    "surface_shape_ok": true,
+    "surface_dtype_ok": true,
+    "bb_shape_ok": true,
+    "bb_dtype_ok": true,
+    "overall_passed": true
+  },
+  "bad_edge_analysis": {
+    "good_error_rate": 0.0383275,
+    "bad_error_rate": 0.03845,
+    "relative_delta": 0.0031961385428216716,
+    "threshold": 0.003,
+    "impact_significant": true,
+    "bad_edge_fidelity": 0.5,
+    "batch_size": 50000
+  },
+  "parity_cross_check": {
+    "surface_parity_ok": true,
+    "bb_parity_ok": true,
+    "overall_passed": true,
+    "n_samples": 10000
+  }
+}

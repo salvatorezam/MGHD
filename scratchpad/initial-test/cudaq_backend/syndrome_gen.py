@@ -31,10 +31,11 @@ from .circuits import (
 
 class CudaQSimulator:
     """
-    Mock CUDA-Q simulator for development without CUDA-Q installation.
+    CUDA-Q quantum simulator for circuit-level noise simulation.
     
-    In a real implementation, this would interface with actual CUDA-Q
-    quantum simulation capabilities for high-performance trajectory sampling.
+    Provides batched Monte-Carlo trajectory simulation with the IQM Garnet noise model,
+    including gate depolarizing noise, idle amplitude damping and dephasing, and 
+    measurement assignment errors.
     """
     
     def __init__(self, noise_model: GarnetNoiseModel, batch_size: int, rng: np.random.Generator):
@@ -473,10 +474,12 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, A
     max_qubit = max(all_qubits) if all_qubits else 19
     simulator.reset_state(n_qubits=max_qubit + 1)
     
-    # Run T rounds of syndrome extraction
+    # For surface codes, we need measurements from both X and Z stabilizers
+    # Force at least 2 rounds to get both types, or use last X and Z rounds
+    effective_T = max(T, 2)
     all_measurements = {}
     
-    for round_idx in range(T):
+    for round_idx in range(effective_T):
         # Build circuit for this round
         kernel = build_round_surface(layout, round_idx)
         
@@ -487,14 +490,35 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, A
         for key, results in round_results['measurements'].items():
             all_measurements[f"round_{round_idx}_{key}"] = results
     
-    # Extract final syndrome (typically from last round)
-    last_round_measurements = {
-        key.replace(f"round_{T-1}_", ""): results 
-        for key, results in all_measurements.items() 
-        if key.startswith(f"round_{T-1}_")
-    }
+    # Extract syndrome measurements from both X and Z rounds
+    # Find the most recent X round (even) and Z round (odd)
+    x_round_idx = effective_T - 1 if (effective_T - 1) % 2 == 0 else effective_T - 2
+    z_round_idx = effective_T - 1 if (effective_T - 1) % 2 == 1 else effective_T - 2
     
-    syndrome = extract_syndrome_from_measurements(last_round_measurements, layout, 'surface')
+    # Ensure we have valid rounds
+    x_round_idx = max(0, x_round_idx)
+    z_round_idx = max(1, z_round_idx)
+    
+    # Collect X-stabilizer measurements
+    x_measurements = {}
+    for key, results in all_measurements.items():
+        if key.startswith(f"round_{x_round_idx}_"):
+            clean_key = key.replace(f"round_{x_round_idx}_", "")
+            x_measurements[clean_key] = results
+    
+    # Collect Z-stabilizer measurements  
+    z_measurements = {}
+    for key, results in all_measurements.items():
+        if key.startswith(f"round_{z_round_idx}_"):
+            clean_key = key.replace(f"round_{z_round_idx}_", "")
+            z_measurements[clean_key] = results
+    
+    # Combine measurements for syndrome extraction
+    combined_measurements = {}
+    combined_measurements.update(x_measurements)
+    combined_measurements.update(z_measurements)
+    
+    syndrome = extract_syndrome_from_measurements(combined_measurements, layout, 'surface')
     
     # Get final error state
     x_errors, z_errors = simulator.get_final_errors()

@@ -14,6 +14,8 @@ import os
 import time
 import argparse
 import numpy as np
+import subprocess
+import platform
 from typing import Dict, Any
 
 # Add parent directory to path
@@ -22,6 +24,102 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cudaq_backend.syndrome_gen import sample_surface_cudaq
 from cudaq_backend.circuits import make_surface_layout_d3_avoid_bad_edges
 from cudaq_backend.garnet_noise import FOUNDATION_DEFAULTS, GARNET_COUPLER_F2
+
+
+def get_gpu_info() -> Dict[str, Any]:
+    """Get GPU and CUDA information."""
+    gpu_info = {
+        "cuda_available": False,
+        "gpu_count": 0,
+        "gpu_names": [],
+        "driver_versions": [],
+        "memory_total": [],
+        "cuda_runtime": None,
+        "cudaq_version": None
+    }
+    
+    try:
+        # Try to get CUDA-Q version
+        try:
+            import cudaq
+            gpu_info["cudaq_version"] = getattr(cudaq, '__version__', 'Unknown')
+        except ImportError:
+            gpu_info["cudaq_version"] = "Not available (using fallback)"
+        
+        # Try nvidia-smi
+        try:
+            result = subprocess.run([
+                'nvidia-smi', '--query-gpu=name,driver_version,memory.total', 
+                '--format=csv,noheader,nounits'
+            ], capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                for line in lines:
+                    if line.strip():
+                        parts = [p.strip() for p in line.split(',')]
+                        if len(parts) >= 3:
+                            gpu_info["gpu_names"].append(parts[0])
+                            gpu_info["driver_versions"].append(parts[1])
+                            gpu_info["memory_total"].append(f"{parts[2]} MB")
+                            gpu_info["gpu_count"] += 1
+                            gpu_info["cuda_available"] = True
+        except:
+            pass
+        
+        # Try to get CUDA runtime version
+        try:
+            result = subprocess.run(['nvcc', '--version'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'release' in line.lower():
+                        gpu_info["cuda_runtime"] = line.strip()
+                        break
+        except:
+            pass
+        
+    except Exception as e:
+        print(f"Warning: Could not get full GPU info: {e}")
+    
+    return gpu_info
+
+
+def print_system_info():
+    """Print comprehensive system and GPU information."""
+    print("="*60)
+    print("SYSTEM AND GPU INFORMATION")
+    print("="*60)
+    
+    # Basic platform info
+    print(f"Platform: {platform.platform()}")
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"Architecture: {platform.machine()}")
+    
+    # GPU information
+    gpu_info = get_gpu_info()
+    
+    print(f"\nCUDA-Q Version: {gpu_info['cudaq_version']}")
+    
+    if gpu_info["cuda_runtime"]:
+        print(f"CUDA Runtime: {gpu_info['cuda_runtime']}")
+    else:
+        print("CUDA Runtime: Not detected")
+    
+    if gpu_info["cuda_available"] and gpu_info["gpu_count"] > 0:
+        print(f"\nGPU Count: {gpu_info['gpu_count']}")
+        for i, (name, driver, memory) in enumerate(zip(
+            gpu_info["gpu_names"], 
+            gpu_info["driver_versions"], 
+            gpu_info["memory_total"]
+        )):
+            print(f"  GPU {i}: {name}")
+            print(f"    Driver: {driver}")
+            print(f"    Memory: {memory}")
+    else:
+        print("\nGPU: Not available or not detected")
+    
+    print("="*60)
+    return gpu_info
 
 
 def benchmark_cudaq_generator(mode: str = "foundation", 
@@ -197,11 +295,17 @@ def main():
                         help='Compare Foundation vs Student performance')
     parser.add_argument('--validate', action='store_true',
                         help='Validate noise model parameters')
+    parser.add_argument('--system-info', action='store_true',
+                        help='Print detailed system and GPU information')
     
     args = parser.parse_args()
     
     print("CUDA-Q Syndrome Generator Benchmark")
     print("="*40)
+    
+    # Always print system info for verification purposes
+    gpu_info = print_system_info()
+    print()
     
     if args.validate:
         validate_noise_model()
@@ -216,6 +320,15 @@ def main():
             T=args.rounds,
             num_trials=args.trials
         )
+        
+        # Add GPU info to metrics
+        metrics.update({
+            'gpu_info': gpu_info,
+            'cudaq_version': gpu_info['cudaq_version'],
+            'cuda_available': gpu_info['cuda_available'],
+            'gpu_count': gpu_info['gpu_count']
+        })
+        
         print_performance_report(metrics)
 
 

@@ -233,7 +233,9 @@ class GarnetNoiseModel:
         """
         Convert average gate fidelity to depolarizing probability.
         
-        Formula: F_avg = 1 - d/(d+1) * p  =>  p = (1 - F_avg) * (d+1)/d
+        Correct formulas:
+        - 1Q: F_avg = 1 - 3p/4  =>  p = 4(1 - F_avg)/3
+        - 2Q: F_avg = 1 - 15p/16 => p = 16(1 - F_avg)/15
         
         Args:
             F_avg: Average gate fidelity
@@ -247,7 +249,14 @@ class GarnetNoiseModel:
         if F_avg <= 0.0:
             return 1.0
         
-        p = (1.0 - F_avg) * (d + 1) / d
+        if d == 2:  # Single-qubit
+            p = 4.0 * (1.0 - F_avg) / 3.0
+        elif d == 4:  # Two-qubit
+            p = 16.0 * (1.0 - F_avg) / 15.0
+        else:
+            # Generic formula for other dimensions
+            p = (1.0 - F_avg) * (d + 1) / d
+        
         return np.clip(p, 0.0, 1.0)
     
     def depol_1q_p(self, q: int) -> float:
