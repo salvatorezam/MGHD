@@ -295,7 +295,7 @@ class GarnetNoiseModel:
     
     def idle_params(self, q: int, dt_ns: float) -> Tuple[float, float]:
         """
-        Return (p_amp, p_dephase) for amplitude damping and pure dephasing over dt.
+        Return (p_amp, p_dephase) for amplitude damping and pure dephasing over dt_ns.
         
         Args:
             q: Qubit index
@@ -307,26 +307,24 @@ class GarnetNoiseModel:
         T1_us = self.T1_us.get(q, FOUNDATION_DEFAULTS["T1_median_us"])
         T2_us = self.T2_us.get(q, FOUNDATION_DEFAULTS["T2_median_us"])
         
-        # Convert to nanoseconds
-        T1_ns = T1_us * 1000.0
-        T2_ns = T2_us * 1000.0
+        # Convert to nanoseconds (T*_us * 1e3)
+        T1_ns = T1_us * 1e3
+        T2_ns = T2_us * 1e3
         
         # Amplitude damping probability
         p_amp = 1.0 - np.exp(-dt_ns / T1_ns)
         
         # Pure dephasing: 1/T2 = 1/(2*T1) + 1/T_phi
         # So T_phi = 1 / (1/T2 - 1/(2*T1))
-        if T2_ns <= 0.5 * T1_ns:
-            # Unphysical regime, set minimal dephasing
-            p_dephase = 0.0
+        den = 1.0 / T2_ns - 1.0 / (2.0 * T1_ns)
+        if den <= 0:
+            Tphi_ns = 1e12  # Large sentinel for unphysical regime
         else:
-            T_phi_inv = 1.0 / T2_ns - 1.0 / (2.0 * T1_ns)
-            if T_phi_inv <= 0:
-                p_dephase = 0.0
-            else:
-                T_phi_ns = 1.0 / T_phi_inv
-                p_dephase = 1.0 - np.exp(-dt_ns / T_phi_ns)
+            Tphi_ns = 1.0 / den
         
+        p_dephase = 1.0 - np.exp(-dt_ns / Tphi_ns)
+        
+        # Clamp to [0,1]
         return np.clip(p_amp, 0.0, 1.0), np.clip(p_dephase, 0.0, 1.0)
     
     def meas_asym_errors(self, q: int) -> Tuple[float, float]:

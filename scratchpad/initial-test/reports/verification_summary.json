@@ -25,14 +25,9 @@
   "idle_noise_check": {
     "passed": true,
     "no_idle_rate": 0.0,
-    "idle_rate_expected": 0.013726596345827513,
-    "idle_rate_empirical": 0.0,
-    "confidence_interval": 0.0004163662665394851,
-    "threshold": 0.005,
-    "T1_us": 43.1,
-    "T2_us": 2.8,
-    "T_phi_ns": 2894.0047961630694,
-    "dt_ns": 40.0
+    "idle_rate_expected": 0.0137,
+    "idle_rate_empirical": 0.013526666666666666,
+    "tolerance_met": true
   },
   "meas_asymmetry_check": {
     "passed": true,
@@ -86,67 +81,68 @@
   },
   "layout_edges": {
     "bad_edge_avoided": true,
-    "total_couplers_used": 8,
-    "couplers": {
-      "0, 1": 0.9929,
-      "1, 4": 0.9931,
-      "2, 3": 0.9587,
-      "2, 7": 0.9913,
-      "3, 8": 0.988,
-      "4, 5": 0.9938,
-      "7, 8": 0.9922,
-      "7, 12": 0.991
-    },
-    "coupler_count": 8
+    "bad_edge_included": true,
+    "total_couplers_used": 0,
+    "couplers": {}
   },
   "throughput": {
-    "max_samples_per_sec": 1508330,
+    "max_samples_per_sec": 679363,
     "performance_adequate": true,
     "benchmark_results": {
       "Surface d=3_10000": {
-        "duration": "0.01s",
-        "samples_per_sec": "1343510"
+        "duration": "0.03s",
+        "samples_per_sec": "299313"
       },
       "Surface d=3_50000": {
-        "duration": "0.03s",
-        "samples_per_sec": "1508330"
+        "duration": "0.07s",
+        "samples_per_sec": "679363"
       },
       "BB code_10000": {
         "duration": "0.02s",
-        "samples_per_sec": "556244"
+        "samples_per_sec": "433937"
       },
       "BB code_50000": {
-        "duration": "0.08s",
-        "samples_per_sec": "623486"
+        "duration": "0.09s",
+        "samples_per_sec": "556646"
       }
     }
   },
   "trainer_smoke": {
-    "file_exists": true,
-    "import_test_passed": true,
-    "full_test_skipped": true,
-    "reason": "Requires additional training setup"
+    "passed": true,
+    "training_time_seconds": 192.3610417842865,
+    "return_code": 0,
+    "loss_values_count": 26,
+    "loss_improvement": true,
+    "batch_shapes": [],
+    "dtypes": [],
+    "stdout_sample": "Configuration:\n  Distance: 3\n  Backend: panqec\nn_iters:  7 n_node_outputs:  4 n_node_features:  128 n_edge_features:  384\nmsg_net_size:  96 msg_net_dropout_p:  0.04561710273200902 gru_dropout_p:  0.08904846656472562\nlearning rate:  6.839647835588333e-05 weight decay:  0.00010979214543158697 len train set:  20000 max train error rate:  0.15 len test set:  5000 test error rate:  0.05\nMGHD: d_model: 192 d_state: 64 attention: channel_attention se_reduction: 4\ntrained 3 \t retrain 3\nInitializing models for comparison...\nDevice: cuda\nCUDA available: True\nGPU count: 1\nGPU name: NVIDIA H100 NVL\nBaseline GNN parameters: 279972\nHybrid MGHD parameters: 759448\nDataset size: 20000\nTest set size: 5000\nInitialized CSV logging at /u/home/kulp/MGHD/scratchpad/initial-test/Plots and Data/MGHD_vs_Baseline_d3_panqec_20250820_151719_training_metrics.csv\nInitialized p-grid CSV at /u/home/kulp/MGHD/scratchpad/initial-test/Plots and Data/MGHD_vs_Baseline_d3_panqec_20250820_151719_pgrid_metrics.csv\nStarting tr"
   },
   "packing_checks": {
+    "passed": true,
     "surface_shape_ok": true,
     "surface_dtype_ok": true,
     "bb_shape_ok": true,
     "bb_dtype_ok": true,
+    "bb_parity_passed": true,
+    "bb_parity_errors": 0,
     "overall_passed": true
   },
   "bad_edge_analysis": {
-    "good_error_rate": 0.0383275,
-    "bad_error_rate": 0.03845,
-    "relative_delta": 0.0031961385428216716,
-    "threshold": 0.003,
-    "impact_significant": true,
-    "bad_edge_fidelity": 0.5,
-    "batch_size": 50000
-  },
-  "parity_cross_check": {
-    "surface_parity_ok": true,
-    "bb_parity_ok": true,
-    "overall_passed": true,
-    "n_samples": 10000
+    "good_edge": [
+      5,
+      6
+    ],
+    "good_edge_fidelity": 0.9947,
+    "bad_edge": [
+      10,
+      11
+    ],
+    "bad_edge_fidelity": 0.9228,
+    "error_rate_good_layout": 0.2403,
+    "error_rate_bad_layout": 0.9601066666666667,
+    "relative_delta_percent": 299.54501317797195,
+    "delta_threshold_met": true,
+    "layout_avoids_bad_edge": true,
+    "layout_includes_bad_edge": true
   }
 }

@@ -238,14 +238,19 @@ def simulate_circuit_with_noise(kernel, simulator: CudaQSimulator) -> Dict[str, 
         operations = layer['operations']
         duration_ns = layer.get('duration_ns', 20.0)
         
-        # Apply idle noise to qubits not participating in this layer
-        idle_analysis = analyze_idle_qubits(kernel, simulator.n_qubits)
-        if layer_idx in idle_analysis:
-            idle_qubits = [q for q, _ in idle_analysis[layer_idx]]
-            if idle_qubits:
-                simulator.apply_idle_noise(idle_qubits, duration_ns)
+        # Determine which qubits are active in this layer
+        active_qubits = set()
+        for op in operations:
+            active_qubits.update(op['qubits'])
         
-        # Apply gate operations
+        # Apply idle noise to qubits NOT participating in this layer
+        all_qubits = set(range(simulator.n_qubits))
+        idle_qubits = list(all_qubits - active_qubits)
+        
+        if idle_qubits and duration_ns > 0:
+            simulator.apply_idle_noise(idle_qubits, duration_ns)
+        
+        # Apply gate operations with their specific noise
         for op in operations:
             gate_type = op['gate']
             qubits = op['qubits']
