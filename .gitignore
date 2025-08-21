@@ -230,6 +230,14 @@ api_keys.txt
 .qiskit/
 
 # =============================================================================
+# PROJECT-SPECIFIC EXCLUSIONS
+# =============================================================================
+# Project summary files (local development notes) - exclude before exceptions
+PROJECT_SUMMARY.md
+scratchpad/initial-test/PROJECT_SUMMARY.md
+**/PROJECT_SUMMARY.md
+
+# =============================================================================
 # EXCEPTIONS (files to keep)
 # =============================================================================
 # Keep important configuration files
@@ -249,3 +257,11 @@ api_keys.txt
 # Keep final results summary (if needed)
 !FINAL_OPTIMAL_CONFIG.md
 !best_hyperparameters.json
+
+# =============================================================================
+# SPECIFIC EXCLUSIONS (override exceptions above)
+# =============================================================================
+# Exclude project summary files even though they are .md files
+PROJECT_SUMMARY.md
+**/PROJECT_SUMMARY.md
+
