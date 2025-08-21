@@ -42,7 +42,8 @@ class CudaQSamplingMode:
                  mode: str = "foundation",
                  fallback_on_error: bool = True,
                  validate_outputs: bool = True,
-                 performance_logging: bool = False):
+                 performance_logging: bool = False,
+                 surface_layout: str = "planar"):
         """
         Initialize CUDA-Q sampling configuration.
         
@@ -58,6 +59,7 @@ class CudaQSamplingMode:
         self.fallback_on_error = fallback_on_error
         self.validate_outputs = validate_outputs
         self.performance_logging = performance_logging
+        self.surface_layout = surface_layout
         
         if enabled and not CUDAQ_AVAILABLE:
             warnings.warn("CUDA-Q backend requested but not available. Using fallback.")
@@ -88,6 +90,7 @@ def create_cudaq_surface_sampler(original_sampler: Callable, config: CudaQSampli
         T = args[1] if len(args) > 1 else kwargs.get('T', 3)
         d = args[2] if len(args) > 2 else kwargs.get('d', 3)
         bitpack = kwargs.get('bitpack', False)
+        surface_layout = kwargs.get('surface_layout', config.surface_layout)
         
         # Create RNG if seed provided
         rng = None
@@ -105,7 +108,8 @@ def create_cudaq_surface_sampler(original_sampler: Callable, config: CudaQSampli
                 d=d,
                 layout=None,  # Use default d=3 layout
                 rng=rng,
-                bitpack=bitpack
+                bitpack=bitpack,
+                surface_layout=surface_layout
             )
             
             if config.performance_logging and start_time is not None:

@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 # --- Imports from our project ---
-from panq_functions import GNNDecoder # From the Astra codebase
+from panq_functions import GNNDecoder, surface_code_edges # From the Astra codebase
 from mamba_ssm import Mamba
 
 # ==============================================================================
@@ -86,6 +87,360 @@ class MGHD(nn.Module):
         # --- Part 4: The Interface Layer (FIXED) ---
         # Project from Mamba's output to GNN's expected n_node_inputs (not n_node_features)
         self.projection = nn.Linear(C, gnn_params['n_node_inputs'])
+        
+        # Store dimensions for inference
+        self.dist = gnn_params['dist']
+        self.n_node_inputs = gnn_params['n_node_inputs']
+        self.n_node_outputs = gnn_params['n_node_outputs']
+        
+        # Precompute static indices for inference (will be created on first use)
+        self.register_buffer('_check_node_indices', None, persistent=False)
+        self.register_buffer('_src_ids', None, persistent=False)
+        self.register_buffer('_dst_ids', None, persistent=False)
+        self.register_buffer('_edge_index', None, persistent=False)
+        self.register_buffer('_node_feature_index', None, persistent=False)  # [num_nodes, k]
+        
+        # Code configuration for authoritative indices
+        self.code_config = {
+            'type': 'surface',  # Default to surface code
+            'distance': self.dist
+        }
+
+    def _build_authoritative_indices(self, device):
+        """
+        Build authoritative gather indices from actual code matrices.
+        Creates proper bipartite graph structure from Hx/Hz matrices.
+        """
+        from panqec.codes import surface_2d
+        
+        code_type = self.code_config['type']
+        distance = self.code_config['distance']
+        
+        if code_type == 'surface':
+            # Create surface code using existing Astra code
+            code = surface_2d.Planar2DCode(distance)
+            
+            # Get the stabilizer matrix (Hx and Hz combined)
+            # For surface codes, we need to construct the bipartite graph
+            # between check nodes (syndrome bits) and data qubits
+            
+            # Extract Hx and Hz matrices
+            Hx = code.Hx.toarray()  # X stabilizers
+            Hz = code.Hz.toarray()  # Z stabilizers
+            
+            # Number of check nodes (syndrome bits)
+            num_x_checks = Hx.shape[0]  # X stabilizers
+            num_z_checks = Hz.shape[0]  # Z stabilizers
+            num_check_nodes = num_x_checks + num_z_checks
+            
+            # Number of data qubits
+            num_data_qubits = Hx.shape[1]  # Should equal Hz.shape[1]
+            
+            # Total nodes: check nodes + data qubits
+            total_nodes = num_check_nodes + num_data_qubits
+            
+            # Build edge indices from Hx and Hz matrices (directed, add reverse to match training)
+            src_ids = []
+            dst_ids = []
+            
+            # Add edges from Hx matrix (X stabilizers to data qubits)
+            for i in range(num_x_checks):
+                for j in range(num_data_qubits):
+                    if Hx[i, j] == 1:
+                        # Edge from check node i to data qubit j
+                        src_ids.append(i)
+                        dst_ids.append(num_check_nodes + j)
+            
+            # Add edges from Hz matrix (Z stabilizers to data qubits)
+            for i in range(num_z_checks):
+                for j in range(num_data_qubits):
+                    if Hz[i, j] == 1:
+                        # Edge from check node (num_x_checks + i) to data qubit j
+                        src_ids.append(num_x_checks + i)
+                        dst_ids.append(num_check_nodes + j)
+            
+            # Add reverse edges (data -> check) to mirror message passing in training utilities
+            src_ids_rev = [num_check_nodes + j for _i in range(num_x_checks) for j in range(num_data_qubits) if Hx[_i, j] == 1]
+            dst_ids_rev = [i for i in range(num_x_checks) for j in range(num_data_qubits) if Hx[i, j] == 1]
+            src_ids_rev += [num_check_nodes + j for _i in range(num_z_checks) for j in range(num_data_qubits) if Hz[_i, j] == 1]
+            dst_ids_rev += [num_x_checks + i for i in range(num_z_checks) for j in range(num_data_qubits) if Hz[i, j] == 1]
+
+            src_ids_all = src_ids + src_ids_rev
+            dst_ids_all = dst_ids + dst_ids_rev
+
+            # Convert to tensors
+            src_ids = torch.tensor(src_ids_all, device=device, dtype=torch.long)
+            dst_ids = torch.tensor(dst_ids_all, device=device, dtype=torch.long)
+            
+            # Create check node indices
+            check_indices = torch.arange(num_check_nodes, device=device, dtype=torch.long)
+            
+            # Assert bounds checking
+            assert src_ids.max() < total_nodes, f"src_ids max {src_ids.max()} >= total_nodes {total_nodes}"
+            assert dst_ids.max() < total_nodes, f"dst_ids max {dst_ids.max()} >= total_nodes {total_nodes}"
+            assert len(src_ids) > 0, "No edges found in code graph"
+
+            # Build node_feature_index: map each node to a syndrome feature index (only checks map, qubits = -1)
+            node_feature_index = torch.full((total_nodes, 1), fill_value=-1, device=device, dtype=torch.long)
+            node_feature_index[:num_check_nodes, 0] = torch.arange(num_check_nodes, device=device, dtype=torch.long)
+
+            # Edge index convenience buffer [2, num_edges]
+            edge_index = torch.stack([src_ids, dst_ids], dim=0)
+
+            return (
+                check_indices,
+                src_ids,
+                dst_ids,
+                edge_index,
+                node_feature_index,
+                num_check_nodes,
+                num_data_qubits,
+            )
+            
+        elif code_type == 'bb':
+            # Build from BB code matrices (using existing utilities)
+            from bb_panq_functions import bb_code
+            code = bb_code(distance)
+
+            Hx = code.hx.astype(int)
+            Hz = code.hz.astype(int)
+
+            num_x_checks = Hx.shape[0]
+            num_z_checks = Hz.shape[0]
+            num_check_nodes = num_x_checks + num_z_checks
+            num_data_qubits = Hx.shape[1]
+            total_nodes = num_check_nodes + num_data_qubits
+
+            src_ids = []
+            dst_ids = []
+            for i in range(num_x_checks):
+                for j in range(num_data_qubits):
+                    if Hx[i, j] == 1:
+                        src_ids.append(i)
+                        dst_ids.append(num_check_nodes + j)
+            for i in range(num_z_checks):
+                for j in range(num_data_qubits):
+                    if Hz[i, j] == 1:
+                        src_ids.append(num_x_checks + i)
+                        dst_ids.append(num_check_nodes + j)
+
+            # Add reverse edges
+            src_ids_rev = [num_check_nodes + j for _i in range(num_x_checks) for j in range(num_data_qubits) if Hx[_i, j] == 1]
+            dst_ids_rev = [i for i in range(num_x_checks) for j in range(num_data_qubits) if Hx[i, j] == 1]
+            src_ids_rev += [num_check_nodes + j for _i in range(num_z_checks) for j in range(num_data_qubits) if Hz[_i, j] == 1]
+            dst_ids_rev += [num_x_checks + i for i in range(num_z_checks) for j in range(num_data_qubits) if Hz[i, j] == 1]
+
+            src_ids_all = src_ids + src_ids_rev
+            dst_ids_all = dst_ids + dst_ids_rev
+
+            src_ids = torch.tensor(src_ids_all, device=device, dtype=torch.long)
+            dst_ids = torch.tensor(dst_ids_all, device=device, dtype=torch.long)
+
+            check_indices = torch.arange(num_check_nodes, device=device, dtype=torch.long)
+
+            assert src_ids.max() < total_nodes, f"src_ids max {src_ids.max()} >= total_nodes {total_nodes}"
+            assert dst_ids.max() < total_nodes, f"dst_ids max {dst_ids.max()} >= total_nodes {total_nodes}"
+            assert len(src_ids) > 0, "No edges found in code graph (BB)"
+
+            node_feature_index = torch.full((total_nodes, 1), fill_value=-1, device=device, dtype=torch.long)
+            node_feature_index[:num_check_nodes, 0] = torch.arange(num_check_nodes, device=device, dtype=torch.long)
+            edge_index = torch.stack([src_ids, dst_ids], dim=0)
+
+            return (
+                check_indices,
+                src_ids,
+                dst_ids,
+                edge_index,
+                node_feature_index,
+                num_check_nodes,
+                num_data_qubits,
+            )
+            
+        else:
+            raise ValueError(f"Unknown code type: {code_type}")
+
+    def set_output_size_from_metadata(self, meta: dict):
+        """
+        Adjust head/output size based on metadata N_bits (e.g., 9 rotated, 13 planar).
+        Reinitialize layers only if size changes; log the change.
+        """
+        if not isinstance(meta, dict) or 'N_bits' not in meta:
+            return
+        target_bits = int(meta['N_bits'])
+        # Our GNN head dimension is self.gnn.n_node_outputs; adjust if mismatch
+        current = self.gnn.n_node_outputs
+        if current != target_bits:
+            device = next(self.parameters()).device
+            self.gnn.n_node_outputs = target_bits
+            # Replace final_digits in GNN head to match new outputs
+            self.gnn.final_digits = nn.Linear(self.gnn.n_node_features, target_bits).to(device)
+            print(f"[MGHD] Adjusted head outputs from {current} to {target_bits} per metadata")
+
+    def _ensure_static_indices(self, device):
+        """Create static index tensors for inference if they don't exist"""
+        if self._check_node_indices is None:
+            # Build authoritative indices from actual code matrices
+            (
+                check_indices,
+                src_ids,
+                dst_ids,
+                edge_index,
+                node_feature_index,
+                num_check_nodes,
+                num_data_qubits,
+            ) = self._build_authoritative_indices(device)
+            
+            # Register the authoritative indices as buffers
+            self.register_buffer('_check_node_indices', check_indices, persistent=False)
+            self.register_buffer('_src_ids', src_ids, persistent=False)
+            self.register_buffer('_dst_ids', dst_ids, persistent=False)
+            self.register_buffer('_edge_index', edge_index, persistent=False)
+            self.register_buffer('_node_feature_index', node_feature_index, persistent=False)
+            
+            # Store dimensions for later use
+            self._num_check_nodes = num_check_nodes
+            self._num_data_qubits = num_data_qubits
+
+    def decode_one(self, packed_syndrome: torch.ByteTensor, *, device: str="cuda", temporal_T: int=1, metadata: dict = None) -> torch.ByteTensor:
+        """
+        Fast inference for a single syndrome (batch=1).
+        
+        Args:
+            packed_syndrome: Either [N_bytes] packed or [N_syn] unpacked syndrome
+            device: Target device
+            temporal_T: Number of temporal steps (default=1 for single-shot)
+            
+        Returns:
+            Correction decisions as uint8 tensor [1, N_bits]
+        """
+        # Ensure static indices are created
+        self._ensure_static_indices(device)
+        
+        # Unit check: assert indices are non-empty and within bounds
+        assert self._src_ids.numel() > 0, "Source indices are empty"
+        assert self._dst_ids.numel() > 0, "Destination indices are empty"
+        total_nodes_bound = self._num_check_nodes + self._num_data_qubits
+        assert int(self._src_ids.max().item()) < total_nodes_bound, (
+            f"src_ids max {int(self._src_ids.max().item())} >= total nodes {total_nodes_bound}"
+        )
+        assert int(self._dst_ids.max().item()) < total_nodes_bound, (
+            f"dst_ids max {int(self._dst_ids.max().item())} >= total nodes {total_nodes_bound}"
+        )
+        
+        # Optional metadata shape check
+        if metadata and isinstance(metadata, dict) and 'N_bits' in metadata:
+            if hasattr(self.gnn, 'n_node_outputs') and self.gnn.n_node_outputs != int(metadata['N_bits']):
+                raise ValueError(f"Model head outputs {self.gnn.n_node_outputs} != metadata N_bits {metadata['N_bits']}")
+
+        # Handle packed vs unpacked input
+        N_syn = self._num_check_nodes  # Number of syndrome bits from authoritative indices
+        N_bytes = (N_syn + 7) // 8  # Ceiling division
+        
+        if packed_syndrome.dim() == 1 and packed_syndrome.dtype == torch.uint8:
+            if packed_syndrome.shape[0] == N_bytes:
+                # Packed input - need to unpack
+                unpacked = torch.zeros(1, N_syn, dtype=torch.float32, device=device)
+                for i in range(N_syn):
+                    byte_idx = i // 8
+                    bit_idx = i % 8
+                    unpacked[0, i] = (packed_syndrome[byte_idx] >> bit_idx) & 1
+                syndrome = unpacked
+            elif packed_syndrome.shape[0] == N_syn:
+                # Unpacked input with uint8 dtype
+                syndrome = packed_syndrome.to(dtype=torch.float32, device=device)
+                syndrome = syndrome.unsqueeze(0)  # Add batch dimension
+            else:
+                raise ValueError(f"Expected {N_bytes} bytes for packed or {N_syn} bits for unpacked syndrome, got {packed_syndrome.shape[0]}")
+        else:
+            # Assume already unpacked with different dtype
+            syndrome = packed_syndrome.to(dtype=torch.float32, device=device)
+            if syndrome.dim() == 1:
+                syndrome = syndrome.unsqueeze(0)  # Add batch dimension
+        
+        # Ensure we have the right shape [1, N_syn]
+        if syndrome.shape != (1, self._num_check_nodes):
+            raise ValueError(f"Expected syndrome shape [1, {self._num_check_nodes}], got {syndrome.shape}")
+        
+        # Create full node inputs tensor [1, nodes_per_graph, n_node_inputs]
+        num_check_nodes = self._num_check_nodes
+        num_qubit_nodes = self._num_data_qubits
+        nodes_per_graph = num_check_nodes + num_qubit_nodes
+        
+        # Initialize with zeros
+        node_inputs = torch.zeros(1, nodes_per_graph, self.n_node_inputs, device=device, dtype=torch.float32)
+        
+        # Place syndrome in check node positions (first num_check_nodes positions)
+        # Convert syndrome to one-hot encoding for the first feature dimension
+        for i in range(num_check_nodes):
+            node_inputs[0, i, 0] = syndrome[0, i]  # First feature is syndrome bit
+        
+        # Reshape for model forward pass [batch*n_nodes, n_node_inputs]
+        node_inputs_flat = node_inputs.view(-1, self.n_node_inputs)
+        
+        # Forward pass through the model
+        with torch.no_grad():
+            outputs = self.forward(node_inputs_flat, self._src_ids, self._dst_ids)
+        
+        # Extract final iteration outputs and qubit node decisions
+        final_outputs = outputs[-1]  # [batch*n_nodes, n_node_outputs]
+        
+        # Extract qubit node outputs (last num_qubit_nodes positions)
+        qubit_outputs = final_outputs[num_check_nodes:num_check_nodes + num_qubit_nodes]
+        
+        # Convert to binary decisions (argmax for classification)
+        decisions = torch.argmax(qubit_outputs, dim=1, keepdim=True)  # [num_qubit_nodes, 1]
+        
+        # Reshape to [1, N_bits] and convert to uint8
+        decisions = decisions.view(1, -1).to(torch.uint8)
+        
+        return decisions
+
+    def export_onnx_int8_ready(self, path: str, N_syn: int, N_bits: int):
+        """
+        Export model to ONNX format ready for int8 quantization.
+        
+        Args:
+            path: Output ONNX file path
+            N_syn: Number of syndrome bits
+            N_bits: Number of output bits
+        """
+        device = next(self.parameters()).device
+        
+        # Create dummy inputs for tracing
+        # Ensure static indices are created to get proper dimensions
+        self._ensure_static_indices(device)
+        num_check_nodes = self._num_check_nodes
+        num_qubit_nodes = self._num_data_qubits
+        nodes_per_graph = num_check_nodes + num_qubit_nodes
+        
+
+        
+        # Create dummy inputs
+        dummy_node_inputs = torch.randn(1, nodes_per_graph, self.n_node_inputs, device=device, dtype=torch.float32)
+        dummy_node_inputs_flat = dummy_node_inputs.view(-1, self.n_node_inputs)
+        
+        # Set model to eval mode
+        self.eval()
+        
+        # Export to ONNX
+        torch.onnx.export(
+            self,
+            (dummy_node_inputs_flat, self._src_ids, self._dst_ids),
+            path,
+            export_params=True,
+            opset_version=11,
+            do_constant_folding=True,
+            input_names=['node_inputs', 'src_ids', 'dst_ids'],
+            output_names=['outputs'],
+            dynamic_axes={
+                'node_inputs': {0: 'batch_nodes'},
+                'outputs': {1: 'batch_nodes'}
+            }
+        )
+        
+        print(f"Model exported to {path}")
+        print(f"Input shape: [batch_nodes, {self.n_node_inputs}]")
+        print(f"Output shape: [{self.gnn.n_iters}, batch_nodes, {self.n_node_outputs}]")
 
     def forward(self, node_inputs, src_ids, dst_ids, priors=None):
         """

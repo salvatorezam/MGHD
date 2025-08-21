@@ -1,6 +1,6 @@
 # CUDA-Q Backend Verification Report
 
-Generated on: 2025-08-20 15:20:30
+Generated on: 2025-08-21 17:31:25
 
 ## Executive Summary
 
@@ -17,7 +17,7 @@ Running: Unit Tests
 Test command: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python -m pytest tests/ -v --tb=short
 Exit code: 0
 ✓ All unit tests passed
-Test summary: ============================== 28 passed in 2.41s ==============================
+Test summary: ============================== 28 passed in 2.45s ==============================
 ✅ Unit Tests PASSED
 
 ============================================================
@@ -190,6 +190,66 @@ BB samples shape: (10000, 25)
 ✅ Packing Consistency PASSED
 
 ============================================================
+Running: Rotated Layout Sanity
+============================================================
+
+## Rotated Layout Sanity
+
+Rotated couplers used: [(0, 3), (3, 8), (5, 6), (7, 8), (8, 13), (14, 18), (15, 16), (15, 19)]
+Rotated samples shape: (5000, 8)
+✓ Rotated surface shapes OK (B,8)
+✅ Rotated Layout Sanity PASSED
+
+============================================================
+Running: Rotated Teacher Sanity
+============================================================
+
+## Rotated Teacher Sanity
+
+Generating 8192 rotated syndromes (student mode)...
+Generated samples shape: (8192, 8)
+Testing Relay-BP teacher...
+Testing MWPM teacher (known unsupported on rotated)...
+MWPM unexpectedly succeeded on rotated; continuing (info only).
+Testing MWPF teacher (HyperBlossom)...
+✓ MWPF labels shape and dtype OK: (8192, 9) uint8
+✓ Relay labels shape and dtype OK: (8192, 9) uint8
+Performing parity spot-check...
+⚠ Relay parity validation: 789 mismatches (may need H matrix sync with CUDA-Q)
+Running accuracy probe on 5000 samples...
+Relay empirical LER: 0.2096
+MWPM empirical LER: 0.2090
+✓ Both decoders reasonable: Relay=0.2096, MWPM=0.2090
+✓ Rotated Teacher Sanity PASSED
+Comparing teacher performance...
+MWPF empirical LER: 0.2096
+Relay-MWPF agreement: 1.0000
+⚠ Relay-MWPF agreement very high: 1.0000 (teachers may be too similar)
+✅ Rotated Teacher Sanity PASSED
+
+============================================================
+Running: Rotated MWPF Lift Sanity
+============================================================
+
+## Rotated MWPF Lift Sanity
+
+Generating 8192 rotated syndromes (student mode)...
+Generated samples shape: (8192, 8)
+Testing MWPF teacher...
+Testing ENSEMBLE teacher on rotated d=3 (strict split parity, full batch)
+Running ensemble teacher: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python tools/relay_teacher.py --code surface --surface-layout rotated --distance 3 --teacher ensemble --input-syndromes /u/home/kulp/MGHD/scratchpad/initial-test/reports/tmp_rotated_ensemble_syndromes.npz --out /u/home/kulp/MGHD/scratchpad/initial-test/reports/tmp_rotated_ensemble_labels.npz --timeout-ms 50 --packed
+✓ Ensemble strict split parity validation passed for 8192 samples (0 mismatches)
+✓ Labels shape and dtype OK: (8192, 9) uint8
+✓ Split parity exactness passed for both teachers (0 mismatches)
+MWPF-Ensemble agreement: 1.0000
+✓ Agreement 1.0000 ≥ 0.8
+MWPF empirical LER: 0.1972
+Ensemble empirical LER: 0.1972
+✓ LER is finite and reasonable
+✓ Rotated MWPF Lift Sanity PASSED
+✅ Rotated MWPF Lift Sanity PASSED
+
+============================================================
 Running: Throughput Benchmarks
 ============================================================
 
@@ -201,22 +261,22 @@ Target: Target nvidia
 GPU: NVIDIA H100 NVL
 Performance Metrics:
   Mean time per batch: 0.004 ± 0.000 seconds
-  Mean throughput: 248,806 samples/second
+  Mean throughput: 248,143 samples/second
 Benchmarking surface code d=3...
-Surface d=3, B=10000: 299313 samples/sec
-Surface d=3, B=50000: 679363 samples/sec
+Surface d=3, B=10000: 250403 samples/sec
+Surface d=3, B=50000: 726689 samples/sec
 Benchmarking BB code...
-BB code, B=10000: 433937 samples/sec
-BB code, B=50000: 556646 samples/sec
+BB code, B=10000: 497091 samples/sec
+BB code, B=50000: 547445 samples/sec
 
 ### Throughput Benchmark Results
 
 | Code Type | Batch Size | Duration | Samples/sec |
 | --- | --- | --- | --- |
-| Surface d=3 | 10000 | 0.03s | 299313 |
-| Surface d=3 | 50000 | 0.07s | 679363 |
-| BB code | 10000 | 0.02s | 433937 |
-| BB code | 50000 | 0.09s | 556646 |
+| Surface d=3 | 10000 | 0.04s | 250403 |
+| Surface d=3 | 50000 | 0.07s | 726689 |
+| BB code | 10000 | 0.02s | 497091 |
+| BB code | 50000 | 0.09s | 547445 |
 
 
 ### Environment Information
@@ -249,19 +309,16 @@ Running: Trainer Smoke Test
 
 Running real training subprocess...
 Command: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python poc_gnn_train.py --backend cudaq --cudaq-mode foundation --T-rounds 1 --bitpack --d 3 --epochs 1 --batch-size 2048 --steps-per-epoch 30
-Training completed in 192.4 seconds
-Loss values captured: 26
-First 5 steps avg loss: 0.621184
-Last 5 steps avg loss: 0.467884
-Improvement: 24.68%
+Training completed in 44.8 seconds
+Insufficient loss values captured: 2
 
 ### Training Smoke Test Results
 
 | Metric | Value |
 | --- | --- |
-| Training time | 192.4s |
+| Training time | 44.8s |
 | Return code | 0 |
-| Loss values captured | 26 |
+| Loss values captured | 2 |
 | Batch shapes logged | 0 |
 | Data types logged | 0 |
 | Loss improvement ≥5% | ✓ YES |

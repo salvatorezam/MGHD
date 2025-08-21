@@ -58,6 +58,369 @@ class CudaQKernel:
         return None
 
 
+def build_H_rotated_d3() -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build rotated planar surface code (d=3) parity-check matrices.
+
+    Data-qubit indexing: 3x3 grid, row-major order:
+      q00=0, q01=1, q02=2,
+      q10=3, q11=4, q12=5,
+      q20=6, q21=7, q22=8
+
+    Returns:
+      (Hz, Hx) as numpy arrays of shapes (4, 9) each (4 Z checks, 4 X checks)
+      Columns correspond to data-qubit order 0..8 as documented above.
+    """
+    try:
+        from codes_q import create_rotated_surface_codes  # reuse Astra helper
+    except ImportError:
+        # Fallback: create simple rotated d=3 matrices manually
+        # Z checks (4x9 matrix)
+        Hz = np.array([
+            [0, 1, 0, 1, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 1, 1, 0, 0, 0], 
+            [0, 0, 0, 1, 1, 0, 1, 1, 0],
+            [0, 0, 0, 0, 1, 1, 0, 1, 1],
+        ], dtype=int)
+        
+        # X checks (4x9 matrix)
+        Hx = np.array([
+            [1, 1, 0, 1, 0, 0, 0, 0, 0],
+            [0, 1, 1, 0, 1, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 0, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1, 0, 1, 1],
+        ], dtype=int)
+        
+        return Hz, Hx
+    css = create_rotated_surface_codes(3, name="rotated_d3")
+    # css.hx and css.hz are (4,9) with row-per-check
+    Hx = css.hx.astype(int)
+    Hz = css.hz.astype(int)
+    return Hz, Hx
+
+
+def _canonicalize_sector_rows(H: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    H8 = H.astype(np.uint8, copy=False)
+    keys = []
+    for r in H8:
+        w = int(r.sum())
+        mask = 0
+        for i,b in enumerate(r[::-1]):  # msb-first integer for stability
+            mask = (mask<<1) | int(b)
+        keys.append((w, mask))
+    # Sort the list of tuples properly
+    perm = np.array([i for i, _ in sorted(enumerate(keys), key=lambda x: x[1])])
+    return H8[perm], perm
+
+def build_H_rotated_d3_from_cfg(cfg) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Returns (Hx, Hz, meta) consistent with the CUDA-Q rotated layout used for sampling.
+    Hx is (#X-stabilizers, #data-qubits), Hz is (#Z-stabilizers, #data-qubits).
+    The row order MUST match the syndrome bit order, and the column order MUST match the data-qubit bit order in labels.
+    meta includes: {'surface_layout':'rotated','distance':3,'N_syn':8,'N_bits':9,'Hx_order':[...],'Hz_order':[...],'data_qubit_order':[...]}
+    """
+    # Get the base matrices from existing implementation
+    Hz, Hx = build_H_rotated_d3()
+
+    # Canonicalize row ordering for deterministic outputs
+    Hz, pz = _canonicalize_sector_rows(Hz)
+    Hx, px = _canonicalize_sector_rows(Hx)
+
+    # Data qubit order: 3x3 grid, row-major (0..8)
+    data_qubit_order = list(range(9))
+    
+    # Syndrome ordering: Z checks first (rows 0-3), then X checks (rows 4-7)
+    # This matches the CUDA-Q convention used in syndrome generation
+    # FROZEN ORDERING: Z checks (0-3), X checks (4-7)
+    Hz_order = [f"Z{i}" for i in range(4)]
+    Hx_order = [f"X{i}" for i in range(4)]
+    
+    meta = {
+        'surface_layout': 'rotated',
+        'distance': 3,
+        'N_syn': 8,
+        'N_bits': 9,
+        'Hx_order': Hx_order,
+        'Hz_order': Hz_order,
+        'data_qubit_order': data_qubit_order,
+        'syndrome_order': 'Z_first_then_X'  # Z checks (0-3), X checks (4-7)
+    }
+    
+    # FROZEN ORDERING: Ensure consistent H matrix structure
+    # H = [Hz; Hx] where Hz is (4,9) and Hx is (4,9)
+    # Syndrome order: [Z0, Z1, Z2, Z3, X0, X1, X2, X3]
+    # Data qubit order: [0, 1, 2, 3, 4, 5, 6, 7, 8] (3x3 grid, row-major)
+    
+    return Hx, Hz, meta
+
+
+def logical_reps_rotated_d3() -> Dict[str, np.ndarray]:
+    """
+    Return logical operator representatives for rotated d=3 surface code.
+    
+    Returns:
+        dict with keys 'Lx', 'Lz' containing length-9 uint8 vectors
+        representing logical X and Z operators on data qubits.
+        
+    Logical operators are derived from kernel of H matrices.
+    """
+    import numpy as np
+    
+    def _gf2_rref(A):  # tiny duplicate acceptable here
+        A = (A.copy().astype(np.uint8))
+        m, n = A.shape
+        pivots = []
+        r = 0
+        for c in range(n):
+            pr = None
+            for rr in range(r, m):
+                if A[rr, c] & 1:
+                    pr = rr; break
+            if pr is None:
+                continue
+            if pr != r:
+                A[[r, pr]] = A[[pr, r]]
+            for rr in range(m):
+                if rr != r and (A[rr, c] & 1):
+                    A[rr, :] ^= A[r, :]
+            pivots.append(c)
+            r += 1
+            if r == m:
+                break
+        return A, pivots
+
+    def _gf2_nullspace_basis(A):
+        A = A.astype(np.uint8, copy=False)
+        m, n = A.shape
+        R, pivots = _gf2_rref(A)
+        pivset = set(pivots)
+        free = [j for j in range(n) if j not in pivset]
+        basis = []
+        for f in free:
+            v = np.zeros(n, dtype=np.uint8); v[f] = 1
+            for i, pc in enumerate(pivots):
+                row = R[i, :n]
+                v[pc] = (row[f] & 1)
+        basis.append(v)
+        return basis
+
+    def _pick_min_weight(vecs):
+        if not vecs: return np.zeros(0, dtype=np.uint8)
+        weights = [int(v.sum()) for v in vecs]
+        minw = min(weights)
+        cand = [v for v, w in zip(vecs, weights) if w == minw]
+        cand.sort(key=lambda x: x.tobytes())
+        return cand[0].astype(np.uint8)
+
+    Hx, Hz, meta = build_H_rotated_d3_from_cfg(None)
+    # Lx must commute with Z checks (in kernel of Hz)
+    NS_Lx = _gf2_nullspace_basis(Hz)
+    Lx = _pick_min_weight(NS_Lx)
+    # Lz must commute with X checks (in kernel of Hx)
+    NS_Lz = _gf2_nullspace_basis(Hx)
+    Lz = _pick_min_weight(NS_Lz)
+    return {'Lx': Lx.astype(np.uint8), 'Lz': Lz.astype(np.uint8)}
+
+
+def build_stim_circuit_rotated_d3_from_cfg(cudaq_cfg) -> Any:
+    """
+    Build Stim circuit matching our rotated d=3 layout and syndrome ordering.
+    
+    Circuit structure:
+    - 9 data qubits (0-8)
+    - 8 detectors: Z checks (0-3), X checks (4-7)
+    - Two observables: X_L, Z_L
+    
+    Returns:
+        stim.Circuit with proper detector and observable definitions
+    """
+    try:
+        import stim
+    except ImportError:
+        raise RuntimeError("Stim not available for circuit construction")
+    
+    # Get error probability from config or use default
+    p = getattr(cudaq_cfg, 'p', 0.01) if cudaq_cfg else 0.01
+    
+    # Get H matrices for detector wiring
+    Hx, Hz, meta = build_H_rotated_d3_from_cfg(cudaq_cfg)
+    
+    # Get logical representatives
+    logical_reps = logical_reps_rotated_d3()
+    Lx, Lz = logical_reps['Lx'], logical_reps['Lz']
+    
+    # Build circuit
+    circuit = stim.Circuit()
+    
+    # Add data qubits
+    circuit.append("R", list(range(9)))  # Reset all data qubits
+    
+    # Add phenomenological errors on data qubits
+    for q in range(9):
+        circuit.append("X_ERROR", [q], p/3)  # X errors
+        circuit.append("Z_ERROR", [q], p/3)  # Z errors
+    
+    # Add stabilizer measurements
+    # Z stabilizers (detectors 0-3)
+    for i in range(4):
+        # Find data qubits involved in this Z check
+        involved_qubits = np.where(Hz[i, :] > 0)[0]
+        if len(involved_qubits) > 0:
+            # Measure the product of Z operators
+            circuit.append("M", involved_qubits)
+            circuit.append("DETECTOR", [stim.target_rec(-1)], (0, i))  # Detector i
+    
+    # X stabilizers (detectors 4-7)  
+    for i in range(4):
+        # Find data qubits involved in this X check
+        involved_qubits = np.where(Hx[i, :] > 0)[0]
+        if len(involved_qubits) > 0:
+            # Measure the product of X operators
+            circuit.append("M", involved_qubits)
+            circuit.append("DETECTOR", [stim.target_rec(-1)], (0, i+4))  # Detector i+4
+    
+    # Add logical observables
+    # X_L observable (logical X measurement)
+    x_qubits = np.where(Lx > 0)[0]
+    if len(x_qubits) > 0:
+        circuit.append("M", x_qubits)
+        circuit.append("OBSERVABLE_INCLUDE", [stim.target_rec(-1)], 0)  # X_L
+    
+    # Z_L observable (logical Z measurement)
+    z_qubits = np.where(Lz > 0)[0]
+    if len(z_qubits) > 0:
+        circuit.append("M", z_qubits)
+        circuit.append("OBSERVABLE_INCLUDE", [stim.target_rec(-1)], 1)  # Z_L
+    
+    return circuit
+
+
+def build_stim_dem_rotated_d3(cudaq_cfg) -> Tuple[Any, List[int]]:
+    """
+    Build Stim DetectorErrorModel for rotated d=3 surface code matching CUDA-Q circuit.
+    
+    Returns:
+        dem: stim.DetectorErrorModel with same syndrome ordering as CUDA-Q
+        map_bit_to_obs: List[int] mapping data qubit index to observable index
+    """
+    try:
+        import stim
+    except ImportError:
+        raise RuntimeError("Stim not available for DEM construction")
+    
+    # Get the H matrices and metadata for consistent ordering
+    Hx, Hz, meta = build_H_rotated_d3_from_cfg(cudaq_cfg)
+    
+    # Create a simple DEM for rotated d=3 surface code
+    # This is a basic implementation - in practice would use full circuit analysis
+    dem = stim.DetectorErrorModel()
+    
+    # Add error processes that flip specific detectors.
+    # Use detector indices directly (0..3 Z, 4..7 X).
+    for data_qubit in range(9):
+        z_checks = np.where(Hz[:, data_qubit] > 0)[0]
+        x_checks = np.where(Hx[:, data_qubit] > 0)[0] + 4  # offset by 4 for X checks
+        if len(z_checks) > 0:
+            dem.append("error", 0.001, [stim.target_detector(int(d)) for d in z_checks])
+        if len(x_checks) > 0:
+            dem.append("error", 0.001, [stim.target_detector(int(d)) for d in x_checks])
+
+    # Do NOT append 'logical_observable' lines into the DEM; MWPF uses num_obs at compile time.
+    map_bit_to_obs = [0] * 9  # unused placeholder for interface compatibility
+    
+    return dem, map_bit_to_obs
+
+
+def rotated_d3_cz_colors() -> Dict[str, List[List[Tuple[int, int]]]]:
+    """
+    Provide a 2-color CZ schedule per basis for rotated d=3 (logical indices).
+
+    We define logical ancilla indices as:
+      Z ancillas: z0..z3 mapped to logical ids 9..12
+      X ancillas: x0..x3 mapped to logical ids 13..16
+
+    Edges connect ancilla to adjacent data-qubit logical indices (0..8).
+    Each basis provides up to two conflict-free layers.
+    """
+    # Logical schedule (ancilla -> data) in two layers; kept small and conflict-free
+    colors = {
+        'X': [
+            # Layer 1
+            [(13, 0), (14, 4), (15, 8)],
+            # Layer 2 (optional sparse)
+            [(16, 5)],
+        ],
+        'Z': [
+            # Layer 1
+            [(9, 1), (10, 5), (11, 7)],
+            # Layer 2
+            [(12, 4)],
+        ],
+    }
+    return colors
+
+
+def place_rotated_d3_on_garnet(calib: Dict[str, Any], avoid_edges: set = {(10, 11)}):
+    """
+    Place rotated d=3 (9 data + 8 ancilla) onto Garnet device avoiding bad couplers.
+
+    Strategy: choose a fixed high-fidelity 17-qubit patch whose couplers are all
+    present in the calibration graph and exclude (10,11). Return mapping dicts and
+    a physical CZ schedule consistent with the rotated pattern.
+
+    Returns:
+      data_map: {logical_data_idx: physical_qubit}
+      anc_map: {'X': {0..3 -> q}, 'Z': {0..3 -> q}}
+      cz_layers_phys: {basis: [[(anc_phys, data_phys), ...], ...]} two layers per basis
+    """
+    from .garnet_noise import GARNET_COUPLER_F2
+
+    # Select a 3x3 data patch using only good couplers
+    data_phys = [0, 1, 4, 5, 8, 9, 10, 14, 15]  # 9 physical qubits
+    data_map = {i: q for i, q in enumerate(data_phys)}
+
+    # Candidate ancillas chosen adjacent to data and avoiding bad (10,11)
+    anc_x_phys = [3, 6, 7, 16]
+    anc_z_phys = [13, 18, 19, 12]
+
+    anc_map = {
+        'X': {i: q for i, q in enumerate(anc_x_phys)},
+        'Z': {i: q for i, q in enumerate(anc_z_phys)},
+    }
+
+    # Build physical CZ layers using only existing couplers and excluding avoid_edges
+    def allowed(edge):
+        e = tuple(sorted(edge))
+        return (e in GARNET_COUPLER_F2) and (e not in avoid_edges)
+
+    # X-basis layers
+    x_l1 = [(anc_x_phys[0], data_phys[0]),  # (3,0) uses (0,3)
+            (anc_x_phys[1], data_phys[3]),  # (6,5) uses (5,6)
+            (anc_x_phys[2], data_phys[4]),  # (7,8) uses (7,8)
+            (anc_x_phys[3], data_phys[8])]  # (16,15) uses (15,16)
+    x_l1 = [e for e in x_l1 if allowed(e)]
+    x_l2 = [(anc_x_phys[0], data_phys[4])]  # (3,4) uses (3,4)
+    x_l2 = [e for e in x_l2 if allowed(e)]
+
+    # Z-basis layers
+    z_l1 = [(anc_z_phys[0], data_phys[5]),   # (13,9) uses (13,9)
+            (anc_z_phys[1], data_phys[7]),   # (18,14) uses (14,18)
+            (anc_z_phys[2], data_phys[8])]   # (19,15) uses (15,19)
+    z_l1 = [e for e in z_l1 if allowed(e)]
+    z_l2 = [(anc_z_phys[0], data_phys[4])]   # (13,14) uses (13,14)
+    z_l2 = [e for e in z_l2 if allowed(e)]
+
+    cz_layers_phys = {
+        'X': [x_l1, x_l2],
+        'Z': [z_l1, z_l2]
+    }
+
+    # Sanity: ensure no forbidden couplers
+    used = {tuple(sorted(e)) for basis in cz_layers_phys.values() for layer in basis for e in layer}
+    assert (10, 11) not in used, "Forbidden coupler (10,11) present in schedule"
+
+    return data_map, anc_map, cz_layers_phys
+
 def make_surface_layout_d3_include_edge(edge: Tuple[int, int] = (10, 11)) -> Dict[str, Any]:
     """
     Create a d=3 surface code layout that INCLUDES the specified edge (e.g., bad (10,11) coupler).

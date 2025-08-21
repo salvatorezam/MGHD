@@ -37,6 +37,21 @@ parser.add_argument('--bitpack', action='store_true',
                     help='Store syndrome data as bit-packed uint8 (CUDA-Q only)')
 parser.add_argument('--d', type=int, default=3,
                     help='Surface code distance (default: 3)')
+parser.add_argument('--surface-layout', choices=['rotated', 'planar'], default='rotated',
+                    help='Surface code layout type (default: rotated)')
+parser.add_argument('--teacher-syndromes', type=str, default=None, help='NPZ with teacher input syndromes')
+parser.add_argument('--teacher-labels-relay', type=str, default=None, help='NPZ with relay hard_labels')
+parser.add_argument('--teacher-labels-mwpm', type=str, default=None, help='NPZ with MWPM hard_labels')
+parser.add_argument('--teacher-labels-mwpf', type=str, default=None, help='NPZ with MWPF hard_labels')
+parser.add_argument('--teacher-labels-ensemble', type=str, default=None, help='NPZ with ensemble hard_labels')
+parser.add_argument('--teacher', choices=['none', 'mwpm', 'relay', 'mwpf', 'ensemble'], default='none',
+                    help='Teacher for generating labels: none, mwpm, relay, mwpf, or ensemble (default: none)')
+parser.add_argument('--epochs', type=int, default=1,
+                    help='Number of training epochs (default: 1)')
+parser.add_argument('--batch-size', type=int, default=128,
+                    help='Training batch size (default: 128)')
+parser.add_argument('--steps-per-epoch', type=int, default=0,
+                    help='Max training steps per epoch; 0 means process all batches')
 
 # Try to parse args, but provide defaults if running in notebook/interactive mode
 try:
@@ -46,6 +61,14 @@ try:
     cudaq_mode = args.cudaq_mode
     T_rounds = args.T_rounds
     bitpack = args.bitpack
+    surface_layout = args.surface_layout
+    teacher_synd = args.teacher_syndromes
+    teacher_relay = args.teacher_labels_relay
+    teacher_mwpm = args.teacher_labels_mwpm
+    teacher = args.teacher
+    epochs = args.epochs
+    batch_size = args.batch_size
+    steps_per_epoch = args.steps_per_epoch
 except SystemExit:
     # Fallback for interactive/notebook usage
     class Args:
@@ -55,12 +78,30 @@ except SystemExit:
             self.T_rounds = 1
             self.bitpack = False
             self.d = 3
+            self.surface_layout = 'rotated'
+            self.teacher_syndromes = None
+            self.teacher_labels_relay = None
+            self.teacher_labels_mwpm = None
+            self.teacher_labels_mwpf = None
+            self.teacher_labels_ensemble = None
+            self.teacher = 'none'
+            self.epochs = 1
+            self.batch_size = 128
+            self.steps_per_epoch = 0
     args = Args()
     d = args.d
     backend = args.backend
     cudaq_mode = args.cudaq_mode
     T_rounds = args.T_rounds
     bitpack = args.bitpack
+    surface_layout = args.surface_layout
+    teacher_synd = args.teacher_syndromes
+    teacher_relay = args.teacher_labels_relay
+    teacher_mwpm = args.teacher_labels_mwpm
+    teacher = args.teacher
+    epochs = args.epochs
+    batch_size = args.batch_size
+    steps_per_epoch = args.steps_per_epoch
 
 # Generate timestamp for this run
 run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -69,10 +110,14 @@ run_id = f"MGHD_vs_Baseline_d{d}_{backend}_{run_timestamp}"
 print(f"Configuration:")
 print(f"  Distance: {d}")
 print(f"  Backend: {backend}")
+print(f"  Surface layout: {surface_layout}")
+print(f"  Teacher: {teacher}")
 if backend == 'cudaq':
     print(f"  CUDA-Q Mode: {cudaq_mode}")
-    print(f"  Syndrome Rounds: {T_rounds}")
-    print(f"  Bit Packing: {bitpack}")
+    print(f"  T-rounds: {T_rounds}")
+print(f"  Epochs: {epochs}")
+print(f"  Batch size: {batch_size}")
+print(f"  Steps per epoch: {steps_per_epoch if steps_per_epoch > 0 else 'all'}")
 
 # Setup CUDA-Q configuration if needed
 cudaq_cfg = None
@@ -146,6 +191,45 @@ len_test_set = 5000  # Back to smaller test set for faster, optimistic tracking 
 test_err_rate = 0.05
 len_train_set = 20000 # original len_test_set * 10
 max_train_err_rate = 0.15
+
+# ============ TeacherDataset for supervised distillation ============
+class TeacherDataset(torch.utils.data.Dataset):
+    def __init__(self, syndromes_npz: str, relay_npz: str = None, mwpm_npz: str = None):
+        data = np.load(syndromes_npz)
+        if 'syndromes' not in data:
+            raise ValueError("Teacher syndromes NPZ missing 'syndromes'")
+        self.synd = data['syndromes'].astype(np.uint8)
+        self.meta = None
+        if 'metadata_json' in data:
+            try:
+                import json
+                self.meta = json.loads(str(data['metadata_json'].item()))
+            except Exception:
+                self.meta = None
+        self.labels_relay = None
+        self.labels_mwpm = None
+        if relay_npz:
+            z = np.load(relay_npz)
+            self.labels_relay = z['hard_labels'].astype(np.uint8)
+        if mwpm_npz:
+            z = np.load(mwpm_npz)
+            arr = z['hard_labels_mwpm']
+            if arr.size > 0:
+                self.labels_mwpm = arr.astype(np.uint8)
+        N = self.synd.shape[0]
+        if self.labels_relay is not None and self.labels_relay.shape[0] != N:
+            raise ValueError("Relay labels length mismatch with syndromes")
+        if self.labels_mwpm is not None and self.labels_mwpm.shape[0] != N:
+            raise ValueError("MWPM labels length mismatch with syndromes")
+
+    def __len__(self):
+        return self.synd.shape[0]
+
+    def __getitem__(self, idx):
+        x = torch.from_numpy(self.synd[idx])  # [N_syn] uint8
+        y_relay = torch.from_numpy(self.labels_relay[idx]) if self.labels_relay is not None else None
+        y_mwpm = torch.from_numpy(self.labels_mwpm[idx]) if self.labels_mwpm is not None else None
+        return x, y_relay, y_mwpm
 
 # ---- Curriculum for training error rate p (center near 0.05 over time) ----
 def sample_training_p(epoch, total_epochs):
@@ -243,6 +327,51 @@ print(f"Baseline GNN parameters: {sum(p.numel() for p in gnn_baseline.parameters
 # 2. Create your new Hybrid MGHD Model
 mghd_model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
 
+# If teacher metadata provided, adjust MGHD head to match N_bits (e.g., 9 for rotated)
+if teacher_synd is not None:
+    try:
+        import json as _json
+        _nz = np.load(teacher_synd)
+        if 'metadata_json' in _nz:
+            _meta = _json.loads(str(_nz['metadata_json'].item()))
+            mghd_model.set_output_size_from_metadata(_meta)
+            print(f"[Trainer] Adjusted MGHD head per metadata N_bits={_meta.get('N_bits')} (Surface layout: {_meta.get('surface_layout')})")
+        else:
+            _meta = None
+    except Exception as _e:
+        print(f"[Trainer] Warning: failed to read teacher metadata: {_e}")
+        _meta = None
+else:
+    _meta = None
+
+# If teacher relay labels provided, assert width equals model head width
+def _check_label_width(npz_path: str, label_key: str, expected: int):
+    if npz_path is None:
+        return
+    try:
+        _z = np.load(npz_path)
+        if label_key not in _z:
+            return
+        _arr = _z[label_key]
+        if _arr.size == 0:
+            return
+        if _arr.shape[1] != expected:
+            print(f"[ERROR] Teacher labels width {_arr.shape[1]} != model head {expected}")
+            sys.exit(2)
+    except Exception as _e:
+        print(f"[Trainer] Warning: could not validate teacher labels '{npz_path}': {_e}")
+
+_head_w = int(getattr(mghd_model.gnn, 'n_node_outputs', n_node_outputs))
+_check_label_width(teacher_relay, 'hard_labels', _head_w)
+_check_label_width(teacher_mwpm, 'hard_labels_mwpm', _head_w)
+
+# Fail-fast: If rotated surface layout and no metadata, ensure expected N_bits=9
+if surface_layout == 'rotated' and _meta is None and (teacher_relay is not None or teacher_mwpm is not None):
+    expected_rotated_bits = 9
+    if _head_w != expected_rotated_bits:
+        print(f"[ERROR] Rotated surface code expects {expected_rotated_bits} bits but model head has {_head_w}")
+        sys.exit(2)
+
 # ---- EMA for MGHD (eval-only) ----
 ema_decay = 0.999
 ema_state = {k: v.detach().clone() for k, v in mghd_model.state_dict().items()}
@@ -287,8 +416,11 @@ Train
 """ automatic mixed precision """
 scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-epochs = 30  # Back to optimal epoch count (was 50)
-batch_size = 128
+# Use CLI-controlled training duration and batch size
+epochs = int(epochs)
+batch_size = int(batch_size)
+# 0 means use all batches in the DataLoader
+steps_per_epoch = int(steps_per_epoch)
 
 # Keep constant LR (no cosine annealing) - this was key to ~0.06 LER sweet spot
 
@@ -394,43 +526,113 @@ for epoch in range(epochs):
     
     # Regenerate training data each epoch with curriculum p near 0.05
     p_train = sample_training_p(epoch, epochs)
-    trainset = adapt_trainset(
-        generate_syndrome_error_volume(code, error_model, p=p_train, batch_size=len_train_set,
-                                       backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg),
-        code, num_classes=n_node_inputs)
-    trainloader = DataLoader(trainset, batch_size=batch_size, collate_fn=collate, shuffle=True)
+    if teacher_synd is not None:
+        # Use TeacherDataset for supervised distillation
+        distil_ds = TeacherDataset(teacher_synd, relay_npz=teacher_relay, mwpm_npz=teacher_mwpm)
+        # Re-validate head size from metadata if present
+        if distil_ds.meta is not None:
+            mghd_model.set_output_size_from_metadata(distil_ds.meta)
+            _head_w = int(getattr(mghd_model.gnn, 'n_node_outputs', n_node_outputs))
+            # Validate teacher widths
+            if distil_ds.labels_relay is not None and distil_ds.labels_relay.shape[1] != _head_w:
+                print(f"[ERROR] Relay labels width {distil_ds.labels_relay.shape[1]} != model head {_head_w}")
+                sys.exit(2)
+            if distil_ds.labels_mwpm is not None and distil_ds.labels_mwpm.shape[1] != _head_w:
+                print(f"[ERROR] MWPM labels width {distil_ds.labels_mwpm.shape[1]} != model head {_head_w}")
+                sys.exit(2)
+        # Simple collate for distillation: produce node_inputs and teacher labels
+        def _distil_collate(batch):
+            xs = [torch.as_tensor(b[0], dtype=torch.uint8) for b in batch]
+            ys_relay = [b[1] for b in batch] if batch[0][1] is not None else None
+            ys_mwpm = [b[2] for b in batch] if batch[0][2] is not None else None
+            X = torch.stack(xs, dim=0)  # [B, N_syn]
+            # Build node_inputs for our GNN forward: pack into expected flat graph format
+            # Use existing collate by adapting to expected format later in loop
+            return X, (None if ys_relay is None else torch.stack(ys_relay, dim=0)), (None if ys_mwpm is None else torch.stack(ys_mwpm, dim=0))
+        trainloader = DataLoader(distil_ds, batch_size=batch_size, shuffle=True, collate_fn=_distil_collate)
+    else:
+        trainset = adapt_trainset(
+            generate_syndrome_error_volume(code, error_model, p=p_train, batch_size=len_train_set,
+                                           backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg),
+            code, num_classes=n_node_inputs)
+        trainloader = DataLoader(trainset, batch_size=batch_size, collate_fn=collate, shuffle=True)
     print(f"  [Curriculum] p_train={p_train:.5f}; batches={len(trainloader)}")
     
     # Initialize gradient accumulation for MGHD
     optimizer_mghd.zero_grad()
     
-    for i, (inputs, targets, src_ids, dst_ids) in enumerate(trainloader):
-        inputs, targets = inputs.to(device), targets.to(device)
-        src_ids, dst_ids = src_ids.to(device), dst_ids.to(device)
+    for i, batch in enumerate(trainloader):
+        if teacher_synd is None:
+            inputs, targets, src_ids, dst_ids = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+            src_ids, dst_ids = src_ids.to(device), dst_ids.to(device)
+        else:
+            # Distillation path
+            X_batch, Y_relay, Y_mwpm = batch
+            inputs, targets, src_ids, dst_ids = X_batch, Y_relay, Y_mwpm, None
 
         # --- Train the Baseline GNN ---
         optimizer_baseline.zero_grad()
         with torch.autocast(device_type=device.type, dtype=amp_data_type, enabled=use_amp):
-            outputs_baseline = gnn_baseline(inputs, src_ids, dst_ids)
-            loss_baseline = criterion(outputs_baseline[-1], targets)
+            if teacher_synd is None:
+                outputs_baseline = gnn_baseline(inputs, src_ids, dst_ids)
+                loss_baseline = criterion(outputs_baseline[-1], targets)
+            else:
+                # Skip baseline training when distilling from external teacher labels
+                loss_baseline = torch.tensor(0.0, device=device, dtype=amp_data_type)
 
-        scaler.scale(loss_baseline).backward()
-        scaler.step(optimizer_baseline)
-        scaler.update()
-        epoch_loss_baseline.append(loss_baseline.item())
+        if teacher_synd is None:
+            scaler.scale(loss_baseline).backward()
+            scaler.step(optimizer_baseline)
+            scaler.update()
+            epoch_loss_baseline.append(loss_baseline.item())
+        else:
+            # No-op baseline path during distillation
+            epoch_loss_baseline.append(0.0)
 
         # --- Train your Hybrid MGHD ---
         with torch.autocast(device_type=device.type, dtype=amp_data_type, enabled=use_amp):
             # Add noise injection for regularization (optimized: 0.00544) - only first 5 epochs
             effective_noise = noise_injection if epoch < 3 else 0.0
-            if effective_noise > 0 and inputs.dtype.is_floating_point:
+            if teacher_synd is None and effective_noise > 0 and inputs.dtype.is_floating_point:
                 noise = torch.randn_like(inputs) * effective_noise
                 noisy_inputs = inputs + noise
             else:
-                noisy_inputs = inputs
-                
-            outputs_mghd = mghd_model(noisy_inputs, src_ids, dst_ids)
-            loss_mghd = criterion(outputs_mghd[-1], targets)
+                noisy_inputs = inputs if teacher_synd is None else None
+
+            if teacher_synd is None:
+                outputs_mghd = mghd_model(noisy_inputs, src_ids, dst_ids)
+                loss_mghd = criterion(outputs_mghd[-1], targets)
+            else:
+                # Distillation: build node_inputs for batch=1 graphs and compute logits, then BCE/CE to teacher labels
+                X_batch, Y_relay, Y_mwpm = inputs, targets, src_ids  # mapped above
+                # Build graph inputs per sample (batch of independent graphs)
+                num_check_nodes = (dist**2 - 1) if surface_layout == 'planar' else 8
+                num_qubit_nodes = (dist**2) if surface_layout == 'planar' else 9
+                nodes_per_graph = num_check_nodes + num_qubit_nodes
+                B = X_batch.shape[0]
+                node_inputs = torch.zeros(B * nodes_per_graph, gnn_baseline.n_node_inputs, device=device, dtype=amp_data_type)
+                # Place syndrome in first feature of check nodes per graph
+                for b in range(B):
+                    off = b * nodes_per_graph
+                    xi = X_batch[b].to(device=device, dtype=torch.uint8)
+                    node_inputs[off:off+num_check_nodes, 0] = xi.to(node_inputs.dtype)
+                # Use training src/dst (single graph) tiled by batch size
+                og_src, og_dst = GNNDecoder.surface_code_edges
+                add = nodes_per_graph
+                tiled_src = torch.cat([og_src + b*add for b in range(B)]).to(device)
+                tiled_dst = torch.cat([og_dst + b*add for b in range(B)]).to(device)
+                outputs_mghd = mghd_model(node_inputs, tiled_src, tiled_dst)
+                logits = outputs_mghd[-1].view(B, nodes_per_graph, -1)[:, num_check_nodes:, :]  # [B, N_bits, C]
+                # Hard labels -> class indices per bit
+                loss_terms = []
+                if Y_relay is not None:
+                    y = Y_relay.to(device=device, dtype=torch.long)
+                    loss_terms.append(nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.view(-1)))
+                if Y_mwpm is not None:
+                    y = Y_mwpm.to(device=device, dtype=torch.long)
+                    loss_terms.append(nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.view(-1)))
+                loss_mghd = sum(loss_terms) / max(1, len(loss_terms)) if loss_terms else torch.tensor(0.0, device=device, dtype=amp_data_type)
             
             # Gradient accumulation (optimized: 1 step)
             loss_mghd = loss_mghd / accumulation_steps
@@ -464,6 +666,11 @@ for epoch in range(epochs):
         if (i + 1) % 20 == 0:
             print(f"  Batch {i+1}/{len(trainloader)} completed")
             sys.stdout.flush()
+
+    # Honor a cap on the number of steps per epoch (0 = use all batches)
+    if steps_per_epoch > 0 and (i + 1) >= steps_per_epoch:
+        print(f"  Reached steps-per-epoch limit ({steps_per_epoch}); breaking.")
+        break
 
     # Calculate average losses
     avg_loss_baseline = np.mean(epoch_loss_baseline)

@@ -25,7 +25,9 @@ from .circuits import (
     build_round_bb, 
     build_round_repetition,
     analyze_idle_qubits,
-    make_surface_layout_d3_avoid_bad_edges
+    make_surface_layout_d3_avoid_bad_edges,
+    build_H_rotated_d3,
+    place_rotated_d3_on_garnet,
 )
 
 
@@ -444,7 +446,8 @@ def pack_syndrome_and_errors(syndrome: np.ndarray, x_errors: np.ndarray, z_error
 
 
 def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, Any],
-                        rng: np.random.Generator, bitpack: bool = False) -> np.ndarray:
+                        rng: np.random.Generator, bitpack: bool = False,
+                        surface_layout: str = "planar") -> np.ndarray:
     """
     Sample surface code syndromes using CUDA-Q with circuit-level noise.
     
@@ -471,6 +474,22 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, A
     
     noise_model = GarnetNoiseModel(params)
     simulator = CudaQSimulator(noise_model, batch_size, rng)
+
+    # Optional rotated layout override for d=3
+    if surface_layout == "rotated":
+        # Place rotated d=3 onto Garnet avoiding bad edges
+        data_map, anc_map, cz_layers_phys = place_rotated_d3_on_garnet(params)
+        # Build layout dict
+        layout = {
+            'data': [data_map[i] for i in sorted(data_map.keys())],
+            'ancilla_x': [anc_map['X'][i] for i in sorted(anc_map['X'].keys())],
+            'ancilla_z': [anc_map['Z'][i] for i in sorted(anc_map['Z'].keys())],
+            'cz_layers': cz_layers_phys['X'] + cz_layers_phys['Z'],
+            'prx_layers': [list(anc_map['X'].values()), []],
+            'total_qubits': max(max(data_map.values()), max(anc_map['X'].values()), max(anc_map['Z'].values())) + 1,
+            'distance': 3,
+            'surface_layout': 'rotated'
+        }
     
     # Determine total qubits needed
     all_qubits = set(layout.get('data', []))
@@ -528,10 +547,27 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, A
     # Get final error state
     x_errors, z_errors = simulator.get_final_errors()
     
-    # Pack in surface code format
-    packed_result = pack_syndrome_and_errors(syndrome, x_errors, z_errors, layout, 'surface')
-    
-    return packed_result
+    if surface_layout == "rotated":
+        # For rotated d=3, expose raw [B, 8] syndrome or bitpack to 1 byte if requested
+        # Here we return just the 8-bit syndrome for downstream teacher usage
+        syn = syndrome.astype(np.uint8)
+        if bitpack:
+            # Pack 8 bits into 1 byte per sample
+            B, N = syn.shape
+            assert N == 8, "Rotated d=3 expects 8 syndrome bits"
+            bytes_out = np.zeros((B, 1), dtype=np.uint8)
+            for b in range(B):
+                val = 0
+                for k in range(8):
+                    val |= (int(syn[b, k]) & 1) << k
+                bytes_out[b, 0] = val
+            return bytes_out
+        else:
+            return syn
+    else:
+        # Pack in planar-like surface code format
+        packed_result = pack_syndrome_and_errors(syndrome, x_errors, z_errors, layout, 'surface')
+        return packed_result
 
 
 def sample_bb_cudaq(mode: str, batch_size: int, T: int, hx: np.ndarray, hz: np.ndarray,

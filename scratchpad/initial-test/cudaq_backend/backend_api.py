@@ -20,7 +20,8 @@ from .circuits import make_surface_layout_d3_avoid_bad_edges
 def cudaq_sample_surface_wrapper(mode: str, batch_size: int, T: int = 3, d: int = 3,
                                 layout: Optional[Dict[str, Any]] = None,
                                 rng: Optional[np.random.Generator] = None, 
-                                bitpack: bool = False) -> np.ndarray:
+                                bitpack: bool = False,
+                                surface_layout: str = "planar") -> np.ndarray:
     """
     Wrapper for surface code sampling that matches the existing panq_functions interface.
     
@@ -62,7 +63,8 @@ def cudaq_sample_surface_wrapper(mode: str, batch_size: int, T: int = 3, d: int 
         T=T,
         layout=layout,
         rng=rng,
-        bitpack=bitpack
+        bitpack=bitpack,
+        surface_layout=surface_layout
     )
     
     # Validate output shape consistency
