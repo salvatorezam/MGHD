@@ -432,26 +432,457 @@ def build_H_surface(distance: int, surface_layout: str = "planar") -> Tuple[np.n
         return H, sizes, meta
 
 
+def _process_canonical_pack(args) -> int:
+    """Process canonical pack with MWPF teacher for rotated d=3 surface code."""
+    if not MWPF_AVAILABLE or not STIM_AVAILABLE:
+        print("[ERROR] MWPF and Stim are required for canonical pack processing")
+        return 1
+    
+    if args.teacher != "mwpf":
+        print("[ERROR] Only MWPF teacher is supported for canonical pack processing")
+        return 1
+    
+    if not args.out_labels:
+        print("[ERROR] --out-labels is required when using --from-pack")
+        return 1
+    
+    start_time = time.perf_counter()
+    
+    try:
+        # 1) Load canonical pack
+        print(f"Loading canonical pack: {args.from_pack}")
+        pack_data = np.load(args.from_pack, allow_pickle=False)
+        
+        # Validate required keys
+        required_keys = ['syndromes', 'Hx', 'Hz', 'meta']
+        for key in required_keys:
+            if key not in pack_data:
+                print(f"[ERROR] Missing required key '{key}' in pack")
+                return 1
+        
+        # Extract data
+        syndromes_packed = pack_data['syndromes']  # [B, 1] uint8
+        Hx = pack_data['Hx']  # (4, 9) uint8
+        Hz = pack_data['Hz']  # (4, 9) uint8
+        meta_str = pack_data['meta'].item() if hasattr(pack_data['meta'], 'item') else str(pack_data['meta'])
+        meta = json.loads(meta_str) if isinstance(meta_str, str) else meta_str
+        
+        # Get hashes if available
+        Hx_hash = pack_data.get('Hx_hash', pack_data.get('hashes', {}).get('Hx', 'unknown'))
+        Hz_hash = pack_data.get('Hz_hash', pack_data.get('hashes', {}).get('Hz', 'unknown'))
+        if isinstance(Hx_hash, np.ndarray):
+            Hx_hash = Hx_hash.item()
+        if isinstance(Hz_hash, np.ndarray):
+            Hz_hash = Hz_hash.item()
+        
+        B = syndromes_packed.shape[0]
+        
+        # Validate canonical format
+        try:
+            from cudaq_backend.constants import ROTATED_D3_MATRIX_SHAPES
+            expected_hx_shape, expected_hz_shape = ROTATED_D3_MATRIX_SHAPES
+        except (ImportError, ValueError) as e:
+            # Fallback to hardcoded values if import fails
+            expected_hx_shape, expected_hz_shape = (4, 9), (4, 9)
+        
+        if Hx.shape != expected_hx_shape:
+            print(f"[ERROR] Hx shape mismatch: got {Hx.shape}, expected {expected_hx_shape}")
+            return 1
+        if Hz.shape != expected_hz_shape:
+            print(f"[ERROR] Hz shape mismatch: got {Hz.shape}, expected {expected_hz_shape}")
+            return 1
+        if syndromes_packed.shape != (B, 1):
+            print(f"[ERROR] Syndromes shape mismatch: got {syndromes_packed.shape}, expected ({B}, 1)")
+            return 1
+        
+        # 2) Unpack syndromes LSB-first into (B, 8)
+        syndromes_unpacked = np.zeros((B, 8), dtype=np.uint8)
+        for i in range(B):
+            val = syndromes_packed[i, 0]
+            for bit_idx in range(8):
+                syndromes_unpacked[i, bit_idx] = (val >> bit_idx) & 1
+        
+        # 3) Split Z_first_then_X -> sZ, sX
+        try:
+            from cudaq_backend.constants import SYNDROME_ORDER
+            expected_order = SYNDROME_ORDER
+        except ImportError:
+            expected_order = 'Z_first_then_X'
+        
+        if meta.get('syndrome_order', expected_order) != 'Z_first_then_X':
+            print(f"[ERROR] Unsupported syndrome order: {meta.get('syndrome_order')}")
+            return 1
+        
+        sZ = syndromes_unpacked[:, :4]  # First 4 bits are Z checks
+        sX = syndromes_unpacked[:, 4:]  # Last 4 bits are X checks
+        
+        # 4) Build Stim DEM for rotated d=3 using canonical H matrices
+        from cudaq_backend.circuits import logical_reps_rotated_d3
+        
+        # Get logical representatives
+        logical_reps = logical_reps_rotated_d3()
+        Lx, Lz = logical_reps['Lx'], logical_reps['Lz']
+        
+        # Build DEM manually for rotated d=3
+        dem_lines = []
+        
+        # Add detector definitions
+        for det_idx in range(8):
+            dem_lines.append(f"detector D{det_idx}")
+        
+        # Add logical observable definitions
+        dem_lines.append("logical_observable L0")  # X_L
+        dem_lines.append("logical_observable L1")  # Z_L
+        
+        # Add error instructions for each data qubit
+        for data_qubit in range(9):
+            # X error on this data qubit affects Z checks
+            z_checks = np.where(Hz[:, data_qubit] > 0)[0]
+            if len(z_checks) > 0:
+                detectors = " ".join([f"D{check}" for check in z_checks])
+                dem_lines.append(f"error(0.001) {detectors}")
+            
+            # Z error on this data qubit affects X checks (offset by 4)
+            x_checks = np.where(Hx[:, data_qubit] > 0)[0] + 4
+            if len(x_checks) > 0:
+                detectors = " ".join([f"D{check}" for check in x_checks])
+                dem_lines.append(f"error(0.001) {detectors}")
+        
+        # Add logical error instructions
+        dem_lines.append("error(0.001) L0")  # Logical X
+        dem_lines.append("error(0.001) L1")  # Logical Z
+        
+        # Create DEM from string
+        dem_string = "\n".join(dem_lines)
+        dem = stim.DetectorErrorModel(dem_string)
+        
+        # 5) Run MWPF to get sector-correct labels
+        # Get particular solutions for each sector
+        x0_batch = np.zeros((B, 9), dtype=np.uint8)
+        z0_batch = np.zeros((B, 9), dtype=np.uint8)
+        
+        for i in range(B):
+            try:
+                x0_batch[i] = _gf2_solve_particular(Hz, sZ[i])  # Hz @ x = sZ
+                z0_batch[i] = _gf2_solve_particular(Hx, sX[i])  # Hx @ z = sX
+            except ValueError as e:
+                print(f"[ERROR] Inconsistent system for shot {i}: {e}")
+                return 4
+        
+        # Get MWPF logical bits
+        ell_x, ell_z = mwpf_decode_logicals(dem, syndromes_packed)
+        
+        # Use separated lifting to get sector-correct labels
+        labels_x, labels_z = lift_logicals_separate(x0_batch, z0_batch, ell_x, ell_z, Lx, Lz)
+        
+        # Build hard_labels as min-weight lift (deterministic)
+        hard_labels = np.zeros((B, 9), dtype=np.uint8)
+        for i in range(B):
+            # Generate all candidates: particular + logical combinations
+            candidates = []
+            
+            # C0: pure particular solutions
+            candidates.append(x0_batch[i] ^ z0_batch[i])
+            
+            # C1: particular + logical X
+            candidates.append((x0_batch[i] ^ Lx) ^ z0_batch[i])
+            
+            # C2: particular + logical Z  
+            candidates.append(x0_batch[i] ^ (z0_batch[i] ^ Lz))
+            
+            # C3: particular + both logicals
+            candidates.append((x0_batch[i] ^ Lx) ^ (z0_batch[i] ^ Lz))
+            
+            # Pick minimum weight deterministically
+            hard_labels[i] = _pick_min_weight(candidates)
+        
+        # 6) Strict split parity gate validation
+        sZ_hat = (Hz @ labels_x.T) % 2
+        sX_hat = (Hx @ labels_z.T) % 2
+        mismatches_z = int((sZ_hat != sZ.T).sum())
+        mismatches_x = int((sX_hat != sX.T).sum())
+        total_mismatches = mismatches_z + mismatches_x
+        
+        if total_mismatches != 0:
+            print(f"[ERROR] Split parity validation failed: {total_mismatches} mismatches (Z: {mismatches_z}, X: {mismatches_x})")
+            return 4
+        
+        # 7) Save LABELS.npz with comprehensive metadata
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        
+        # Create validation metadata
+        validation_info = {
+            "B": int(B),
+            "mismatches": 0,
+            "mismatches_z": 0,
+            "mismatches_x": 0,
+            "elapsed_ms": float(elapsed_ms),
+            "teacher": "mwpf",
+            "validation_passed": True
+        }
+        
+        # Compute label hashes
+        labels_x_hash = hashlib.sha256(labels_x.astype(np.uint8).tobytes()).hexdigest()
+        labels_z_hash = hashlib.sha256(labels_z.astype(np.uint8).tobytes()).hexdigest()
+        hard_labels_hash = hashlib.sha256(hard_labels.astype(np.uint8).tobytes()).hexdigest()
+        
+        # Save labels with full metadata
+        np.savez_compressed(
+            args.out_labels,
+            labels_x=labels_x.astype(np.uint8),
+            labels_z=labels_z.astype(np.uint8),
+            hard_labels=hard_labels.astype(np.uint8),
+            Hx=Hx.astype(np.uint8),
+            Hz=Hz.astype(np.uint8),
+            meta=json.dumps(meta),
+            Hx_hash=str(Hx_hash),
+            Hz_hash=str(Hz_hash),
+            labels_x_hash=labels_x_hash,
+            labels_z_hash=labels_z_hash,
+            hard_labels_hash=hard_labels_hash,
+            validation=json.dumps(validation_info)
+        )
+        
+        # 8) Print one-line summary
+        hx_hash8 = str(Hx_hash)[:8] if isinstance(Hx_hash, str) else "unknown"
+        hz_hash8 = str(Hz_hash)[:8] if isinstance(Hz_hash, str) else "unknown"
+        print(f"B={B}, hashes Hx={hx_hash8} Hz={hz_hash8}, mismatches=0, elapsed {elapsed_ms:.0f}ms")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"[ERROR] Canonical pack processing failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+def _generate_canonical_pack(args) -> int:
+    """Generate canonical dataset pack via CUDA-Q student mode."""
+    from cudaq_backend.constants import ROTATED_D3, DEFAULT_PACK_PARAMS
+    
+    print(f"Generating canonical dataset pack: B={DEFAULT_PACK_PARAMS['B']}, p={args.p}")
+    
+    try:
+        # Import CUDA-Q sampling functions
+        from cudaq_backend.syndrome_gen import sample_surface_cudaq
+        from cudaq_backend.circuits import make_surface_layout_d3_avoid_bad_edges
+        
+        # Use fixed RNG seed for reproducibility
+        rng = np.random.default_rng(DEFAULT_PACK_PARAMS['rng_seed'])
+        layout = make_surface_layout_d3_avoid_bad_edges()
+        
+        # Generate syndromes using CUDA-Q student mode (rotated layout)
+        samples = sample_surface_cudaq(
+            mode='student', 
+            batch_size=DEFAULT_PACK_PARAMS['B'], 
+            T=1,  # Single syndrome extraction round
+            layout=layout, 
+            rng=rng, 
+            bitpack=False
+        )
+        
+        # Extract syndrome bits (first 8 columns for d=3 rotated)
+        synd_unpacked = samples[:, :ROTATED_D3['N_syn']].astype(np.uint8)
+        
+        # Pack syndromes into uint8 [B, 1] for 8 bits (little-endian per byte)
+        synd_packed = np.zeros((DEFAULT_PACK_PARAMS['B'], 1), dtype=np.uint8)
+        for i in range(DEFAULT_PACK_PARAMS['B']):
+            val = 0
+            for bit_idx in range(8):
+                if synd_unpacked[i, bit_idx]:
+                    val |= (1 << bit_idx)
+            synd_packed[i, 0] = val
+        
+        # Get canonical H matrices
+        Hx, Hz, meta = build_H_rotated_d3_from_cfg(None)
+        
+        # Compute matrix hashes
+        Hz_hash = hashlib.sha256(Hz.astype(np.uint8).tobytes()).hexdigest()
+        Hx_hash = hashlib.sha256(Hx.astype(np.uint8).tobytes()).hexdigest()
+        
+        # Create metadata
+        pack_meta = {
+            'source': 'cudaq_student',
+            'surface_layout': 'rotated',
+            'distance': 3,
+            'N_bits': ROTATED_D3['N_bits'],
+            'N_syn': ROTATED_D3['N_syn'],
+            'syndrome_order': ROTATED_D3['syndrome_order'],
+            'p': args.p,
+            'B': DEFAULT_PACK_PARAMS['B'],
+            'rng_seed': DEFAULT_PACK_PARAMS['rng_seed'],
+            'generated_at': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Save canonical pack
+        np.savez_compressed(
+            args.out,
+            syndromes=synd_packed,
+            Hx=Hx.astype(np.uint8),
+            Hz=Hz.astype(np.uint8),
+            meta=json.dumps(pack_meta),
+            Hx_hash=Hx_hash,
+            Hz_hash=Hz_hash
+        )
+        
+        print(f"✓ Canonical pack saved to {args.out}")
+        print(f"  Shape: {synd_packed.shape}, p={args.p}, B={DEFAULT_PACK_PARAMS['B']}")
+        print(f"  Hx hash: {Hx_hash[:8]}..., Hz hash: {Hz_hash[:8]}...")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to generate canonical pack: {e}")
+        return 1
+
+def _canonicalize_willow_data(args) -> int:
+    """Canonicalize Willow d=3 shots to our convention."""
+    from cudaq_backend.constants import ROTATED_D3, SYNDROME_ORDER
+    
+    print(f"Canonicalizing Willow data from {args.willow}")
+    
+    try:
+        # Load Willow detection events from .b8 format
+        willow_dir = Path(args.willow)
+        
+        # Check if it's a directory or file
+        if willow_dir.is_dir():
+            detection_file = willow_dir / "detection_events.b8"
+            if not detection_file.exists():
+                print(f"[ERROR] detection_events.b8 not found in {willow_dir}")
+                return 1
+        elif willow_dir.suffix == '.b8':
+            detection_file = willow_dir
+        else:
+            print(f"[ERROR] Willow path must be directory with detection_events.b8 or .b8 file")
+            return 1
+        
+        # Read binary detection events
+        with open(detection_file, 'rb') as f:
+            detection_data = f.read()
+        
+        # Parse detection events (each shot is 1 byte for 8 detectors)
+        B = len(detection_data)
+        synd_packed = np.frombuffer(detection_data, dtype=np.uint8).reshape(B, 1)
+        
+        # Unpack to check syndrome ordering
+        synd_unpacked = np.zeros((B, 8), dtype=np.uint8)
+        for i in range(B):
+            val = synd_packed[i, 0]
+            for bit_idx in range(8):
+                synd_unpacked[i, bit_idx] = (val >> bit_idx) & 1
+        
+        # Get canonical H matrices for validation
+        Hx, Hz, meta = build_H_rotated_d3_from_cfg(None)
+        
+        # Validate parity (should be zero for valid syndromes)
+        # Split into Z and X sectors according to our convention
+        sZ = synd_unpacked[:, :4]  # First 4 bits are Z checks
+        sX = synd_unpacked[:, 4:]  # Last 4 bits are X checks
+        
+        # Check parity with zero error assumption
+        sZ_hat = (Hz @ np.zeros((ROTATED_D3['N_bits'], B), dtype=np.uint8)) % 2
+        sX_hat = (Hx @ np.zeros((ROTATED_D3['N_bits'], B), dtype=np.uint8)) % 2
+        
+        mismatches = int((sZ_hat != sZ.T).sum() + (sX_hat != sX.T).sum())
+        if mismatches > 0:
+            print(f"[WARNING] Willow parity validation: {mismatches} mismatches")
+            print("  This may indicate different syndrome ordering convention")
+        
+        # Compute matrix hashes
+        Hz_hash = hashlib.sha256(Hz.astype(np.uint8).tobytes()).hexdigest()
+        Hx_hash = hashlib.sha256(Hx.astype(np.uint8).tobytes()).hexdigest()
+        
+        # Create metadata
+        willow_meta = {
+            'source': 'willow_canonicalized',
+            'original_file': str(detection_file),
+            'surface_layout': 'rotated',
+            'distance': 3,
+            'N_bits': ROTATED_D3['N_bits'],
+            'N_syn': ROTATED_D3['N_syn'],
+            'syndrome_order': SYNDROME_ORDER,
+            'B': B,
+            'parity_mismatches': mismatches,
+            'canonicalized_at': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Save canonicalized Willow data
+        np.savez_compressed(
+            args.out,
+            syndromes=synd_packed,
+            Hx=Hx.astype(np.uint8),
+            Hz=Hz.astype(np.uint8),
+            meta=json.dumps(willow_meta),
+            Hx_hash=Hx_hash,
+            Hz_hash=Hz_hash
+        )
+        
+        print(f"✓ Canonicalized Willow data saved to {args.out}")
+        print(f"  Shape: {synd_packed.shape}, B={B}")
+        print(f"  Parity mismatches: {mismatches}")
+        print(f"  Hx hash: {Hx_hash[:8]}..., Hz hash: {Hz_hash[:8]}...")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to canonicalize Willow data: {e}")
+        return 1
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Teacher labeling script for QEC")
-    parser.add_argument("--code", choices=["surface", "bb"], required=True, help="Code type")
+    parser.add_argument("--code", choices=["surface", "bb"], help="Code type (required unless --make-pack, --willow, or --from-pack)")
     parser.add_argument("--hx", type=str, help="Path to Hx (.npy)")
     parser.add_argument("--hz", type=str, help="Path to Hz (.npy)")
-    parser.add_argument("--input-syndromes", type=str, required=True, help="Input syndromes .npz (key 'syndromes')")
+    parser.add_argument("--input-syndromes", type=str, help="Input syndromes .npz (key 'syndromes') (required unless --make-pack, --willow, or --from-pack)")
     parser.add_argument("--packed", action="store_true", help="Input syndromes are bit-packed uint8")
     parser.add_argument("--num-sets", type=int, default=80)
     parser.add_argument("--set-max-iter", type=int, default=150)
     parser.add_argument("--gamma0", type=float, default=0.1)
     parser.add_argument("--gamma-dist-interval", nargs=2, type=float, default=[-0.24, 0.66])
     parser.add_argument("--timeout-ms", type=int, default=50)
-    parser.add_argument("--out", type=str, required=True, help="Output .npz path")
+    parser.add_argument("--out", type=str, help="Output .npz path (required unless using --from-pack with --out-labels)")
     parser.add_argument("--distance", type=int, default=3, help="Distance (surface only)")
     parser.add_argument("--teacher", choices=["relay", "mwpm", "mwpf", "ensemble"], default="relay", 
                                                  help="Teacher type: relay (Relay-BP), mwpm (MWPM), mwpf (HyperBlossom), or ensemble (Relay+MWPF) (default: relay)")
     parser.add_argument("--surface-layout", choices=["rotated", "planar"], default="rotated",
                         help="Surface layout type (default: rotated)")
+    parser.add_argument("--make-pack", action="store_true", 
+                        help="Generate canonical dataset pack via CUDA-Q student mode")
+    parser.add_argument("--p", type=float, default=0.05, 
+                        help="Error rate for dataset generation (default: 0.05)")
+    parser.add_argument("--willow", type=str, 
+                        help="Path to Willow d=3 shots for canonicalization")
+    # New canonical pack processing arguments
+    parser.add_argument("--from-pack", type=str, 
+                        help="Load canonical pack PACK.npz (keys: syndromes [B,1] uint8, Hx(4,9), Hz(4,9), meta, hashes)")
+    parser.add_argument("--out-labels", type=str, 
+                        help="Output labels .npz path when using --from-pack")
 
     args = parser.parse_args()
+
+    # Validate required arguments
+    if args.from_pack:
+        return _process_canonical_pack(args)
+    elif not args.make_pack and not args.willow:
+        if not args.code:
+            print("[ERROR] --code is required unless using --make-pack, --willow, or --from-pack")
+            return 1
+        if not args.input_syndromes:
+            print("[ERROR] --input-syndromes is required unless using --make-pack, --willow, or --from-pack")
+            return 1
+    
+    # Validate --out requirement
+    if not args.out:
+        print("[ERROR] --out is required unless using --from-pack with --out-labels")
+        return 1
+
+    # Handle dataset pack generation and Willow adapter
+    if args.make_pack:
+        return _generate_canonical_pack(args)
+    elif args.willow:
+        return _canonicalize_willow_data(args)
 
     # 1) Build detector graph / parity-check matrix H
     if args.hx and args.hz:

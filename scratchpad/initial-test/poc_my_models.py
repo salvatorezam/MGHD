@@ -93,18 +93,36 @@ class MGHD(nn.Module):
         self.n_node_inputs = gnn_params['n_node_inputs']
         self.n_node_outputs = gnn_params['n_node_outputs']
         
+        # Code configuration for authoritative indices
+        self.code_config = {
+            'type': 'surface',  # Default to surface code
+            'distance': self.dist,
+            'layout': 'planar'  # Default to planar, can be set to 'rotated'
+        }
+        
         # Precompute static indices for inference (will be created on first use)
         self.register_buffer('_check_node_indices', None, persistent=False)
         self.register_buffer('_src_ids', None, persistent=False)
         self.register_buffer('_dst_ids', None, persistent=False)
         self.register_buffer('_edge_index', None, persistent=False)
-        self.register_buffer('_node_feature_index', None, persistent=False)  # [num_nodes, k]
+    
+    def set_rotated_layout(self):
+        """Configure the model to use rotated surface code layout."""
+        self.code_config['layout'] = 'rotated'
+        # Clear cached indices to force rebuilding with new layout
+        self._check_node_indices = None
+        self._src_ids = None
+        self._dst_ids = None
+        self._edge_index = None
         
-        # Code configuration for authoritative indices
-        self.code_config = {
-            'type': 'surface',  # Default to surface code
-            'distance': self.dist
-        }
+        # For rotated d=3, set n_node_outputs to 2 (binary classification per qubit)
+        if self.dist == 3:
+            # For per-qubit binary classification use 2 logits per data qubit
+            self.gnn.n_node_outputs = 2
+            # Update the final layer to output 2 logits - preserve device
+            if hasattr(self.gnn, 'final_digits') and self.gnn.final_digits is not None:
+                current_device = next(self.gnn.final_digits.parameters()).device
+                self.gnn.final_digits = nn.Linear(self.gnn.n_node_features, 2).to(current_device)
 
     def _build_authoritative_indices(self, device):
         """
@@ -115,10 +133,14 @@ class MGHD(nn.Module):
         
         code_type = self.code_config['type']
         distance = self.code_config['distance']
+        layout = self.code_config.get('layout', 'planar')
         
         if code_type == 'surface':
             # Create surface code using existing Astra code
-            code = surface_2d.Planar2DCode(distance)
+            if layout == 'rotated':
+                code = surface_2d.RotatedPlanar2DCode(distance)
+            else:
+                code = surface_2d.Planar2DCode(distance)
             
             # Get the stabilizer matrix (Hx and Hz combined)
             # For surface codes, we need to construct the bipartite graph
@@ -261,20 +283,27 @@ class MGHD(nn.Module):
 
     def set_output_size_from_metadata(self, meta: dict):
         """
-        Adjust head/output size based on metadata N_bits (e.g., 9 rotated, 13 planar).
-        Reinitialize layers only if size changes; log the change.
+        Adjust output head ONLY when appropriate.
+        For rotated layouts we enforce a binary head (2 logits per data qubit).
+        This prevents accidental reversion to a 9-logit multi-class head.
         """
-        if not isinstance(meta, dict) or 'N_bits' not in meta:
+        if not isinstance(meta, dict):
             return
-        target_bits = int(meta['N_bits'])
-        # Our GNN head dimension is self.gnn.n_node_outputs; adjust if mismatch
-        current = self.gnn.n_node_outputs
-        if current != target_bits:
-            device = next(self.parameters()).device
-            self.gnn.n_node_outputs = target_bits
-            # Replace final_digits in GNN head to match new outputs
-            self.gnn.final_digits = nn.Linear(self.gnn.n_node_features, target_bits).to(device)
-            print(f"[MGHD] Adjusted head outputs from {current} to {target_bits} per metadata")
+
+        # If meta explicitly says rotated layout, enforce binary head
+        if meta.get('surface_layout') == 'rotated':
+            if getattr(self.gnn, 'n_node_outputs', None) != 2:
+                device = next(self.parameters()).device
+                self.gnn.n_node_outputs = 2
+                # Recreate final layer to 2 logits (binary per qubit)
+                if hasattr(self.gnn, 'final_digits'):
+                    self.gnn.final_digits = nn.Linear(self.gnn.n_node_features, 2).to(device)
+                print("[MGHD] Enforced binary head (2 logits/qubit) for rotated layout from metadata")
+            return
+
+        # For non-rotated layouts we currently keep the binary head as well.
+        # If in future we support multi-class heads, gate it explicitly here by layout name.
+        return
 
     def _ensure_static_indices(self, device):
         """Create static index tensors for inference if they don't exist"""
@@ -370,9 +399,7 @@ class MGHD(nn.Module):
         node_inputs = torch.zeros(1, nodes_per_graph, self.n_node_inputs, device=device, dtype=torch.float32)
         
         # Place syndrome in check node positions (first num_check_nodes positions)
-        # Convert syndrome to one-hot encoding for the first feature dimension
-        for i in range(num_check_nodes):
-            node_inputs[0, i, 0] = syndrome[0, i]  # First feature is syndrome bit
+        node_inputs[0, :num_check_nodes, 0] = syndrome[0, :num_check_nodes]
         
         # Reshape for model forward pass [batch*n_nodes, n_node_inputs]
         node_inputs_flat = node_inputs.view(-1, self.n_node_inputs)
@@ -446,14 +473,18 @@ class MGHD(nn.Module):
         """
         Defines the full data flow through the hybrid model.
         """
-        num_check_nodes = self.gnn.dist**2 - 1
-        num_qubit_nodes = self.gnn.dist**2
+        # Use authoritative sizes derived from Hx/Hz (supports rotated d=3: 8+9=17)
+        self._ensure_static_indices(node_inputs.device)
+        num_check_nodes = self._num_check_nodes
+        num_qubit_nodes = self._num_data_qubits
         nodes_per_graph = num_check_nodes + num_qubit_nodes
         batch_size = node_inputs.shape[0] // nodes_per_graph
 
-        # --- Step A: Isolate and Reshape Data for Mamba ---
-        indices = [i*nodes_per_graph + j for i in range(batch_size) for j in range(num_check_nodes)]
-        check_node_inputs = node_inputs[indices]
+        # --- Step A: Isolate and Reshape Data for Mamba (vectorized) ---
+        # node_inputs: [B*n_nodes, n_node_inputs] -> [B, n_nodes, n_node_inputs]
+        xin = node_inputs.view(batch_size, nodes_per_graph, self.n_node_inputs)
+        # Slice first num_check_nodes positions (the check nodes), then flatten back
+        check_node_inputs = xin[:, :num_check_nodes, :].reshape(-1, self.n_node_inputs)
         check_node_inputs = check_node_inputs.to(self.input_embedding.weight.dtype)
         embedded_check_inputs = self.input_embedding(check_node_inputs)
         mamba_input_sequence = embedded_check_inputs.view(batch_size, num_check_nodes, -1)
@@ -479,8 +510,13 @@ class MGHD(nn.Module):
         # Create tensor with correct dimensions (n_node_inputs, not n_node_features)
         gnn_input_features = torch.zeros(node_inputs.shape[0], self.gnn.n_node_inputs, device=node_inputs.device)
         
-        # Place projected features back with correct dtype
-        gnn_input_features[indices] = projected_check_features.to(gnn_input_features.dtype)
+        # Place projected features back with correct dtype (vectorized)
+        # projected_check_features is [B*num_check_nodes, n_node_inputs]
+        # Reshape to [B, num_check_nodes, n_node_inputs], then place in gnn_input
+        projected_reshaped = projected_check_features.view(batch_size, num_check_nodes, self.gnn.n_node_inputs)
+        gnn_input_reshaped = gnn_input_features.view(batch_size, nodes_per_graph, self.gnn.n_node_inputs)
+        gnn_input_reshaped[:, :num_check_nodes, :] = projected_reshaped.to(gnn_input_features.dtype)
+        gnn_input_features = gnn_input_reshaped.view(-1, self.gnn.n_node_inputs)
 
         # --- Step D: Spatial Processing ---
         gnn_outputs = self.gnn(gnn_input_features, src_ids, dst_ids)

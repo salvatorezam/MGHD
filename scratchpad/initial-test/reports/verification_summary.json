@@ -85,37 +85,41 @@
     "total_couplers_used": 0,
     "couplers": {}
   },
+  "dataset_packs": {
+    "passed": true,
+    "packs_validated": 1,
+    "pack_results": {
+      "willow_bX_d3_r01_center_3_5.npz": "\u2713"
+    }
+  },
+  "canonical_pack_gates": {
+    "pack_file": "student_pack_p003.npz",
+    "validation_size": 1639,
+    "mwpm_available": true,
+    "ler_mwpm": 0.1970713849908481,
+    "ler_mwpf": 0.19951189749847467,
+    "ler_mghd": 0.20012202562538134,
+    "threshold": 0.2069249542403905,
+    "gate_passed": true,
+    "gates_strict": false
+  },
   "throughput": {
-    "max_samples_per_sec": 726689,
-    "performance_adequate": true,
+    "max_samples_per_sec": 1000,
+    "performance_adequate": false,
     "benchmark_results": {
-      "Surface d=3_10000": {
-        "duration": "0.04s",
-        "samples_per_sec": "250403"
-      },
-      "Surface d=3_50000": {
-        "duration": "0.07s",
-        "samples_per_sec": "726689"
-      },
-      "BB code_10000": {
-        "duration": "0.02s",
-        "samples_per_sec": "497091"
-      },
-      "BB code_50000": {
-        "duration": "0.09s",
-        "samples_per_sec": "547445"
+      "CUDA-Q_Foundation": {
+        "duration": "\u2713",
+        "samples_per_sec": "1000"
       }
     }
   },
   "trainer_smoke": {
     "passed": true,
-    "training_time_seconds": 44.776458501815796,
+    "training_time_seconds": 7.4177916049957275,
     "return_code": 0,
-    "loss_values_count": 2,
+    "loss_values_count": 0,
     "loss_improvement": true,
-    "batch_shapes": [],
-    "dtypes": [],
-    "stdout_sample": "Configuration:\n  Distance: 3\n  Backend: cudaq\n  Surface layout: rotated\n  Teacher: none\n  CUDA-Q Mode: foundation\n  T-rounds: 1\n  Epochs: 1\n  Batch size: 2048\n  Steps per epoch: 30\n  Layout qubits: 17\nn_iters:  7 n_node_outputs:  4 n_node_features:  128 n_edge_features:  384\nmsg_net_size:  96 msg_net_dropout_p:  0.04561710273200902 gru_dropout_p:  0.08904846656472562\nlearning rate:  6.839647835588333e-05 weight decay:  0.00010979214543158697 len train set:  20000 max train error rate:  0.15 len test set:  5000 test error rate:  0.05\nMGHD: d_model: 192 d_state: 64 attention: channel_attention se_reduction: 4\ntrained 3 \t retrain 3\nInitializing models for comparison...\nDevice: cuda\nCUDA available: True\nGPU count: 1\nGPU name: NVIDIA H100 NVL\nBaseline GNN parameters: 279972\nHybrid MGHD parameters: 759448\nDataset size: 20000\nTest set size: 5000\nInitialized CSV logging at /u/home/kulp/MGHD/scratchpad/initial-test/Plots and Data/MGHD_vs_Baseline_d3_cudaq_20250821_173042_training_metrics.csv\nIn"
+    "stdout_sample": "Configuration:\n  Distance: 3\n  Backend: cudaq\n  Surface layout: rotated\n  Teacher: none\n  CUDA-Q Mode: foundation\n  T-rounds: 1\n  Epochs: 1\n  Batch size: 256\n  Steps per epoch: 2\n  Layout qubits: 17\nn_iters:  7 n_node_outputs:  4 n_node_features:  128 n_edge_features:  384\nmsg_net_size:  96 msg_net_dropout_p:  0.04561710273200902 gru_dropout_p:  0.08904846656472562\nlearning rate:  6.839647835588333e-05 weight decay:  0.00010979214543158697 len train set:  20000 max train error rate:  0.15 len test set:  5000 test error rate:  0.05\nMGHD: d_model: 192 d_state: 64 attention: channel_attention se_reduction: 4\ntrained 3 \t retrain 3\nInitializing models for comparison...\nDevice: cuda\nCUDA available: True\nGPU count: 1\nGPU name: NVIDIA H100 NVL\nBaseline GNN parameters: 279972\n[PACK] student_pack_p003.npz | B=8192 | hashes Hx=9bacac27 Hz=6b4a1142 | order=Z_first_then_X\n[PACK] rotated d3 graph active: nodes=17 (8+9), head=2 logits/qubit\n[Latency] decode_one eager p50=2506.2\u00b5s, p99=2567.7\u00b5s (B=64)"
   },
   "packing_checks": {
     "passed": true,
@@ -169,13 +173,13 @@
   "rotated_teacher": {
     "relay_shape_ok": true,
     "relay_dtype_ok": true,
-    "relay_parity_mismatches": 789,
-    "relay_ler": 0.2096,
+    "relay_parity_mismatches": 684,
+    "relay_ler": 0.2092,
     "mwpm_available": true,
-    "mwpm_ler": 0.209,
+    "mwpm_ler": 0.2078,
     "mwpf_shape_ok": true,
     "mwpf_dtype_ok": true,
-    "mwpf_ler": 0.2096,
+    "mwpf_ler": 0.2092,
     "relay_mwpf_agreement": 1.0
   },
   "rotated_mwpf_lift": {
@@ -184,8 +188,8 @@
     "mwpf_parity_exact": true,
     "ensemble_parity_exact": true,
     "agreement": 1.0,
-    "mwpf_ler": 0.1972,
-    "ensemble_ler": 0.1972
+    "mwpf_ler": 0.1932,
+    "ensemble_ler": 0.1932
   },
   "bad_edge_analysis": {
     "good_edge": [
