@@ -220,6 +220,12 @@ parser.add_argument('--steps-per-epoch', type=int, default=0,
 parser.add_argument("--pack", type=str, help="Canonical pack (.npz) with syndromes/Hx/Hz/meta")
 parser.add_argument("--teacher-labels", type=str, help="Optional labels NPZ (labels_x, labels_z, hard_labels)")
 
+# New arguments
+parser.add_argument("--decoder", type=str, choices=["mghd","fastpath"], default="mghd",
+                    help="Inference decoder backend")
+parser.add_argument("--fastpath-capacity", type=int, default=1024,
+                    help="Ring capacity for persistent fastpath")
+
 # Try to parse args, but provide defaults if running in notebook/interactive mode
 try:
     args = parser.parse_args()
@@ -522,6 +528,19 @@ if pack is not None:
         if device.type == 'cuda':
             lat = benchmark_decode_one_batch(mghd_model, synd_t, backend='eager')
             print(f"[Latency] decode_one eager p50={lat['p50']:.1f}µs, p99={lat['p99']:.1f}µs (B={subset})")
+
+        # Fast-path setup
+        fastpath_svc = None
+        if args.decoder == "fastpath":
+            try:
+                import fastpath
+                lut16, Hx, Hz, meta = fastpath.load_rotated_d3_lut_npz()
+                from fastpath import PersistentLUT
+                fastpath_svc = PersistentLUT(lut16=lut16, capacity=max(1024, args.fastpath_capacity)).__enter__()
+                print(f"[FASTPATH] Persistent LUT online (capacity={max(1024, args.fastpath_capacity)})")
+            except Exception as e:
+                print(f"[FASTPATH] ERROR initializing fastpath: {e}")
+                raise
     except Exception as e:
         print(f"[PACK] ERROR in early pack configuration/bench: {e}")
         raise
@@ -665,19 +684,74 @@ best_mghd_state = None
 best_epoch = 0
 current_global_step = 0
 
-def evaluate_model_avg(model, loader, code, runs=1):
+def evaluate_model_avg(model, loader, code, runs=1, decoder_type="mghd", fastpath_svc=None):
     """Return (lerx_mean, lerz_mean, lertot_mean) across 'runs' repeated evaluations."""
     lerx_vals, lerz_vals, lertot_vals = [], [], []
     model.eval()
     with torch.no_grad():
         for _ in range(max(1, runs)):
-            lerx, lerz, lertot = logical_error_rate(model, loader, code)
+            if decoder_type == "fastpath" and fastpath_svc is not None:
+                lerx, lerz, lertot = logical_error_rate_fastpath(fastpath_svc, loader, code)
+            else:
+                lerx, lerz, lertot = logical_error_rate(model, loader, code)
             lerx_vals.append(float(lerx))
             lerz_vals.append(float(lerz))
             lertot_vals.append(float(lertot))
     return float(np.mean(lerx_vals)), float(np.mean(lerz_vals)), float(np.mean(lertot_vals))
 
-def evaluate_over_p_grid(model, code, ps=(0.03, 0.04, 0.05, 0.06, 0.08), runs=1, set_size=5000):
+def logical_error_rate_fastpath(fastpath_svc, testloader, code):
+    """Fastpath decoder evaluation using persistent LUT service."""
+    size = 2 * code.d ** 2 - 1
+    error_index = code.d ** 2 - 1
+    
+    with torch.no_grad():
+        n_test = 0
+        n_l_error = 0
+        n_codespace_error = 0
+        n_total_ler = 0
+
+        for i, (inputs, targets, src_ids, dst_ids) in enumerate(testloader):
+            # Extract syndrome bits (first 8 nodes for rotated d=3)
+            batch_size = inputs.shape[0] // 17  # 17 nodes total for rotated d=3
+            syndrome_batch = inputs[:batch_size * 8].view(batch_size, 8)  # First 8 syndrome nodes
+            
+            # Convert to uint8 and decode via fastpath
+            synd_np = syndrome_batch.cpu().numpy().astype(np.uint8)
+            corr_np = fastpath_svc.decode_batch(synd_np)  # [B, 9] corrections
+            
+            # Convert corrections to final solution format
+            final_solution = torch.from_numpy(corr_np).cpu()  # [B, 9]
+            
+            # Extract targets for comparison
+            final_targets = targets.view(batch_size, size)[:, error_index:].cpu()
+            final_targetsx = torch.where(final_targets == 1, final_targets, 0) + torch.where(final_targets == 3,
+                                                                                             final_targets, 0) // 3
+            final_targetsz = torch.where(final_targets == 2, final_targets, 0) // 2 + torch.where(final_targets == 3,
+                                                                                                  final_targets, 0) // 3
+
+            final_solutionx = torch.where(final_solution == 1, final_solution, 0) + torch.where(final_solution == 3,
+                                                                                                final_solution, 0) // 3
+            final_solutionz = torch.where(final_solution == 2, final_solution, 0) // 2 + torch.where(
+                final_solution == 3, final_solution, 0) // 3
+
+            final_solution = torch.cat((final_solutionx, final_solutionz), dim=1)
+            final_targets = torch.cat((final_targetsx, final_targetsz), dim=1)
+
+            rf = (final_targets + final_solution) % 2
+
+            ms = code.measure_syndrome(rf).T
+            mse = np.any(ms, axis=1)
+            n_codespace_error += mse.sum()
+
+            l = np.any(code.logical_errors(rf) != 0, axis=1)
+            n_l_error += l.sum()
+
+            n_total_ler += np.logical_or(l, mse).sum()
+            n_test += batch_size
+
+        return (n_l_error / n_test), (n_codespace_error / n_test), n_total_ler / n_test
+
+def evaluate_over_p_grid(model, code, ps=(0.03, 0.04, 0.05, 0.06, 0.08), runs=1, set_size=5000, decoder_type="mghd", fastpath_svc=None):
     results = []
     for p in ps:
         testset_p = adapt_trainset(
@@ -685,7 +759,7 @@ def evaluate_over_p_grid(model, code, ps=(0.03, 0.04, 0.05, 0.06, 0.08), runs=1,
                                            for_training=False, backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg),
             code, num_classes=n_node_inputs, for_training=False)
         testloader_p = DataLoader(testset_p, batch_size=512, collate_fn=collate, shuffle=False)
-        lerx, lerz, lertot = evaluate_model_avg(model, testloader_p, code, runs=runs)
+        lerx, lerz, lertot = evaluate_model_avg(model, testloader_p, code, runs=runs, decoder_type=decoder_type, fastpath_svc=fastpath_svc)
         results.append((float(p), float(lerx), float(lerz), float(lertot)))
     ps_arr = np.array([r[0] for r in results], dtype=float)
     lers = np.array([r[3] for r in results], dtype=float)
@@ -1073,8 +1147,12 @@ for epoch in range(epochs):
         # Baseline eval
         lerx_baseline, lerz_baseline, ler_tot_baseline = evaluate_model_avg(gnn_baseline, testloader, code, runs=eval_runs)
 
-        # MGHD eval with raw training weights (EMA disabled - was hurting performance)
-        lerx_mghd, lerz_mghd, ler_tot_mghd = evaluate_model_avg(mghd_model, testloader, code, runs=eval_runs)
+        # MGHD eval with decoder branching
+        if args.decoder == "fastpath" and fastpath_svc is not None:
+            lerx_mghd, lerz_mghd, ler_tot_mghd = evaluate_model_avg(None, testloader, code, runs=eval_runs, 
+                                                                   decoder_type="fastpath", fastpath_svc=fastpath_svc)
+        else:
+            lerx_mghd, lerz_mghd, ler_tot_mghd = evaluate_model_avg(mghd_model, testloader, code, runs=eval_runs)
         
         # Calculate fraction solved
         frac_solved_baseline = fraction_of_solved_puzzles(gnn_baseline, testloader, code)
@@ -1108,8 +1186,12 @@ for epoch in range(epochs):
             auc_row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
         writer.writerow(auc_row)
 
-    # MGHD (raw weights - EMA disabled)
-    mghd_pgrid, mghd_auc = evaluate_over_p_grid(mghd_model, code, runs=1, set_size=5000)
+    # MGHD evaluation with decoder branching
+    if args.decoder == "fastpath" and fastpath_svc is not None:
+        mghd_pgrid, mghd_auc = evaluate_over_p_grid(None, code, runs=1, set_size=5000, 
+                                                   decoder_type="fastpath", fastpath_svc=fastpath_svc)
+    else:
+        mghd_pgrid, mghd_auc = evaluate_over_p_grid(mghd_model, code, runs=1, set_size=5000)
     with open(pgrid_csv, 'a', newline='') as f:
         writer = csv.writer(f)
         for (pp, lx, lz, lt) in mghd_pgrid:
@@ -1244,8 +1326,12 @@ if best_mghd_state is not None:
     print(f"Saved best MGHD weights to {os.path.join(output_dir, f'{run_id}_mghd_best.pt')}")
     print(f"Appended per-epoch metrics to {csv_path}")
     
-    # Final averaged evaluation on best checkpoint
-    final_lerx, final_lerz, final_lertot = evaluate_model_avg(mghd_model, testloader, code, runs=final_eval_runs)
+    # Final averaged evaluation on best checkpoint with decoder branching
+    if args.decoder == "fastpath" and fastpath_svc is not None:
+        final_lerx, final_lerz, final_lertot = evaluate_model_avg(None, testloader, code, runs=final_eval_runs,
+                                                                 decoder_type="fastpath", fastpath_svc=fastpath_svc)
+    else:
+        final_lerx, final_lerz, final_lertot = evaluate_model_avg(mghd_model, testloader, code, runs=final_eval_runs)
     print(f"Final (best-checkpoint) averaged over {final_eval_runs} runs -> "
           f"LER_Total: {final_lertot:.6f} (LER_X: {final_lerx:.6f}, LER_Z: {final_lerz:.6f})")
     
@@ -1262,8 +1348,12 @@ if best_mghd_state is not None:
             row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
         writer.writerow(row)
     
-    # Final multi-p evaluation with stronger averaging (raw weights)
-    final_grid, final_auc = evaluate_over_p_grid(mghd_model, code, runs=3, set_size=20000)
+    # Final multi-p evaluation with stronger averaging
+    if args.decoder == "fastpath" and fastpath_svc is not None:
+        final_grid, final_auc = evaluate_over_p_grid(None, code, runs=3, set_size=20000,
+                                                    decoder_type="fastpath", fastpath_svc=fastpath_svc)
+    else:
+        final_grid, final_auc = evaluate_over_p_grid(mghd_model, code, runs=3, set_size=20000)
     with open(pgrid_csv, 'a', newline='') as f:
         writer = csv.writer(f)
         for (pp, lx, lz, lt) in final_grid:

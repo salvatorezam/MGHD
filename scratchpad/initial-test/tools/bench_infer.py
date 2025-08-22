@@ -402,6 +402,8 @@ def main():
     parser.add_argument("--model", type=str, help="Path to model checkpoint (optional)")
     parser.add_argument("--backend", type=str, choices=["eager", "ts", "trace", "onnxrt", "trt", "graph"], 
                        default="eager", help="Backend to benchmark")
+    parser.add_argument("--fastpath-persist", action="store_true", help="Benchmark persistent fastpath decoder")
+    parser.add_argument("--N", type=int, default=1000, help="Number of syndromes for fastpath-persist")
     parser.add_argument("--repeats", type=int, default=10000, help="Number of benchmark iterations")
     parser.add_argument("--warmup", type=int, default=1000, help="Number of warmup iterations")
     parser.add_argument("--n-syn", type=int, required=True, help="Number of syndrome bits")
@@ -410,6 +412,27 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     
     args = parser.parse_args()
+    
+    # Handle fastpath-persist special case
+    if args.fastpath_persist:
+        import fastpath, numpy as np, time
+        lut16, *_ = fastpath.load_rotated_d3_lut_npz()
+        from fastpath import PersistentLUT
+        capacity = max(1024, args.N)
+        with PersistentLUT(lut16=lut16, capacity=capacity) as svc:
+            # warm
+            for _ in range(32): svc.decode_bytes(np.array([0], dtype=np.uint8))
+            # batch-ish: submit in smaller chunks to avoid wrap-around
+            batch_size = min(args.N, 512)  # Conservative batch size
+            arr = np.random.randint(0,256,size=(batch_size,),dtype=np.uint8)
+            t0 = time.time()
+            out = svc.decode_bytes(arr)
+            t1 = time.time()
+            print(f"[fastpath-persist] {out.shape[0]} shots in {(t1-t0)*1e3:.3f} ms "
+                  f"({out.shape[0]/((t1-t0)+1e-12):.0f} shots/s)")
+        return 0
+        svc.stop()
+        return 0
     
     # Validate inputs
     if args.n_syn <= 0 or args.n_bits <= 0:
@@ -450,6 +473,71 @@ def main():
         import traceback
         traceback.print_exc()
         return 1
+
+def benchmark_decode_one_batch(model, syndrome_tensor, backend='eager', B_sizes=None, warmup=10, runs=20):
+    """Benchmark decode_one method for various batch sizes."""
+    if B_sizes is None:
+        B_sizes = [1, 8, 16, 32, 64, 128, 256]
+    
+    results = {}
+    n_syn = 8  # rotated d=3 has 8 syndrome bits
+    n_bits = 9  # rotated d=3 has 9 data qubits
+    
+    for B in B_sizes:
+        if B > len(syndrome_tensor):
+            continue
+            
+        # Take subset of syndromes
+        synd_batch = syndrome_tensor[:B]
+        
+        # Warmup
+        for _ in range(warmup):
+            try:
+                _ = model.decode_one(synd_batch)
+            except:
+                pass
+        
+        # Measure latency
+        times = []
+        for _ in range(runs):
+            start = time.perf_counter()
+            try:
+                _ = model.decode_one(synd_batch)
+                torch.cuda.synchronize()  # Ensure completion
+                end = time.perf_counter()
+                times.append((end - start) * 1e6)  # Convert to microseconds
+            except Exception as e:
+                # If decode_one fails, skip this measurement
+                continue
+        
+        if times:
+            times = np.array(times)
+            results[B] = {
+                'p50': float(np.percentile(times, 50)),
+                'p99': float(np.percentile(times, 99)),
+                'mean': float(np.mean(times)),
+                'std': float(np.std(times)),
+                'min': float(np.min(times)),
+                'max': float(np.max(times))
+            }
+        else:
+            # If no successful measurements, return placeholder
+            results[B] = {
+                'p50': float('inf'),
+                'p99': float('inf'),
+                'mean': float('inf'),
+                'std': 0.0,
+                'min': float('inf'),
+                'max': float('inf')
+            }
+    
+    # Return results for the first successful batch size if no specific B requested
+    if B_sizes and 1 in results:
+        return results[1]
+    elif results:
+        return list(results.values())[0]
+    else:
+        return {'p50': float('inf'), 'p99': float('inf'), 'mean': float('inf'), 'std': 0.0}
 
 
 if __name__ == "__main__":
