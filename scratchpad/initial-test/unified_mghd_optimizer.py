@@ -15,6 +15,10 @@ import argparse
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
+import os
+import sys
+import subprocess
+from pathlib import Path
 
 # Quantum error correction imports
 from panqec.codes import surface_2d
@@ -635,28 +639,230 @@ class ComprehensiveMGHDOptimizer:
         }
 
 def main():
-    parser = argparse.ArgumentParser(description='Comprehensive MGHD Optimization')
+    parser = argparse.ArgumentParser(description='Comprehensive MGHD Optimization + Step-11')
+    # Legacy optimization path
     parser.add_argument('--strategy', choices=['basic', 'advanced', 'ensemble', 'direct'], 
                        default='basic', help='Optimization strategy')
     parser.add_argument('--trials', type=int, default=30, help='Number of Optuna trials')
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs per trial')
     parser.add_argument('--ensemble-size', type=int, default=5, help='Ensemble size')
-    
+
+    # Step-11 Foundation training (GPU-only)
+    parser.add_argument('--step11-train', action='store_true', help='Run Step-11 Garnet foundation training')
+    parser.add_argument('--profile', choices=['S','M','L'], default='S')
+    parser.add_argument('--garnet-mode', choices=['foundation','student'], default='foundation')
+    parser.add_argument('--teacher-ensemble', default='mwpf+mwpm')
+    parser.add_argument('--steps-per-epoch', type=int, default=800)
+    parser.add_argument('--batch-size', type=int, default=512)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--grad-clip', type=float, default=1.0)
+    parser.add_argument('--compile', action='store_true')
+    parser.add_argument('--amp', choices=['bf16','fp16','off'], default='bf16')
+    parser.add_argument('--outdir', type=str, default='results/step11')
+    parser.add_argument('--seed', type=int, default=42)
+
     args = parser.parse_args()
-    
+
+    if args.step11_train:
+        return run_step11_garnet_train(args)
+
+    # Legacy path
     config = OptimizationConfig(
         strategy=args.strategy,
         n_trials=args.trials,
         epochs=args.epochs,
         ensemble_size=args.ensemble_size
     )
-    
+
     optimizer = ComprehensiveMGHDOptimizer(config)
     results = optimizer.run_optimization()
-    
-    print("\\n🏆 Optimization Complete!")
+
+    print("\n🏆 Optimization Complete!")
     print(f"Strategy: {results['strategy']}")
     print(f"Best LER achieved: {min([res['lers'][-1] for res in results['training_results'].values()]):.6f}")
+
+
+def run_step11_garnet_train(args):
+    """Step-11 training loop with CUDA-Q sampler (fallback: numpy+LUT).
+
+    - Streams synthetic syndrome/label batches from tools/cudaq_sampler.py
+    - Binary head via logit difference and BCEWithLogits
+    - Cosine schedule w/ warmup, grad clip, bf16 AMP
+    - Saves best checkpoint by coset-validated val metric
+    - Calls tools/eval_ler.py at the end; writes small handoff JSON
+    """
+    import torch
+    import numpy as np
+    from tools.cudaq_sampler import CudaqGarnetSampler, get_code_mats
+    from tools.eval_ler import _coset_success  # reuse logic locally
+    from poc_my_models import MGHD
+
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # H matrices for validation/coset checks
+    Hx, Hz, meta = get_code_mats()
+    Hx_t = torch.from_numpy(Hx.astype(np.uint8))
+    Hz_t = torch.from_numpy(Hz.astype(np.uint8))
+
+    # Model profiles
+    profiles = {
+        'S': dict(n_iters=7, n_node_features=128, n_edge_features=128, msg_net=96, d_model=192, d_state=32),
+        'M': dict(n_iters=8, n_node_features=192, n_edge_features=192, msg_net=128, d_model=256, d_state=48),
+        'L': dict(n_iters=9, n_node_features=256, n_edge_features=256, msg_net=160, d_model=320, d_state=64),
+    }
+    pf = profiles[args.profile]
+
+    gnn_params = dict(
+        dist=3, n_node_inputs=9, n_node_outputs=9,  # MGHD will adapt for rotated
+        n_iters=pf['n_iters'], n_node_features=pf['n_node_features'], n_edge_features=pf['n_edge_features'],
+        msg_net_size=pf['msg_net'], msg_net_dropout_p=0.04, gru_dropout_p=0.11,
+    )
+    mamba_params = dict(d_model=pf['d_model'], d_state=pf['d_state'], d_conv=2, expand=3,
+                        attention_mechanism='channel_attention', se_reduction=4)
+    model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
+    # Enforce rotated layout behavior (8 checks + 9 qubits; binary head)
+    try:
+        model.set_rotated_layout()
+    except Exception:
+        pass
+    model.train()
+    # Ensure graph indices are built once
+    try:
+        model._ensure_static_indices(device)
+    except Exception:
+        pass
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Cosine with warmup
+    total_epochs = args.epochs
+    warmup = max(1, int(0.05 * total_epochs))
+    base_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
+    def lr_lambda(epoch):
+        if epoch < warmup:
+            return (epoch + 1) / float(max(1, warmup))
+        return 1.0
+    warmup_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # AMP settings
+    use_amp = args.amp != 'off'
+    amp_dtype = torch.bfloat16 if args.amp == 'bf16' else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type == 'cuda')
+
+    if args.compile and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass
+
+    sampler = CudaqGarnetSampler(args.garnet_mode)
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = outdir / f"step11_garnet_{args.profile}_best.pt"
+
+    best_val = 1.0
+    history = []
+
+    for epoch in range(args.epochs):
+        epoch_losses = []
+        for step in range(args.steps_per_epoch):
+            s_bin, labels_x, labels_z = sampler.sample_batch(args.batch_size, p=np.random.choice([0.02,0.03,0.05,0.08]))
+            # Targets: use labels_x (d=3 symmetric)
+            y = torch.from_numpy(labels_x.astype(np.float32)).to(device)
+
+            # Build node_inputs from syndrome bits: place into first feature of check nodes
+            B = s_bin.shape[0]
+            num_check_nodes = 8
+            num_qubit_nodes = 9
+            nodes_per_graph = num_check_nodes + num_qubit_nodes
+            node_inputs = torch.zeros(B, nodes_per_graph, 9, device=device, dtype=torch.float32)
+            node_inputs[:, :num_check_nodes, 0] = torch.from_numpy(s_bin.astype(np.float32)).to(device)
+            flat_inputs = node_inputs.view(-1, 9)
+
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+                outs = model(flat_inputs, model._src_ids, model._dst_ids)  # [n_iters, B*n_nodes, n_node_outputs]
+                final = outs[-1]
+                # Slice qubit node outputs: last 9 of each graph
+                final = final.view(B, nodes_per_graph, -1)[:, num_check_nodes:, :]  # [B,9,2 or 9]
+                # Binary head: if 2 logits, condense to bitlogits; if >2 treat last axis as pre-bitlogits
+                if final.shape[-1] == 2:
+                    bitlogits = (final[..., 1] - final[..., 0])  # [B,9]
+                else:
+                    # Fallback: assume single logit already
+                    bitlogits = final.squeeze(-1)
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(bitlogits, y, reduction='mean')
+
+            optimizer.zero_grad(set_to_none=True)
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip and args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+            epoch_losses.append(float(loss.detach().cpu().item()))
+
+        # Warmup then base schedule
+        warmup_sched.step(epoch)
+        base_sched.step()
+
+        # Validation (small batch for parity/coset)
+        with torch.no_grad():
+            v_s, v_lx, v_lz = sampler.sample_batch(1024, p=0.05)
+            # Use model to predict
+            B = v_s.shape[0]
+            node_inputs = torch.zeros(B, 17, 9, device=device, dtype=torch.float32)
+            node_inputs[:, :8, 0] = torch.from_numpy(v_s.astype(np.float32)).to(device)
+            final = model(node_inputs.view(-1, 9), model._src_ids, model._dst_ids)[-1]
+            final = final.view(B, 17, -1)[:, 8:, :]
+            if final.shape[-1] == 2:
+                bits = (final[..., 1] - final[..., 0]).sigmoid() > 0.5
+            else:
+                bits = (final.squeeze(-1).sigmoid() > 0.5)
+            y_pred = bits.to(torch.uint8).cpu().numpy()
+            succ = _coset_success(Hz, Hx, v_s, y_pred, v_lx)
+            val_ler = 1.0 - float(succ.mean())
+
+        history.append(dict(epoch=epoch+1, loss=float(np.mean(epoch_losses)), val_ler=val_ler))
+        print(f"[Step11] epoch {epoch+1}/{args.epochs} loss={np.mean(epoch_losses):.4f} val_LER={val_ler:.4f}")
+
+        # Save best
+        if val_ler < best_val:
+            best_val = val_ler
+            torch.save(model.state_dict(), ckpt_path)
+
+    # Auto-evaluate LER with harness
+    ler_json = outdir / f"ler_{args.profile}_step11.json"
+    try:
+        cmd = [sys.executable, str(Path('tools')/ 'eval_ler.py'),
+               '--decoder','mghd','--checkpoint', str(ckpt_path),
+               '--metric','coset','--N-per-p','10000',
+               '--p-grid','0.02,0.03,0.05,0.08','--out', str(ler_json)]
+        subprocess.run(cmd, cwd=Path(__file__).parent, check=False)
+    except Exception:
+        pass
+
+    # Handoff summary
+    handoff = dict(
+        profile=args.profile,
+        ckpt=str(ckpt_path),
+        best_val_ler=best_val,
+        history=history[-5:],
+        ler_json=str(ler_json)
+    )
+    with open(outdir / f"handoff_step11_{args.profile}.json", 'w') as f:
+        json.dump(handoff, f, indent=2)
+    print(f"Saved checkpoint to {ckpt_path}")
+    return 0
 
 if __name__ == "__main__":
     main()

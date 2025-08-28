@@ -1,6 +1,10 @@
-from panqec.codes import surface_2d
-from panqec.error_models import PauliErrorModel
-from panqec.decoders import MatchingDecoder, BeliefPropagationOSDDecoder
+try:
+    from panqec.codes import surface_2d
+    from panqec.error_models import PauliErrorModel
+    from panqec.decoders import MatchingDecoder, BeliefPropagationOSDDecoder
+    _HAS_PANQEC = True
+except Exception:
+    _HAS_PANQEC = False
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -348,17 +352,23 @@ from poc_my_models import MGHD
 """
 Parameters
 """
+"""Parameters"""
 d = 3
-error_model_name = "DP"
-
-if (error_model_name == "X"):
-    error_model = PauliErrorModel(1, 0.0, 0)
-elif (error_model_name == "Z"):
-    error_model = PauliErrorModel(0, 0.0, 1)
-elif (error_model_name == "XZ"):
-    error_model = PauliErrorModel(0.5, 0.0, 0.5)
-elif (error_model_name == "DP"):
-    error_model = PauliErrorModel(0.34, 0.32, 0.34)
+if not _HAS_PANQEC:
+    class Dummy:
+        pass
+    PauliErrorModel = Dummy
+    error_model = None
+else:
+    error_model_name = "DP"
+    if (error_model_name == "X"):
+        error_model = PauliErrorModel(1, 0.0, 0)
+    elif (error_model_name == "Z"):
+        error_model = PauliErrorModel(0, 0.0, 1)
+    elif (error_model_name == "XZ"):
+        error_model = PauliErrorModel(0.5, 0.0, 0.5)
+    elif (error_model_name == "DP"):
+        error_model = PauliErrorModel(0.34, 0.32, 0.34)
 
 # list of hyperparameters (ALL 23 parameters optimized with comprehensive attention mechanism investigation)
 n_node_inputs = 4
@@ -631,15 +641,36 @@ def warmup_lambda(step):
 warmup_scheduler_mghd = torch.optim.lr_scheduler.LambdaLR(optimizer_mghd, lr_lambda=warmup_lambda)
 print(f"Hybrid MGHD parameters: {sum(p.numel() for p in mghd_model.parameters())}")
 
-# Generate the test data
-testset = adapt_trainset(
-    generate_syndrome_error_volume(code, error_model=error_model, p=test_err_rate, batch_size=len_test_set,
-                                   for_training=False, backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg), 
-    code, num_classes=n_node_inputs, for_training=False)
-testloader = DataLoader(testset, batch_size=512, collate_fn=collate, shuffle=False)
-
-print(f"Dataset size: {len_train_set}")
-print(f"Test set size: {len(testset)}")
+# Prefer canonical pack for evaluation when provided
+pack_mode = pack is not None and teacher_labels is not None
+if pack_mode:
+    # Force baseline head to 2 logits/qubit for rotated d=3
+    try:
+        gnn_baseline.n_node_outputs = 2
+        _devb = next(gnn_baseline.final_digits.parameters()).device
+        gnn_baseline.final_digits = nn.Linear(gnn_baseline.n_node_features, 2).to(_devb)
+    except Exception:
+        pass
+    # Load pack + labels for eval
+    synd_bin_eval, sZ_eval, sX_eval, Hx_eval, Hz_eval, meta_eval, (hx8_eval, hz8_eval, Beval) = load_canonical_pack(pack)
+    hard_labels_eval = load_teacher_labels_with_parity_check(teacher_labels, sZ_eval, sX_eval, Hx_eval, Hz_eval, hx8_eval, hz8_eval)
+    eval_ds = CanonicalPackDataset(synd_bin_eval, hard_labels_eval)
+    def _pack_collate(batch):
+        xs = torch.stack([b[0] for b in batch])
+        ys = torch.stack([b[1] for b in batch])
+        return xs, ys
+    testloader = DataLoader(eval_ds, batch_size=512, shuffle=False, collate_fn=_pack_collate)
+    print(f"Dataset size (pack): {eval_ds.B}")
+    print(f"Test set size (pack): {eval_ds.B}")
+else:
+    # Generate the test data
+    testset = adapt_trainset(
+        generate_syndrome_error_volume(code, error_model=error_model, p=test_err_rate, batch_size=len_test_set,
+                                       for_training=False, backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg), 
+        code, num_classes=n_node_inputs, for_training=False)
+    testloader = DataLoader(testset, batch_size=512, collate_fn=collate, shuffle=False)
+    print(f"Dataset size: {len_train_set}")
+    print(f"Test set size: {len(testset)}")
 
 """
 Train
@@ -687,16 +718,83 @@ current_global_step = 0
 def evaluate_model_avg(model, loader, code, runs=1, decoder_type="mghd", fastpath_svc=None):
     """Return (lerx_mean, lerz_mean, lertot_mean) across 'runs' repeated evaluations."""
     lerx_vals, lerz_vals, lertot_vals = [], [], []
-    model.eval()
-    with torch.no_grad():
-        for _ in range(max(1, runs)):
-            if decoder_type == "fastpath" and fastpath_svc is not None:
-                lerx, lerz, lertot = logical_error_rate_fastpath(fastpath_svc, loader, code)
-            else:
-                lerx, lerz, lertot = logical_error_rate(model, loader, code)
-            lerx_vals.append(float(lerx))
-            lerz_vals.append(float(lerz))
-            lertot_vals.append(float(lertot))
+    if 'pack_mode' in globals() and pack_mode:
+        # Evaluate using canonical pack parity with Hx/Hz
+        import numpy as _np
+        Hx_np = Hx_eval.astype(_np.uint8); Hz_np = Hz_eval.astype(_np.uint8)
+        _model = mghd_model if model is None else model
+        _model.eval()
+        with torch.no_grad():
+            for _ in range(max(1, runs)):
+                total=0; ok=0
+                for batch in loader:
+                    # Support both (xs,ys) pack and 4-tuple legacy batches
+                    if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                        xs, ys = batch
+                    else:
+                        # Legacy path cannot be parity-checked here; skip
+                        continue
+                    xs = xs.to(device); B = xs.shape[0]
+                    total_nodes=17; num_checks=8
+                    ni = torch.zeros(B*total_nodes, n_node_inputs, device=device, dtype=xs.dtype)
+                    for b in range(B):
+                        off=b*total_nodes; ni[off:off+num_checks,0]=xs[b,:]
+                    # Build canonical edges for rotated d=3 if baseline model lacks indices
+                    if hasattr(_model, '_src_ids') and hasattr(_model, '_dst_ids'):
+                        # MGHD path
+                        _model._ensure_static_indices(device)
+                        src=_model._src_ids; dst=_model._dst_ids
+                    else:
+                        # Baseline path: build edges from Hx/Hz
+                        src_ids=[]; dst_ids=[]
+                        # X stabilizers (rows 0..3 of Hx) map to check nodes 4..7
+                        for i in range(4):
+                            for j in range(9):
+                                if int(Hx_np[i,j]) & 1:
+                                    src_ids.append(4+i); dst_ids.append(8+j)
+                        # Z stabilizers (rows 0..3 of Hz) map to check nodes 0..3
+                        for i in range(4):
+                            for j in range(9):
+                                if int(Hz_np[i,j]) & 1:
+                                    src_ids.append(i); dst_ids.append(8+j)
+                        # Add reverse edges data->check
+                        rev_src=[]; rev_dst=[]
+                        for i in range(4):
+                            for j in range(9):
+                                if int(Hx_np[i,j]) & 1:
+                                    rev_src.append(8+j); rev_dst.append(4+i)
+                        for i in range(4):
+                            for j in range(9):
+                                if int(Hz_np[i,j]) & 1:
+                                    rev_src.append(8+j); rev_dst.append(i)
+                        src_ids = src_ids + rev_src; dst_ids = dst_ids + rev_dst
+                        src = torch.tensor(src_ids, device=device, dtype=torch.long)
+                        dst = torch.tensor(dst_ids, device=device, dtype=torch.long)
+                    src_t = torch.cat([src + b*total_nodes for b in range(B)])
+                    dst_t = torch.cat([dst + b*total_nodes for b in range(B)])
+                    out = _model(ni, src_t, dst_t)
+                    logits = out[-1].view(B,total_nodes,-1)[:, num_checks:, :]
+                    if logits.shape[-1]==2:
+                        pred = logits.argmax(dim=-1).to(torch.uint8)
+                    else:
+                        pred = (logits.argmax(dim=-1)==1).to(torch.uint8)
+                    s = xs.cpu().numpy().astype(_np.uint8)
+                    pred_np = pred.cpu().numpy().astype(_np.uint8)
+                    sZ = s[:, :4]; sX = s[:, 4:8]
+                    sZ_hat = (Hz_np @ pred_np.T)%2; sX_hat=(Hx_np @ pred_np.T)%2
+                    ok_mask = (_np.all(sZ_hat.T==sZ,axis=1) & _np.all(sX_hat.T==sX,axis=1))
+                    total += B; ok += int(ok_mask.sum())
+                lertot = 1.0 - (ok/max(1,total))
+                lerx_vals.append(lertot); lerz_vals.append(lertot); lertot_vals.append(lertot)
+    else:
+        model.eval()
+        with torch.no_grad():
+            for _ in range(max(1, runs)):
+                if decoder_type == "fastpath" and fastpath_svc is not None:
+                    lerx, lerz, lertot = logical_error_rate_fastpath(fastpath_svc, loader, code)
+                else:
+                    lerx, lerz, lertot = logical_error_rate(model, loader, code)
+                lerx_vals.append(float(lerx)); lerz_vals.append(float(lerz)); lertot_vals.append(float(lertot))
     return float(np.mean(lerx_vals)), float(np.mean(lerz_vals)), float(np.mean(lertot_vals))
 
 def logical_error_rate_fastpath(fastpath_svc, testloader, code):
@@ -888,11 +986,26 @@ for epoch in range(epochs):
             return X, (None if ys_relay is None else torch.stack(ys_relay, dim=0)), (None if ys_mwpm is None else torch.stack(ys_mwpm, dim=0))
         trainloader = DataLoader(distil_ds, batch_size=batch_size, shuffle=True, collate_fn=_distil_collate)
     else:
-        trainset = adapt_trainset(
-            generate_syndrome_error_volume(code, error_model, p=p_train, batch_size=len_train_set,
-                                           backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg),
-            code, num_classes=n_node_inputs)
-        trainloader = DataLoader(trainset, batch_size=batch_size, collate_fn=collate, shuffle=True)
+        # Pack-mode supervised training on canonical dataset when provided
+        if pack is not None and teacher_labels is not None:
+            # Build canon dataset and split 80/20
+            synd_bin_tr, sZ_tr, sX_tr, Hx_tr, Hz_tr, meta_tr, (hx8_tr, hz8_tr, Btr) = load_canonical_pack(pack)
+            hard_labels_tr = load_teacher_labels_with_parity_check(teacher_labels, sZ_tr, sX_tr, Hx_tr, Hz_tr, hx8_tr, hz8_tr)
+            full_ds = CanonicalPackDataset(synd_bin=synd_bin_tr, hard_labels=hard_labels_tr)
+            train_ds, val_ds = full_ds.split_train_val(train_ratio=0.8)
+            def _pack_collate_train(batch):
+                xs = torch.stack([b[0] for b in batch])
+                ys = torch.stack([b[1] for b in batch])
+                return xs, ys
+            trainloader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=_pack_collate_train)
+            print(f"[PACK] train={len(train_ds)} val={len(val_ds)}")
+        else:
+            # Legacy path: generate synthetic/DP or CUDA-Q backend data
+            trainset = adapt_trainset(
+                generate_syndrome_error_volume(code, error_model, p=p_train, batch_size=len_train_set,
+                                               backend=backend, cudaq_mode=cudaq_mode, cudaq_cfg=cudaq_cfg),
+                code, num_classes=n_node_inputs)
+            trainloader = DataLoader(trainset, batch_size=batch_size, collate_fn=collate, shuffle=True)
     print(f"  [Curriculum] p_train={p_train:.5f}; batches={len(trainloader)}")
     
     # Initialize gradient accumulation for MGHD
@@ -1155,8 +1268,12 @@ for epoch in range(epochs):
             lerx_mghd, lerz_mghd, ler_tot_mghd = evaluate_model_avg(mghd_model, testloader, code, runs=eval_runs)
         
         # Calculate fraction solved
-        frac_solved_baseline = fraction_of_solved_puzzles(gnn_baseline, testloader, code)
-        frac_solved_mghd = fraction_of_solved_puzzles(mghd_model, testloader, code)
+        if 'pack_mode' in globals() and pack_mode:
+            frac_solved_baseline = 1.0 - ler_tot_baseline
+            frac_solved_mghd = 1.0 - ler_tot_mghd
+        else:
+            frac_solved_baseline = fraction_of_solved_puzzles(gnn_baseline, testloader, code)
+            frac_solved_mghd = fraction_of_solved_puzzles(mghd_model, testloader, code)
 
     # Update best checkpoint if MGHD improved
     if ler_tot_mghd + early_stop_min_delta < best_mghd_ler:
@@ -1170,40 +1287,39 @@ for epoch in range(epochs):
     else:
         epochs_without_improve += 1
 
-    # Per-epoch multi-p evaluation (fast: runs=1, set_size=5000)
-    # Baseline
-    baseline_pgrid, baseline_auc = evaluate_over_p_grid(gnn_baseline, code, runs=1, set_size=5000)
-    with open(pgrid_csv, 'a', newline='') as f:
-        writer = csv.writer(f)
-        for (pp, lx, lz, lt) in baseline_pgrid:
-            row = [datetime.utcnow().isoformat(), epoch + 1, 'baseline', f"{pp:.5f}", f"{lt:.6f}", f"{lx:.6f}", f"{lz:.6f}"]
+    # Per-epoch multi-p evaluation (fast): skip in pack-mode to avoid loader mismatch
+    if not ('pack_mode' in globals() and pack_mode):
+        # Baseline
+        baseline_pgrid, baseline_auc = evaluate_over_p_grid(gnn_baseline, code, runs=1, set_size=5000)
+        with open(pgrid_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            for (pp, lx, lz, lt) in baseline_pgrid:
+                row = [datetime.utcnow().isoformat(), epoch + 1, 'baseline', f"{pp:.5f}", f"{lt:.6f}", f"{lx:.6f}", f"{lz:.6f}"]
+                if pack:
+                    row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
+                writer.writerow(row)
+            auc_row = [datetime.utcnow().isoformat(), epoch + 1, 'baseline', 'AUC', f"{baseline_auc:.6f}", '', '']
             if pack:
-                row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
-            writer.writerow(row)
-        
-        auc_row = [datetime.utcnow().isoformat(), epoch + 1, 'baseline', 'AUC', f"{baseline_auc:.6f}", '', '']
-        if pack:
-            auc_row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
-        writer.writerow(auc_row)
+                auc_row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
+            writer.writerow(auc_row)
 
-    # MGHD evaluation with decoder branching
-    if args.decoder == "fastpath" and fastpath_svc is not None:
-        mghd_pgrid, mghd_auc = evaluate_over_p_grid(None, code, runs=1, set_size=5000, 
-                                                   decoder_type="fastpath", fastpath_svc=fastpath_svc)
-    else:
-        mghd_pgrid, mghd_auc = evaluate_over_p_grid(mghd_model, code, runs=1, set_size=5000)
-    with open(pgrid_csv, 'a', newline='') as f:
-        writer = csv.writer(f)
-        for (pp, lx, lz, lt) in mghd_pgrid:
-            row = [datetime.utcnow().isoformat(), epoch + 1, 'mghd_raw', f"{pp:.5f}", f"{lt:.6f}", f"{lx:.6f}", f"{lz:.6f}"]
+        # MGHD evaluation with decoder branching
+        if args.decoder == "fastpath" and fastpath_svc is not None:
+            mghd_pgrid, mghd_auc = evaluate_over_p_grid(None, code, runs=1, set_size=5000, 
+                                                       decoder_type="fastpath", fastpath_svc=fastpath_svc)
+        else:
+            mghd_pgrid, mghd_auc = evaluate_over_p_grid(mghd_model, code, runs=1, set_size=5000)
+        with open(pgrid_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            for (pp, lx, lz, lt) in mghd_pgrid:
+                row = [datetime.utcnow().isoformat(), epoch + 1, 'mghd_raw', f"{pp:.5f}", f"{lt:.6f}", f"{lx:.6f}", f"{lz:.6f}"]
+                if pack:
+                    row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
+                writer.writerow(row)
+            auc_row = [datetime.utcnow().isoformat(), epoch + 1, 'mghd_raw', 'AUC', f"{mghd_auc:.6f}", '', '']
             if pack:
-                row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
-            writer.writerow(row)
-        
-        auc_row = [datetime.utcnow().isoformat(), epoch + 1, 'mghd_raw', 'AUC', f"{mghd_auc:.6f}", '', '']
-        if pack:
-            auc_row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
-        writer.writerow(auc_row)
+                auc_row.extend([pack_id, pack_hx_hash8, pack_hz_hash8])
+            writer.writerow(auc_row)
 
     # Check for early stopping
     if epochs_without_improve >= early_stop_patience:

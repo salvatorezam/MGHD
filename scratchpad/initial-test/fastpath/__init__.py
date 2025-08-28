@@ -108,6 +108,10 @@ class PersistentLUT:
         # extension returns a CPU torch tensor [N,9]; convert to numpy
         return t.numpy()
 
+    # Backward-compatible alias for realtime service
+    def decode_batch(self, synd_bytes: np.ndarray) -> np.ndarray:
+        return self.decode_bytes(synd_bytes)
+
     def __exit__(self, exc_type, exc, tb):
         if self._alive:
             _fastpath_ext = _ensure_persist_ext()
