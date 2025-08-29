@@ -686,6 +686,10 @@ def main():
     parser.add_argument('--amp', choices=['bf16','fp16','off'], default='bf16')
     parser.add_argument('--outdir', type=str, default='results/step11')
     parser.add_argument('--seed', type=int, default=42)
+    # Fine-tune / eval controls
+    parser.add_argument('--train-p', type=float, default=None, help='Fix training p (e.g., 0.05); default uses curriculum')
+    parser.add_argument('--val-N', type=int, default=1024, help='Validation shots per epoch (default: 1024)')
+    parser.add_argument('--init-ckpt', type=str, default=None, help='Optional checkpoint to initialize model weights')
 
     args = parser.parse_args()
 
@@ -719,6 +723,7 @@ def run_foundation_train(args):
     """
     import torch
     import numpy as np
+    import signal, tempfile, os as _os
     from tools.cudaq_sampler import CudaqGarnetSampler, get_code_mats
     from tools.eval_ler import _coset_success  # reuse logic locally
     from poc_my_models import MGHD
@@ -749,6 +754,14 @@ def run_foundation_train(args):
     mamba_params = dict(d_model=pf['d_model'], d_state=pf['d_state'], d_conv=2, expand=3,
                         attention_mechanism='channel_attention', se_reduction=4)
     model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
+    # Optional init from checkpoint for fine-tuning
+    if getattr(args, 'init_ckpt', None):
+        try:
+            state = torch.load(args.init_ckpt, map_location=device)
+            model.load_state_dict(state, strict=False)
+            print(f"[Foundation] Loaded init checkpoint: {args.init_ckpt}")
+        except Exception as e:
+            print(f"[Foundation] Warning: failed to load init checkpoint: {e}")
     # Enforce rotated layout behavior (8 checks + 9 qubits; binary head)
     try:
         model.set_rotated_layout()
@@ -788,6 +801,7 @@ def run_foundation_train(args):
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     ckpt_path = outdir / f"step11_garnet_{args.profile}_best.pt"
+    ckpt_last = outdir / f"step11_garnet_{args.profile}_last.pt"
     # Write run manifest (repro + paper assets)
     try:
         # Command line
@@ -816,12 +830,59 @@ def run_foundation_train(args):
 
     best_val = 1.0
     history = []
+    # Graceful stop flag for SIGTERM/SIGINT
+    _stop_flag = {"stop": False}
 
+    def _signal_handler(sig, frame):
+        try:
+            print(f"[Foundation] Received signal {sig}; will save last checkpoint and stop after current step.")
+        except Exception:
+            pass
+        _stop_flag["stop"] = True
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    def _save_last_ckpt(epoch_idx: int):
+        try:
+            payload = {
+                'epoch': int(epoch_idx),
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'warmup_sched': getattr(warmup_sched, 'state_dict', lambda: {})(),
+                'base_sched': getattr(base_sched, 'state_dict', lambda: {})(),
+                'best_val_ler': float(best_val),
+                'args': vars(args),
+                'teacher_stats': sampler.stats_snapshot(),
+                'rng_numpy': np.random.get_state()[1].tolist(),
+                'rng_torch': torch.random.get_rng_state().cpu().tolist(),
+            }
+            with tempfile.NamedTemporaryFile(delete=False, dir=str(outdir), suffix='.pt.tmp') as tf:
+                tmp_path = Path(tf.name)
+            torch.save(payload, tmp_path)
+            _os.replace(tmp_path, ckpt_last)
+        except Exception:
+            pass
+
+    # Curriculum p-schedule for training
+    rng = np.random.default_rng(args.seed)
     for epoch in range(args.epochs):
         epoch_losses = []
         samples_epoch = 0
         for step in range(args.steps_per_epoch):
-            s_bin, labels_x, labels_z = sampler.sample_batch(args.batch_size, p=np.random.choice([0.02,0.03,0.05,0.08]))
+            # Choose p with curriculum schedule across epochs (or fixed via --train-p)
+            if getattr(args, 'train_p', None) is not None:
+                p_train = float(args.train_p)
+            elif epoch < 10:
+                ps, ws = [0.08, 0.05, 0.03, 0.02], [0.5, 0.3, 0.15, 0.05]
+                p_train = float(rng.choice(ps, p=ws))
+            elif epoch < 20:
+                ps, ws = [0.05, 0.03, 0.08, 0.02], [0.5, 0.3, 0.15, 0.05]
+                p_train = float(rng.choice(ps, p=ws))
+            else:
+                ps, ws = [0.03, 0.02, 0.05, 0.08], [0.5, 0.3, 0.15, 0.05]
+                p_train = float(rng.choice(ps, p=ws))
+            s_bin, labels_x, labels_z = sampler.sample_batch(args.batch_size, p=p_train, rng=rng)
             samples_epoch += int(s_bin.shape[0])
             # Targets: use labels_x (d=3 symmetric)
             y = torch.from_numpy(labels_x.astype(np.float32)).to(device)
@@ -863,13 +924,17 @@ def run_foundation_train(args):
                 optimizer.step()
             epoch_losses.append(float(loss.detach().cpu().item()))
 
+            if _stop_flag["stop"]:
+                break
+
         # Warmup then base schedule
         warmup_sched.step(epoch)
         base_sched.step()
 
         # Validation (small batch for parity/coset)
         with torch.no_grad():
-            v_s, v_lx, v_lz = sampler.sample_batch(1024, p=0.05)
+            vN = int(getattr(args, 'val_N', 1024))
+            v_s, v_lx, v_lz = sampler.sample_batch(vN, p=0.05, rng=rng)
             # Use model to predict
             B = v_s.shape[0]
             node_inputs = torch.zeros(B, 17, 9, device=device, dtype=torch.float32)
@@ -893,6 +958,10 @@ def run_foundation_train(args):
             with open(outdir / 'metrics.csv', 'a', newline='') as f:
                 w = _csv.writer(f)
                 w.writerow([epoch+1, f"{np.mean(epoch_losses):.6f}", f"{val_ler:.6f}", samples_epoch, st.get('mwpf_shots',0), st.get('mwpm_shots',0)])
+                try:
+                    f.flush(); _os.fsync(f.fileno())
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -900,6 +969,13 @@ def run_foundation_train(args):
         if val_ler < best_val:
             best_val = val_ler
             torch.save(model.state_dict(), ckpt_path)
+
+        # Always update last checkpoint for resume safety
+        _save_last_ckpt(epoch+1)
+
+        if _stop_flag["stop"]:
+            print("[Foundation] Stopping early due to signal; last checkpoint saved.")
+            break
 
     # Auto-evaluate LER with harness
     ler_json = outdir / f"ler_{args.profile}_foundation.json"

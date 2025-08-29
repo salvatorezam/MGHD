@@ -119,12 +119,19 @@ class CudaqGarnetSampler:
             'mwpf_shots': 0,
             'mwpm_shots': 0,
             'total_shots': 0,
+            'sampler_backend': 'unknown',
+            'cudaq_calls': 0,
+            'numpy_calls': 0,
         }
 
     def _ensure_cudaq(self) -> bool:
         if self._tried_import:
             return self._cudaq_ready
         self._tried_import = True
+        # Allow explicit override to disable CUDA-Q path for A/B checks
+        if os.getenv('MGHD_FORCE_NUMPY_SAMPLER', '0') == '1':
+            self._cudaq_ready = False
+            return False
         try:
             # Lazy import (no CUDA usage here)
             from cudaq_backend import (
@@ -177,6 +184,9 @@ class CudaqGarnetSampler:
                         s_bin = _unpack_byte_lsbf(s_bin[:, 0])
                     else:
                         raise RuntimeError(f"Unexpected CUDA-Q syn shape {s_bin.shape}")
+                # Update stats backend tag
+                self._stats['sampler_backend'] = 'cudaq_rotated_d3'
+                self._stats['cudaq_calls'] += 1
             except Exception as e:
                 # Soft fallback to numpy if CUDA-Q path fails
                 e_msg = str(e)
@@ -185,12 +195,16 @@ class CudaqGarnetSampler:
                 sZ = (Hz @ e_bits.T) % 2
                 sX = (Hx @ e_bits.T) % 2
                 s_bin = np.concatenate([sZ.T, sX.T], axis=1).astype(np.uint8)
+                self._stats['sampler_backend'] = 'numpy_fallback'
+                self._stats['numpy_calls'] += 1
         else:
             # Deterministic numpy fallback (no CUDA-Q dependency)
             e_bits = (rng.random((B, 9)) < p).astype(np.uint8)  # error bits
             sZ = (Hz @ e_bits.T) % 2
             sX = (Hx @ e_bits.T) % 2
             s_bin = np.concatenate([sZ.T, sX.T], axis=1).astype(np.uint8)
+            self._stats['sampler_backend'] = 'numpy_fallback'
+            self._stats['numpy_calls'] += 1
 
         # Teacher labels: MWPF primary via Stim DEM metadata; MWPM fallback.
         teacher_used = 'mwpf'

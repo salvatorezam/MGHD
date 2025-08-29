@@ -110,21 +110,40 @@ def decode_mghd(s_bin: np.ndarray, ckpt: str, device: str = "cuda") -> np.ndarra
     import torch
     from poc_my_models import MGHD
 
-    # Build a small default MGHD that recomputes indices from Hx/Hz
+    # Try to reconstruct architecture from checkpoint run args (profile-aware)
+    import json as _json
+    from pathlib import Path as _Path
+    ckpt_path = _Path(ckpt)
+    run_dir = ckpt_path.parent
+    profile = 'S'
+    args_json = run_dir / 'args.json'
+    if args_json.exists():
+        try:
+            with open(args_json) as f:
+                aj = _json.load(f)
+            profile = aj.get('profile', profile)
+        except Exception:
+            pass
+    profiles = {
+        'S': dict(n_iters=7, n_node_features=128, n_edge_features=128, msg_net=96, d_model=192, d_state=32),
+        'M': dict(n_iters=8, n_node_features=192, n_edge_features=192, msg_net=128, d_model=256, d_state=48),
+        'L': dict(n_iters=9, n_node_features=256, n_edge_features=256, msg_net=160, d_model=320, d_state=64),
+    }
+    pf = profiles.get(profile, profiles['S'])
     gnn_params = {
         'dist': 3,
         'n_node_inputs': 9,
         'n_node_outputs': 9,  # adjusted to 2 for rotated if model enforces
-        'n_iters': 7,
-        'n_node_features': 128,
-        'n_edge_features': 128,
-        'msg_net_size': 96,
+        'n_iters': pf['n_iters'],
+        'n_node_features': pf['n_node_features'],
+        'n_edge_features': pf['n_edge_features'],
+        'msg_net_size': pf['msg_net'],
         'msg_net_dropout_p': 0.0,
         'gru_dropout_p': 0.0,
     }
     mamba_params = {
-        'd_model': 192,
-        'd_state': 32,
+        'd_model': pf['d_model'],
+        'd_state': pf['d_state'],
         'd_conv': 2,
         'expand': 3,
         'attention_mechanism': 'none',

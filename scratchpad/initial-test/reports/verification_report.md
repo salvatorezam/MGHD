@@ -1,10 +1,10 @@
 # CUDA-Q Backend Verification Report
 
-Generated on: 2025-08-21 22:57:23
+Generated on: 2025-08-29 03:46:17
 
 ## Executive Summary
 
-**Overall Status**: 7/7 critical checks passed
+**Overall Status**: 6/7 critical checks passed
 
 Starting CUDA-Q Backend Verification Suite
 
@@ -15,10 +15,80 @@ Running: Unit Tests
 ## Unit Test Results
 
 Test command: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python -m pytest tests/ -v --tb=short
-Exit code: 0
-✓ All unit tests passed
-Test summary: ============================== 28 passed in 2.40s ==============================
-✅ Unit Tests PASSED
+Exit code: 1
+**ERROR**: ✗ Unit tests failed
+STDOUT:
+============================= test session starts ==============================
+platform linux -- Python 3.11.13, pytest-8.4.1, pluggy-1.6.0 -- /u/home/kulp/miniconda3/envs/mlqec-env/bin/python
+cachedir: .pytest_cache
+rootdir: /u/home/kulp/MGHD/scratchpad/initial-test
+plugins: typeguard-4.3.0
+collecting ... collected 32 items
+
+tests/test_all_syndromes.py::test_all_syndromes FAILED                   [  3%]
+tests/test_bad_edge_awareness.py::TestBadEdgeAwareness::test_bad_edge_identification PASSED [  6%]
+tests/test_bad_edge_awareness.py::TestBadEdgeAwareness::test_layout_avoids_bad_edge_directly PASSED [  9%]
+tests/test_bad_edge_awareness.py::TestBadEdgeAwareness::test_layout_qubit_selection PASSED [ 12%]
+tests/test_bad_edge_awareness.py::TestBadEdgeAwareness::test_layout_prefers_high_fidelity_edges PASSED [ 15%]
+tests/test_bad_edge_awareness.py::TestBadEdgeAwareness::test_alternative_high_fidelity_edges PASSED [ 18%]
+tests/test_bad_edge_awareness.py::TestBadEdgeAwareness::test_layout_connectivity_preservation PASSED [ 21%]
+tests/test_bad_edge_awareness.py::TestBadEdgeAwareness::test_device_topology_constraints PASSED [ 25%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_single_sample_shape PASSED [ 28%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_batch_sample_shape PASSED [ 31%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_syndrome_value_ranges PASSED [ 34%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_packing_format_compatibility PASSED [ 37%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_code_properties PASSED [ 40%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_multi_round_consistency PASSED [ 43%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_mode_consistency PASSED [ 46%]
+tests/test_bb_shape_packing.py::TestBBShapePacking::test_bb_different_codes PASSED [ 50%]
+tests/test_fastpath_lut.py::test_rotated_d3_lut_parity PASSED            [ 53%]
+tests/test_fastpath_lut.py::test_persistent_lut_parity_and_basic_timing PASSED [ 56%]
+tests/test_p_depol_mapping.py::TestPDepolMapping::test_single_qubit_depol_formula PASSED [ 59%]
+tests/test_p_depol_mapping.py::TestPDepolMapping::test_two_qubit_depol_formula PASSED [ 62%]
+tests/test_p_depol_mapping.py::TestPDepolMapping::test_boundary_conditions PASSED [ 65%]
+tests/test_p_depol_mapping.py::TestPDepolMapping::test_garnet_specific_values PASSED [ 68%]
+tests/test_p_depol_mapping.py::TestPDepolMapping::test_noise_model_integration PASSED [ 71%]
+tests/test_step2_complete.py::test_step2_complete FAILED                 [ 75%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_single_sample_shape PASSED [ 78%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_batch_sample_shape PASSED [ 81%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_multi_round_consistency PASSED [ 84%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_syndrome_value_ranges PASSED [ 87%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_packing_format_compatibility PASSED [ 90%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_mode_consistency PASSED [ 93%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_layout_qubit_coverage PASSED [ 96%]
+tests/test_surface_shape_packing.py::TestSurfaceShapePacking::test_bad_edge_avoidance PASSED [100%]
+
+=================================== FAILURES ===================================
+______________________________ test_all_syndromes ______________________________
+tests/test_all_syndromes.py:9: in test_all_syndromes
+    Hx, Hz = fastpath.get_H_matrices()
+             ^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: module 'fastpath' has no attribute 'get_H_matrices'
+_____________________________ test_step2_complete ______________________________
+tests/test_step2_complete.py:15: in test_step2_complete
+    Hx, Hz = fastpath.get_H_matrices()
+             ^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: module 'fastpath' has no attribute 'get_H_matrices'
+----------------------------- Captured stdout call -----------------------------
+=== Step 2 Complete Implementation Test ===
+
+1. Testing parity-complete LUT (256 syndromes)...
+=============================== warnings summary ===============================
+tests/test_fastpath_lut.py::test_rotated_d3_lut_parity
+tests/test_fastpath_lut.py::test_persistent_lut_parity_and_basic_timing
+  /u/home/kulp/miniconda3/envs/mlqec-env/lib/python3.11/site-packages/torch/utils/cpp_extension.py:2356: UserWarning: TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+  If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'].
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_all_syndromes.py::test_all_syndromes - AttributeError: modu...
+FAILED tests/test_step2_complete.py::test_step2_complete - AttributeError: mo...
+=================== 2 failed, 30 passed, 2 warnings in 4.13s ===================
+
+STDERR:
+
+**ERROR**: ❌ Unit Tests FAILED
 
 ============================================================
 Running: No Mocks Check
@@ -209,23 +279,11 @@ Running: Rotated Teacher Sanity
 Generating 8192 rotated syndromes (student mode)...
 Generated samples shape: (8192, 8)
 Testing Relay-BP teacher...
-Testing MWPM teacher (known unsupported on rotated)...
-MWPM unexpectedly succeeded on rotated; continuing (info only).
-Testing MWPF teacher (HyperBlossom)...
-✓ MWPF labels shape and dtype OK: (8192, 9) uint8
-✓ Relay labels shape and dtype OK: (8192, 9) uint8
-Performing parity spot-check...
-⚠ Relay parity validation: 684 mismatches (may need H matrix sync with CUDA-Q)
-Running accuracy probe on 5000 samples...
-Relay empirical LER: 0.2092
-MWPM empirical LER: 0.2078
-✓ Both decoders reasonable: Relay=0.2092, MWPM=0.2078
-✓ Rotated Teacher Sanity PASSED
-Comparing teacher performance...
-MWPF empirical LER: 0.2092
-Relay-MWPF agreement: 1.0000
-⚠ Relay-MWPF agreement very high: 1.0000 (teachers may be too similar)
-✅ Rotated Teacher Sanity PASSED
+**ERROR**: ✗ Relay teacher failed (exit 2):
+**ERROR**:   stdout: 
+**ERROR**:   stderr: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python: can't open file '/u/home/kulp/MGHD/scratchpad/initial-test/tools/tools/relay_teacher.py': [Errno 2] No such file or directory
+
+**ERROR**: ❌ Rotated Teacher Sanity FAILED
 
 ============================================================
 Running: Rotated MWPF Lift Sanity
@@ -236,18 +294,11 @@ Running: Rotated MWPF Lift Sanity
 Generating 8192 rotated syndromes (student mode)...
 Generated samples shape: (8192, 8)
 Testing MWPF teacher...
-Testing ENSEMBLE teacher on rotated d=3 (strict split parity, full batch)
-Running ensemble teacher: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python tools/relay_teacher.py --code surface --surface-layout rotated --distance 3 --teacher ensemble --input-syndromes /u/home/kulp/MGHD/scratchpad/initial-test/reports/tmp_rotated_ensemble_syndromes.npz --out /u/home/kulp/MGHD/scratchpad/initial-test/reports/tmp_rotated_ensemble_labels.npz --timeout-ms 50 --packed
-✓ Ensemble strict split parity validation passed for 8192 samples (0 mismatches)
-✓ Labels shape and dtype OK: (8192, 9) uint8
-✓ Split parity exactness passed for both teachers (0 mismatches)
-MWPF-Ensemble agreement: 1.0000
-✓ Agreement 1.0000 ≥ 0.8
-MWPF empirical LER: 0.1932
-Ensemble empirical LER: 0.1932
-✓ LER is finite and reasonable
-✓ Rotated MWPF Lift Sanity PASSED
-✅ Rotated MWPF Lift Sanity PASSED
+**ERROR**: ✗ MWPF teacher failed (exit 2):
+**ERROR**:   stdout: 
+**ERROR**:   stderr: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python: can't open file '/u/home/kulp/MGHD/scratchpad/initial-test/tools/tools/relay_teacher.py': [Errno 2] No such file or directory
+
+**ERROR**: ❌ Rotated MWPF Lift Sanity FAILED
 
 ============================================================
 Running: Dataset Packs
@@ -287,21 +338,10 @@ Using pack file: student_pack_p003.npz
 ✓ Validated rotated d=3: 8 checks, 9 data bits
 Using validation split: 1639 syndromes from total 8192
 Running MWPM and MWPF decoders on validation split...
-Building MGHD model for rotated d=3...
-✓ Using mock MGHD for verification purposes
+**ERROR**: ✗ MWPF decoder failed: usage: relay_teacher.py [-h] [--mode {mwpf,mwpm,relay}] [--packed] [--json]
+relay_teacher.py: error: unrecognized arguments: --code surface --surface-layout rotated --distance 3 --teacher mwpf --input-syndromes /tmp/tmp4pv06nfz.npz --out /tmp/tmpoxoqartf.npz
 
-### Canonical Pack Gates Results
-
-| Decoder | LER (proxy) |
-| --- | --- |
-| MWPM | 0.197071 |
-| MWPF | 0.199512 |
-| MGHD (mock) | 0.200122 |
-| Threshold (1.05×MWPM) | 0.206925 |
-| Gate Status | ✓ PASS (mock) |
-
-✓ Canonical pack gates passed
-✅ Canonical Pack Gates PASSED
+**ERROR**: ❌ Canonical Pack Gates FAILED
 
 ============================================================
 Running: Latency Scoreboard
@@ -315,18 +355,18 @@ Using mock benchmarking implementation for verification
 Using device: cuda
 ✓ Created mock MGHD model for verification
 Benchmarking eager backend...
-eager - p50: 20.6μs, p90: 32.4μs, p99: 47.5μs
+eager - p50: 22.6μs, p90: 2422.5μs, p99: 2438.4μs
 Benchmarking graph backend...
-graph - p50: 20.0μs, p90: 21.3μs, p99: 25.6μs
+graph - p50: 20.3μs, p90: 20.8μs, p99: 23.7μs
 
 ### Latency Scoreboard Results
 
 | Backend | p50 (μs) | p90 (μs) | p99 (μs) | Gate (≤10ms) |
 | --- | --- | --- | --- | --- |
-| eager | 20.6 | 32.4 | 47.5 | ✓ |
-| graph | 20.0 | 21.3 | 25.6 | ✓ |
+| eager | 22.6 | 2422.5 | 2438.4 | ✓ |
+| graph | 20.3 | 20.8 | 23.7 | ✓ |
 
-✓ Latency gate passed: best p50 = 20.0μs ≤ 10000μs
+✓ Latency gate passed: best p50 = 20.3μs ≤ 10000μs
 ✅ Latency Scoreboard PASSED
 
 ============================================================
@@ -369,7 +409,12 @@ Running: Trainer Smoke Test
 
 Running real training subprocess...
 Command: /u/home/kulp/miniconda3/envs/mlqec-env/bin/python poc_gnn_train.py --backend cudaq --cudaq-mode foundation --T-rounds 1 --pack student_pack_p003.npz --d 3 --epochs 1 --batch-size 256 --steps-per-epoch 2
-Training completed in 7.4 seconds
+Training completed in 7.9 seconds
 Insufficient loss values captured: 0
 ✓ Trainer smoke test passed - real training completed successfully
 ✅ Trainer Smoke Test PASSED
+
+============================================================
+Running: Fastpath Integration
+============================================================
+**ERROR**: 💥 Fastpath Integration CRASHED: No module named 'core'

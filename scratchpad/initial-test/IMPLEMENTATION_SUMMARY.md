@@ -131,4 +131,42 @@ Environment: All commands are run within `conda activate mlqec-env`.
 - Launched full training (CUDA‑Q syndromes):
   `python unified_mghd_optimizer.py --foundation-train --profile L --garnet-mode foundation --teacher-ensemble mwpf+mwpm --epochs 20 --steps-per-epoch 800 --batch-size 512 --lr 1e-4 --weight-decay 1e-4 --grad-clip 1.0 --compile --amp bf16 --outdir results/foundation_L_cudaq --seed 42`
 - PID written to `results/foundation_L_cudaq/pid.txt`; logs streaming to `results/foundation_L_cudaq/train_L_full.log`. Metrics append to `metrics.csv`; best checkpoint at `step11_garnet_L_best.pt`; final LER JSON auto-writes on completion.
-- Runtime estimate (H100, bf16): ~25–40 minutes total for 20×800 steps (sampling + train) plus final 40k‑shot eval; varies ±20% with GPU load. Per-step latency observed ≈80–120 ms (batch 512) in smokes.
+
+2025-08-29 03:44 UTC (Stop earlier 20‑epoch run)
+
+- Action: Stopped earlier 20‑epoch CUDA‑Q job to free GPU for 30‑epoch run.
+- Killed PID from `results/foundation_L_cudaq/pid.txt` (367756) via SIGTERM; confirmed exit.
+- 30‑epoch job remains active (PID in `results/foundation_L_cudaq_e30/pid.txt`).
+
+2025-08-29 04:25 UTC (L foundation results + plots)
+
+- Training complete: 30 epochs, 1,200 steps/epoch, batch=512; total ≈ 18.46M MWPF‑supervised shots; CUDA‑Q sampler used (`sampler_backend=cudaq_rotated_d3`).
+- Best per‑epoch validation (p=0.05, N=1024): min LER≈0.1631 (early), final epochs stable ≈0.19–0.22.
+- Final LER sweep (N=10k per‑p):
+  - MGHD(L) mghd: p=0.02→0.1848; 0.03→0.2141; 0.05→0.2077; 0.08→0.2097 (`results/foundation_L_cudaq_e30/ler_L_foundation.json`).
+  - MWPF teacher: p=0.02→0.2023; 0.03→0.1939; 0.05→0.1952; 0.08→0.2060 (`results/foundation_L_cudaq_e30/ler_mwpf.json`).
+  - MWPM baseline: p=0.02→0.2158; 0.03→0.2032; 0.05→0.2025; 0.08→0.2009 (`results/foundation_L_cudaq_e30/ler_mwpm.json`).
+- Plots written:
+  - Training curves: `results/foundation_L_cudaq_e30/plot_training_curves.png` (val LER + loss vs epoch)
+  - LER vs p (with 95% CIs): `results/foundation_L_cudaq_e30/plot_ler_vs_p.png` (MGHD vs MWPF/MWPM)
+- Takeaways:
+  - MGHD(L) currently does not beat MWPF/MWPM at p=0.05 (0.2077 vs 0.195–0.203). Early epoch best (0.163) did not persist as training progressed under the curriculum.
+  - Throughput is excellent; optimization likely needs targeted p=0.05 focus and/or schedule/arch tweaks.
+
+Next steps
+- Fine‑tune from best checkpoint (fixed p=0.05): 10–20 epochs, steps/epoch=1200, batch=512, lower LR=5e‑5 with cosine/plateau; save best by val LER.
+
+2025-08-29 04:27 UTC (Launched p=0.05 fine‑tune; unique outdir)
+
+- Trainer updates: added CLI flags `--train-p`, `--val-N`, `--init-ckpt` to `unified_mghd_optimizer.py`.
+  - `--train-p 0.05` fixes training p; `--val-N 4096` increases per‑epoch validation shots; `--init-ckpt` seeds from best L.
+- Command:
+  `python unified_mghd_optimizer.py --foundation-train --profile L --garnet-mode foundation --teacher-ensemble mwpf+mwpm --epochs 15 --steps-per-epoch 1200 --batch-size 512 --lr 5e-5 --weight-decay 1e-4 --grad-clip 1.0 --compile --amp bf16 --train-p 0.05 --val-N 4096 --init-ckpt results/foundation_L_cudaq_e30/step11_garnet_L_best.pt --outdir results/foundation_L_p005_tune_YYYYMMDD_HHMMSS --seed 42`
+- Outdir: timestamped (UTC) to avoid overwriting prior runs. PID written to `pid.txt`; logs to `train_L_tune.log`; metrics to `metrics.csv`; checkpoints: `*_best.pt`, `*_last.pt`.
+- Re‑evaluate with N=10k per‑p; accept only if MGHD ≤ MWPF at p=0.05.
+- Optional: increase model capacity slightly (L+ variant: n_iters=10, d_model=384, msg_net=192) if latency budget allows; verify B=1 latency post‑training.
+- Improve eval parity: evaluator now reconstructs model profile from `args.json` to avoid arch mismatch; consider exporting full arch config alongside checkpoints.
+- Runtime estimate (30‑epoch plan):
+  - Per‑step (B=512, CUDA‑Q + MWPF + FWD/BWD): ≈0.25–0.40 s
+  - Per‑epoch (1,200 steps): ≈5–8 minutes
+  - Total (30 epochs) ≈ 2.5–4.0 hours; final eval adds ~10–20 minutes
