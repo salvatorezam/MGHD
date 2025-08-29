@@ -265,7 +265,17 @@ class ComprehensiveMGHDOptimizer:
             
             # Training loop
             criterion = nn.CrossEntropyLoss(label_smoothing=params.get('label_smoothing', 0.0))
-            scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+            # AMP scaler: enable only on CUDA; use a no-op scaler on CPU
+            if device.type == 'cuda':
+                from torch.cuda.amp import GradScaler as _GradScaler
+                scaler = _GradScaler(enabled=use_amp)
+            else:
+                class _NoopScaler:
+                    def scale(self, x): return x
+                    def step(self, opt): opt.step()
+                    def update(self): pass
+                    def unscale_(self, opt): pass
+                scaler = _NoopScaler()
             best_ler = float('inf')
             accum = params.get('accumulation_steps', 1)
             grad_clip = params.get('gradient_clip', 0.0)
@@ -279,7 +289,7 @@ class ComprehensiveMGHDOptimizer:
                     inputs, targets = inputs.to(device), targets.to(device)
                     src_ids, dst_ids = src_ids.to(device), dst_ids.to(device)
                     
-                    with torch.autocast(device_type=device.type, dtype=amp_data_type, enabled=use_amp):
+                    with torch.autocast(device_type='cuda', dtype=amp_data_type, enabled=(use_amp and device.type == 'cuda')):
                         outputs = model(inputs, src_ids, dst_ids)  # Correct call signature
                         loss = criterion(outputs[-1], targets) / accum
                     
@@ -287,7 +297,10 @@ class ComprehensiveMGHDOptimizer:
                     
                     if (batch_idx + 1) % accum == 0:
                         if grad_clip and grad_clip > 0:
-                            scaler.unscale_(optimizer)
+                            try:
+                                scaler.unscale_(optimizer)
+                            except Exception:
+                                pass
                             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                         scaler.step(optimizer)
                         scaler.update()
@@ -513,7 +526,17 @@ class ComprehensiveMGHDOptimizer:
         
         # Training
         criterion = nn.CrossEntropyLoss()
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        # AMP scaler: enable only on CUDA; use a no-op scaler on CPU
+        if device.type == 'cuda':
+            from torch.cuda.amp import GradScaler as _GradScaler
+            scaler = _GradScaler(enabled=use_amp)
+        else:
+            class _NoopScaler:
+                def scale(self, x): return x
+                def step(self, opt): opt.step()
+                def update(self): pass
+                def unscale_(self, opt): pass
+            scaler = _NoopScaler()
         
         results = {}
         epochs = 25 if self.config.strategy == 'direct' else 30  # Use 25 epochs for direct to match search conditions
@@ -534,7 +557,7 @@ class ComprehensiveMGHDOptimizer:
                     src_ids, dst_ids = src_ids.to(device), dst_ids.to(device)
                     
                     optimizer.zero_grad()
-                    with torch.autocast(device_type=device.type, dtype=amp_data_type, enabled=use_amp):
+                    with torch.autocast(device_type='cuda', dtype=amp_data_type, enabled=(use_amp and device.type == 'cuda')):
                         outputs = model(inputs, src_ids, dst_ids)
                         loss = criterion(outputs[-1], targets)
                     
@@ -647,8 +670,10 @@ def main():
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs per trial')
     parser.add_argument('--ensemble-size', type=int, default=5, help='Ensemble size')
 
-    # Step-11 Foundation training (GPU-only)
-    parser.add_argument('--step11-train', action='store_true', help='Run Step-11 Garnet foundation training')
+    # Foundation training (GPU-only)
+    # Back-compat: keep --step11-train as alias for --foundation-train
+    parser.add_argument('--foundation-train', action='store_true', help='Run Garnet foundation training (formerly Step-11)')
+    parser.add_argument('--step11-train', action='store_true', help='Alias for --foundation-train (deprecated)')
     parser.add_argument('--profile', choices=['S','M','L'], default='S')
     parser.add_argument('--garnet-mode', choices=['foundation','student'], default='foundation')
     parser.add_argument('--teacher-ensemble', default='mwpf+mwpm')
@@ -664,8 +689,8 @@ def main():
 
     args = parser.parse_args()
 
-    if args.step11_train:
-        return run_step11_garnet_train(args)
+    if getattr(args, 'foundation_train', False) or getattr(args, 'step11_train', False):
+        return run_foundation_train(args)
 
     # Legacy path
     config = OptimizationConfig(
@@ -683,7 +708,7 @@ def main():
     print(f"Best LER achieved: {min([res['lers'][-1] for res in results['training_results'].values()]):.6f}")
 
 
-def run_step11_garnet_train(args):
+def run_foundation_train(args):
     """Step-11 training loop with CUDA-Q sampler (fallback: numpy+LUT).
 
     - Streams synthetic syndrome/label batches from tools/cudaq_sampler.py
@@ -763,14 +788,41 @@ def run_step11_garnet_train(args):
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     ckpt_path = outdir / f"step11_garnet_{args.profile}_best.pt"
+    # Write run manifest (repro + paper assets)
+    try:
+        # Command line
+        (outdir / 'cmd.txt').write_text(' '.join(map(str, sys.argv)))
+        # Args JSON
+        import json as _json
+        (outdir / 'args.json').write_text(_json.dumps(vars(args), indent=2, default=str))
+        # Env summary
+        import torch
+        env = {
+            'python': sys.version,
+            'torch': torch.__version__,
+            'cuda_available': torch.cuda.is_available(),
+            'device': (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'),
+            'amp': args.amp,
+            'seed': args.seed,
+        }
+        (outdir / 'env.json').write_text(_json.dumps(env, indent=2))
+        # Metrics CSV header
+        import csv as _csv
+        with open(outdir / 'metrics.csv', 'w', newline='') as f:
+            w = _csv.writer(f)
+            w.writerow(['epoch','train_loss_mean','val_ler','samples_epoch','mwpf_shots_cum','mwpm_shots_cum'])
+    except Exception:
+        pass
 
     best_val = 1.0
     history = []
 
     for epoch in range(args.epochs):
         epoch_losses = []
+        samples_epoch = 0
         for step in range(args.steps_per_epoch):
             s_bin, labels_x, labels_z = sampler.sample_batch(args.batch_size, p=np.random.choice([0.02,0.03,0.05,0.08]))
+            samples_epoch += int(s_bin.shape[0])
             # Targets: use labels_x (d=3 symmetric)
             y = torch.from_numpy(labels_x.astype(np.float32)).to(device)
 
@@ -833,7 +885,16 @@ def run_step11_garnet_train(args):
             val_ler = 1.0 - float(succ.mean())
 
         history.append(dict(epoch=epoch+1, loss=float(np.mean(epoch_losses)), val_ler=val_ler))
-        print(f"[Step11] epoch {epoch+1}/{args.epochs} loss={np.mean(epoch_losses):.4f} val_LER={val_ler:.4f}")
+        print(f"[Foundation] epoch {epoch+1}/{args.epochs} loss={np.mean(epoch_losses):.4f} val_LER={val_ler:.4f}")
+        # Append metrics row
+        try:
+            import csv as _csv
+            st = sampler.stats_snapshot()
+            with open(outdir / 'metrics.csv', 'a', newline='') as f:
+                w = _csv.writer(f)
+                w.writerow([epoch+1, f"{np.mean(epoch_losses):.6f}", f"{val_ler:.6f}", samples_epoch, st.get('mwpf_shots',0), st.get('mwpm_shots',0)])
+        except Exception:
+            pass
 
         # Save best
         if val_ler < best_val:
@@ -841,7 +902,7 @@ def run_step11_garnet_train(args):
             torch.save(model.state_dict(), ckpt_path)
 
     # Auto-evaluate LER with harness
-    ler_json = outdir / f"ler_{args.profile}_step11.json"
+    ler_json = outdir / f"ler_{args.profile}_foundation.json"
     try:
         cmd = [sys.executable, str(Path('tools')/ 'eval_ler.py'),
                '--decoder','mghd','--checkpoint', str(ckpt_path),
@@ -862,7 +923,17 @@ def run_step11_garnet_train(args):
     with open(outdir / f"handoff_step11_{args.profile}.json", 'w') as f:
         json.dump(handoff, f, indent=2)
     print(f"Saved checkpoint to {ckpt_path}")
+    # Teacher stats snapshot
+    try:
+        with open(outdir / 'teacher_stats.json', 'w') as f:
+            json.dump(sampler.stats_snapshot(), f, indent=2)
+    except Exception:
+        pass
     return 0
+
+# Back-compat entry for older scripts
+def run_step11_garnet_train(args):
+    return run_foundation_train(args)
 
 if __name__ == "__main__":
     main()

@@ -31,7 +31,11 @@ from datetime import datetime
 
 # Add benchmarking utilities
 sys.path.insert(0, '/u/home/kulp/MGHD')
-from tools.bench_infer import benchmark_decode_one_batch
+try:
+    from tools.bench_infer import benchmark_decode_one_batch
+except ImportError:
+    print("Warning: benchmark_decode_one_batch not available")
+    benchmark_decode_one_batch = None
 
 # Canonical pack utilities
 def _bit_unpack_rows(packed: np.ndarray, n_bits: int) -> np.ndarray:
@@ -434,7 +438,7 @@ def sample_training_p(epoch, total_epochs):
 # ---- Stability & early-stop config ----
 eval_runs = 1           # Back to single eval run for faster, optimistic tracking
 final_eval_runs = 5     # number of times to eval at the very end (best checkpoint)
-early_stop_patience = 8 # epochs without improvement before stopping
+early_stop_patience = 10 # epochs without improvement before stopping
 early_stop_min_delta = 0.0  # required improvement in LER to reset patience
 
 lr = 6.839647835588333e-05  # LOCKED: Trial B winner - optimal LR from investigation
@@ -536,8 +540,11 @@ if pack is not None:
         subset = min(64, B)
         synd_t = torch.from_numpy(synd[:subset]).to(torch.uint8)
         if device.type == 'cuda':
-            lat = benchmark_decode_one_batch(mghd_model, synd_t, backend='eager')
-            print(f"[Latency] decode_one eager p50={lat['p50']:.1f}µs, p99={lat['p99']:.1f}µs (B={subset})")
+            if benchmark_decode_one_batch is not None:
+                lat = benchmark_decode_one_batch(mghd_model, synd_t, backend='eager')
+                print(f"[Latency] decode_one eager p50={lat['p50']:.1f}µs, p99={lat['p99']:.1f}µs (B={subset})")
+            else:
+                print(f"[Latency] Benchmarking unavailable (B={subset})")
 
         # Fast-path setup
         fastpath_svc = None
@@ -554,6 +561,33 @@ if pack is not None:
     except Exception as e:
         print(f"[PACK] ERROR in early pack configuration/bench: {e}")
         raise
+else:
+    # Non-pack path: enforce rotated graph layout but keep 4-class head for compatibility
+    try:
+        if surface_layout == 'rotated':
+            # Force rotated layout for graph indices
+            try:
+                mghd_model.code_config['layout'] = 'rotated'
+                # Clear cached indices
+                mghd_model._check_node_indices = None
+                mghd_model._src_ids = None
+                mghd_model._dst_ids = None
+                mghd_model._edge_index = None
+            except Exception:
+                # Fallback to setter (may switch head to 2); we'll restore head width below
+                mghd_model.set_rotated_layout()
+            # Restore 4-class head expected by non-pack CE targets
+            if getattr(mghd_model.gnn, 'n_node_outputs', None) != n_node_outputs:
+                _dev = next(mghd_model.gnn.final_digits.parameters()).device
+                mghd_model.gnn.n_node_outputs = n_node_outputs
+                mghd_model.gnn.final_digits = nn.Linear(mghd_model.gnn.n_node_features, n_node_outputs).to(_dev)
+            # Build indices now
+            mghd_model._ensure_static_indices(device)
+            assert getattr(mghd_model, '_num_check_nodes', None) == 8, "rotated d=3 requires 8 check nodes"
+            assert getattr(mghd_model, '_num_data_qubits', None) == 9, "rotated d=3 requires 9 data qubits"
+            print("[INIT] Rotated d3 graph enforced for MGHD (non-pack): nodes=17 (8+9), head=4")
+    except Exception as e:
+        print(f"[INIT] WARNING: could not enforce rotated layout: {e}")
 
 # If teacher metadata provided, adjust MGHD head to match N_bits (e.g., 2 logits per data qubit for rotated)
 if teacher_synd is not None:
@@ -641,8 +675,9 @@ def warmup_lambda(step):
 warmup_scheduler_mghd = torch.optim.lr_scheduler.LambdaLR(optimizer_mghd, lr_lambda=warmup_lambda)
 print(f"Hybrid MGHD parameters: {sum(p.numel() for p in mghd_model.parameters())}")
 
-# Prefer canonical pack for evaluation when provided
-pack_mode = pack is not None and teacher_labels is not None
+# Prefer canonical pack for evaluation when provided  
+# NOTE: Disabling pack_mode to test regular logical_error_rate function
+pack_mode = False  # pack is not None and teacher_labels is not None
 if pack_mode:
     # Force baseline head to 2 logits/qubit for rotated d=3
     try:
@@ -675,8 +710,23 @@ else:
 """
 Train
 """
-""" automatic mixed precision """
-scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+# Automatic mixed precision and scaler
+# Use CUDA AMP only on GPU to avoid no-op or API mismatches on CPU.
+if device.type == 'cuda':
+    from torch.cuda.amp import GradScaler
+    scaler = GradScaler(enabled=use_amp)
+else:
+    # CPU: disable GradScaler; we still allow bfloat16 autocast below
+    class _NoopScaler:
+        def scale(self, x):
+            return x
+        def step(self, opt):
+            opt.step()
+        def update(self):
+            pass
+        def unscale_(self, opt):
+            pass
+    scaler = _NoopScaler()
 
 # Use CLI-controlled training duration and batch size
 epochs = int(epochs)
@@ -691,6 +741,18 @@ criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)  # Optimized: 0
 gradient_clip_value = gradient_clip  # Optimized: 4.04 from investigation
 
 start_time = time.time()
+
+# --- Diagnostics: track parameter change to ensure training actually updates weights ---
+def _param_l2(model: nn.Module) -> float:
+    with torch.no_grad():
+        s = 0.0
+        for p in model.parameters():
+            if p is not None and p.dtype.is_floating_point:
+                s += float((p.detach()**2).sum().item())
+        return s ** 0.5
+
+baseline_param_l2_prev = None
+mghd_param_l2_prev = None
 size = 2 * GNNDecoder.dist ** 2 - 1
 error_index = GNNDecoder.dist ** 2 - 1
 
@@ -782,8 +844,38 @@ def evaluate_model_avg(model, loader, code, runs=1, decoder_type="mghd", fastpat
                     pred_np = pred.cpu().numpy().astype(_np.uint8)
                     sZ = s[:, :4]; sX = s[:, 4:8]
                     sZ_hat = (Hz_np @ pred_np.T)%2; sX_hat=(Hx_np @ pred_np.T)%2
-                    ok_mask = (_np.all(sZ_hat.T==sZ,axis=1) & _np.all(sX_hat.T==sX,axis=1))
-                    total += B; ok += int(ok_mask.sum())
+                    
+                    # Check if syndrome is reproduced (necessary but not sufficient)
+                    syndrome_ok = (_np.all(sZ_hat.T==sZ,axis=1) & _np.all(sX_hat.T==sX,axis=1))
+                    
+                    # For samples that reproduce syndrome, check logical errors
+                    logical_ok = _np.zeros(B, dtype=bool)
+                    syndrome_count = int(syndrome_ok.sum())
+                    logical_count = 0
+                    for b in range(B):
+                        if syndrome_ok[b]:
+                            # pred_np[b] is the predicted correction
+                            # Compare with target correction to see if logical operators are preserved
+                            target_corr = ys[b].cpu().numpy().astype(_np.uint8)
+                            residual = (target_corr + pred_np[b]) % 2
+                            # Check if residual commutes with logical operators (no logical error)
+                            # For rotated d=3, logical X = [1,0,1,0,1,0,1,0,1] and Z = [1,1,1,1,1,1,1,1,1]
+                            logX = _np.array([1,0,1,0,1,0,1,0,1], dtype=_np.uint8)
+                            logZ = _np.array([1,1,1,1,1,1,1,1,1], dtype=_np.uint8)
+                            # Logical error occurs if residual anticommutes with either logical operator
+                            log_err_X = (_np.sum(residual * logX) % 2) != 0
+                            log_err_Z = (_np.sum(residual * logZ) % 2) != 0
+                            logical_ok[b] = not (log_err_X or log_err_Z)
+                            if logical_ok[b]:
+                                logical_count += 1
+                        else:
+                            logical_ok[b] = False  # Syndrome not reproduced = automatic failure
+                    
+                    # Debug output for first run of first epoch
+                    if _ == 0 and len(lerx_vals) == 0:
+                        print(f"    [DEBUG] Pack eval: B={B}, syndrome_ok={syndrome_count}, logical_ok={logical_count}")
+                    
+                    total += B; ok += logical_count
                 lertot = 1.0 - (ok/max(1,total))
                 lerx_vals.append(lertot); lerz_vals.append(lertot); lertot_vals.append(lertot)
     else:
@@ -1064,7 +1156,7 @@ for epoch in range(epochs):
 
         # --- Train the Baseline GNN ---
         optimizer_baseline.zero_grad()
-        with torch.autocast(device_type=device.type, dtype=amp_data_type, enabled=use_amp):
+        with torch.autocast(device_type='cuda', dtype=amp_data_type, enabled=(use_amp and device.type == 'cuda')):
             if pack:
                 # Forward baseline GNN with canonical graph
                 outputs_baseline = gnn_baseline(node_inputs, tiled_src, tiled_dst)
@@ -1120,7 +1212,7 @@ for epoch in range(epochs):
             epoch_loss_baseline.append(0.0)
 
         # --- Train your Hybrid MGHD ---
-        with torch.autocast(device_type=device.type, dtype=amp_data_type, enabled=use_amp):
+        with torch.autocast(device_type='cuda', dtype=amp_data_type, enabled=(use_amp and device.type == 'cuda')):
             # Add noise injection for regularization (optimized: 0.00544) - only first 5 epochs
             effective_noise = noise_injection if epoch < 3 else 0.0
             
@@ -1209,7 +1301,11 @@ for epoch in range(epochs):
             # Only step optimizer every accumulation_steps
             if (i + 1) % accumulation_steps == 0:
                 # IMPROVED: Add gradient clipping for stability
-                scaler.unscale_(optimizer_mghd)
+                # Unscale if CUDA AMP is active; no-op otherwise
+                try:
+                    scaler.unscale_(optimizer_mghd)
+                except Exception:
+                    pass
                 
                 # Debug: Check gradient norms
                 total_norm = torch.nn.utils.clip_grad_norm_(mghd_model.parameters(), gradient_clip_value)
@@ -1249,6 +1345,19 @@ for epoch in range(epochs):
     # Calculate average losses
     avg_loss_baseline = np.mean(epoch_loss_baseline)
     avg_loss_mghd = np.mean(epoch_loss_mghd)
+
+    # Diagnostics: report parameter L2 norms and delta
+    try:
+        bl_l2 = _param_l2(gnn_baseline)
+        mg_l2 = _param_l2(mghd_model)
+        if baseline_param_l2_prev is None:
+            print(f"[Diag] Baseline ||W||2={bl_l2:.4e}; MGHD ||W||2={mg_l2:.4e}")
+        else:
+            print(f"[Diag] Δ||W||2 Baseline={bl_l2-baseline_param_l2_prev:+.4e}; MGHD={mg_l2-mghd_param_l2_prev:+.4e}")
+        baseline_param_l2_prev = bl_l2
+        mghd_param_l2_prev = mg_l2
+    except Exception:
+        pass
 
     print(f"Epoch {epoch+1} - Evaluating models...")
     
@@ -1363,13 +1472,19 @@ for epoch in range(epochs):
         src_ids, dst_ids = GNNDecoder.surface_code_edges
         graph_structure = (src_ids.to(device), dst_ids.to(device))
         
-        bench_results = benchmark_decode_one_batch(mghd_model, bench_syndromes, 
-                                                 backend='eager', graph_structure=graph_structure)
-        lat_p50 = bench_results['p50']
-        lat_p99 = bench_results['p99']
-        lat_backend = bench_results['backend']
-        
-        print(f"  Latency - p50: {lat_p50:.1f}μs, p99: {lat_p99:.1f}μs ({lat_backend})")
+        if benchmark_decode_one_batch is not None:
+            bench_results = benchmark_decode_one_batch(mghd_model, bench_syndromes, 
+                                                     backend='eager', graph_structure=graph_structure)
+            lat_p50 = bench_results['p50']
+            lat_p99 = bench_results['p99']
+            lat_backend = bench_results['backend']
+            
+            print(f"  Latency - p50: {lat_p50:.1f}μs, p99: {lat_p99:.1f}μs ({lat_backend})")
+        else:
+            print("  Benchmarking unavailable")
+            lat_p50 = float('nan')
+            lat_p99 = float('nan')
+            lat_backend = 'unavailable'
         
     except Exception as e:
         print(f"  Warning: Benchmarking failed: {e}")

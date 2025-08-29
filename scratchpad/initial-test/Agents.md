@@ -45,7 +45,7 @@ Training Flows
    - Dataset: Rotated d=3, CUDA‑Q Garnet foundation sampler with MWPF+MWPM labels.
    - Script: adapt `poc_gnn_train.py` to read syndromes/labels from the CUDA‑Q sampler (same data for both models). Plot LER_X, LER_Z, LER_total and fraction solved.
 
-2) Foundation Model (Step‑11 style)
+2) Foundation Model (formerly “Step‑11”)
    - Sampler: CUDA‑Q Garnet with ±10% parameter spread; MWPF primary, MWPM fallback; strict parity/coset validation.
    - Loss: BCEWithLogits (bit‑head), minimal label smoothing, grad clip=1.0.
    - Schedule: cosine with warmup; curriculum over p ∈ {0.02, 0.03, 0.05, 0.08}; 20–40 epochs; early stop/selection by coset‑validated val LER (N≥10k per‑p).
@@ -70,7 +70,7 @@ Latency Optimization (B=1)
 
 File Layout (selected)
 - `poc_my_models.py` — MGHD model (Mamba+GNN), rotated layout support, ONNX export.
-- `unified_mghd_optimizer.py` — Step‑11 training CLI (foundation path), now extended for S/M/L and auto‑evaluation.
+- `unified_mghd_optimizer.py` — Foundation training CLI (formerly Step‑11); use `--foundation-train` (alias `--step11-train`). Supports S/M/L and auto‑evaluation.
 - `tools/eval_ler.py` — Coset‑aware LER evaluator with CIs and latency.
 - `tools/collect_latency_benchmarks.py` — Latency collector for S/M/L and fastpath.
 - `tools/realtime_decode.py` — Persistent fastpath streaming service (demo).
@@ -95,7 +95,7 @@ Playbooks
    - Train baseline GNN and MGHD on the same data; plot LER curves; proceed only if MGHD ≥ baseline.
 
 2) Foundation training (selected profile)
-   - Run Step‑11 for S/M/L; pick best by val LER ± CI; verify B=1 latency meets target after CUDA Graph capture.
+   - Run foundation training (`--foundation-train`) for S/M/L; pick best by val LER ± CI; verify B=1 latency meets target after CUDA Graph capture.
 
 3) Student fine‑tune, distill, quantize
    - Fine‑tune on exact calibration; distill to smaller student if accuracy allows; quantize (PTQ/INT8) without compromising LER or latency; validate with `eval_ler.py` and latency collector.

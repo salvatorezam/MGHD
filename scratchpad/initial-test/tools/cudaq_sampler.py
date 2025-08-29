@@ -114,6 +114,12 @@ class CudaqGarnetSampler:
         self.Hx, self.Hz, self.meta = get_code_mats()
         self._cudaq_ready = False
         self._tried_import = False
+        # Teacher usage statistics (for logging/reporting)
+        self._stats = {
+            'mwpf_shots': 0,
+            'mwpm_shots': 0,
+            'total_shots': 0,
+        }
 
     def _ensure_cudaq(self) -> bool:
         if self._tried_import:
@@ -155,15 +161,27 @@ class CudaqGarnetSampler:
         s_bin = np.concatenate([sZ, sX], axis=1)  # [B,8], Z first then X
 
         # Teacher labels: MWPF primary via Stim DEM metadata; MWPM fallback.
+        teacher_used = 'mwpf'
         try:
             labels9 = self._labels_via_mwpf_stim(s_bin)
         except Exception as e:
             if not _HAS_PYMATCHING:
                 raise RuntimeError(f"MWPF teacher failed and PyMatching not available: {e}")
             labels9 = self._labels_via_mwpm(hx=Hx, hz=Hz, s_bin=s_bin)
+            teacher_used = 'mwpm'
         # For d=3 rotated we set labels_x and labels_z identical (bit‑flip corrections)
         labels_x = labels9.copy(); labels_z = labels9.copy()
+        # Update stats
+        self._stats['total_shots'] += int(B)
+        if teacher_used == 'mwpf':
+            self._stats['mwpf_shots'] += int(B)
+        else:
+            self._stats['mwpm_shots'] += int(B)
         return s_bin, labels_x, labels_z
+
+    def stats_snapshot(self) -> Dict:
+        """Return a shallow copy of accumulated teacher usage statistics."""
+        return dict(self._stats)
 
     # --- Teacher helpers ---
     def _build_stim_dem_rotated_d3(self, Hx: np.ndarray, Hz: np.ndarray) -> 'stim.DetectorErrorModel':

@@ -75,3 +75,29 @@ Environment: All commands are run within `conda activate mlqec-env`.
 
 - Fixed pack-mode evaluator crash (baseline GNN lacked MGHD graph buffers). Evaluator now builds rotated d=3 edges from Hx/Hz for baseline and uses MGHD buffers for MGHD. Parity-based evaluation on canonical pack is consistent with training.
 - Relaunching 30-epoch pack-mode baseline vs MGHD: results/baseline_vs_mghd_pack_e30.log. Will report best LERs and plots on completion.
+
+2025-08-29 01:20 UTC (Fix constant LER; AMP/GradScaler & diagnostics)
+
+- Patched poc_gnn_train.py to make AMP/GradScaler GPU-only and added a no-op scaler on CPU. Guarded autocast to enable only when `device.type == 'cuda'` and added a safe `unscale_` call. This prevents silent no-op optimizer steps that kept weights frozen and LER constant across epochs.
+- Added per-epoch parameter L2 diagnostics for both baseline GNN and MGHD to verify weights change (Δ||W||2 logs).
+- Mirrored the same AMP/autocast/scaler fixes in unified_mghd_optimizer.py for both the Optuna search path and the final training path, retaining the already-correct Step‑11 section.
+- Next: run a short 2–3 epoch sanity pass to confirm LER now varies epoch-to-epoch and deltas are non-zero; then resume longer runs.
+
+2025-08-29 01:26 UTC (Non-pack rotated alignment + sanity run)
+
+- Enforced rotated d=3 graph indices for MGHD in non-pack training while preserving a 4‑class head to match legacy CE targets; fixes node-count mismatch (17 vs 25) and CE class bound asserts.
+- Verified end-to-end training runs on H100 with 1 epoch (no cap): grad norms printed; per‑epoch evaluation executed; metrics + CSV/NPY artifacts saved under `Plots and Data/`.
+
+2025-08-29 01:35 UTC (Naming: Step‑11 -> Foundation Training)
+
+ - Renamed preferred training entry to “Foundation Training” for clarity. Added `--foundation-train` CLI to `unified_mghd_optimizer.py`; kept `--step11-train` as a deprecated alias. Console logs now print `[Foundation]` epoch lines.
+ - Updated `Agents.md` to reflect new naming and CLI; process unchanged (CUDA‑Q syndromes, MWPF primary, MWPM fallback, bf16 AMP, cosine warmup, best‑ckpt save, auto‑eval).
+
+2025-08-29 02:15 UTC (Paper-ready artifacts in foundation trainer)
+
+- Added run manifest and metrics capture to `unified_mghd_optimizer.py --foundation-train`:
+  - Writes `cmd.txt`, `args.json`, and `env.json` in the run outdir.
+  - Appends per‑epoch CSV metrics (`metrics.csv`): epoch, train_loss_mean, val_ler, samples_epoch, mwpf_shots_cum, mwpm_shots_cum.
+  - Saves `teacher_stats.json` summarizing MWPF/MWPM usage.
+- Updated `tools/cudaq_sampler.py` to accumulate teacher usage stats (mwpf_shots, mwpm_shots, total_shots) and expose `stats_snapshot()`.
+- These artifacts support plotting and paper figures without re-running training.
