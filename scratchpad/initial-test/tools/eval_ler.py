@@ -106,6 +106,66 @@ def decode_fastpath(synd_bytes: np.ndarray) -> np.ndarray:
     return decode_bytes(synd_bytes, lut16)
 
 
+def _infer_profile_from_args(ckpt: str) -> str:
+    from pathlib import Path as _Path
+    import json as _json
+    args_json = _Path(ckpt).parent / 'args.json'
+    if args_json.exists():
+        try:
+            with open(args_json) as f:
+                aj = _json.load(f)
+            return aj.get('profile', 'S')
+        except Exception:
+            return 'S'
+    return 'S'
+
+
+def _build_mghd_from_ckpt_meta(ckpt: str, device: str = 'cuda'):
+    import torch
+    from poc_my_models import MGHD
+    prof = _infer_profile_from_args(ckpt)
+    profiles = {
+        'S': dict(n_iters=7, n_node_features=128, n_edge_features=128, msg_net=96, d_model=192, d_state=32),
+        'M': dict(n_iters=8, n_node_features=192, n_edge_features=192, msg_net=128, d_model=256, d_state=48),
+        'L': dict(n_iters=9, n_node_features=256, n_edge_features=256, msg_net=160, d_model=320, d_state=64),
+    }
+    pf = profiles.get(prof, profiles['S'])
+    gnn_params = {
+        'dist': 3,
+        'n_node_inputs': 9,
+        'n_node_outputs': 9,
+        'n_iters': pf['n_iters'],
+        'n_node_features': pf['n_node_features'],
+        'n_edge_features': pf['n_edge_features'],
+        'msg_net_size': pf['msg_net'],
+        'msg_net_dropout_p': 0.0,
+        'gru_dropout_p': 0.0,
+    }
+    mamba_params = {
+        'd_model': pf['d_model'],
+        'd_state': pf['d_state'],
+        'd_conv': 2,
+        'expand': 3,
+        'attention_mechanism': 'none',
+    }
+    model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
+    try:
+        state = torch.load(ckpt, map_location=device)
+        model.load_state_dict(state, strict=False)
+    except Exception:
+        pass
+    try:
+        model.set_rotated_layout()
+    except Exception:
+        pass
+    try:
+        model._ensure_static_indices(device)
+    except Exception:
+        pass
+    model.eval()
+    return model
+
+
 def decode_mghd(s_bin: np.ndarray, ckpt: str, device: str = "cuda") -> np.ndarray:
     import torch
     from poc_my_models import MGHD
@@ -148,17 +208,7 @@ def decode_mghd(s_bin: np.ndarray, ckpt: str, device: str = "cuda") -> np.ndarra
         'expand': 3,
         'attention_mechanism': 'none',
     }
-    model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
-    try:
-        model.set_rotated_layout()
-    except Exception:
-        pass
-    state = torch.load(ckpt, map_location=device)
-    try:
-        model.load_state_dict(state, strict=False)
-    except Exception:
-        pass
-    model.eval()
+    model = _build_mghd_from_ckpt_meta(ckpt, device=device)
 
     # Batch decode via decode_one in a loop (keeps implementation simple)
     B = s_bin.shape[0]
@@ -175,10 +225,35 @@ def decode_mghd(s_bin: np.ndarray, ckpt: str, device: str = "cuda") -> np.ndarra
     return out
 
 
+def decode_mghd_forward(s_bin: np.ndarray, ckpt: str, device: str = 'cuda') -> np.ndarray:
+    import torch
+    model = _build_mghd_from_ckpt_meta(ckpt, device=device)
+    B = s_bin.shape[0]
+    out = np.zeros((B, 9), dtype=np.uint8)
+    bs = 1024
+    for off in range(0, B, bs):
+        sl = slice(off, min(off + bs, B))
+        chunk = s_bin[sl]
+        bsz = chunk.shape[0]
+        node_inputs = torch.zeros(bsz, 17, 9, device=device, dtype=torch.float32)
+        node_inputs[:, :8, 0] = torch.from_numpy(chunk.astype(np.float32)).to(device)
+        flat_inputs = node_inputs.view(-1, 9)
+        with torch.no_grad():
+            outs = model(flat_inputs, getattr(model, '_src_ids', None), getattr(model, '_dst_ids', None))
+            final = outs[-1].view(bsz, 17, -1)[:, 8:, :]
+            if final.shape[-1] == 2:
+                bitlogits = (final[..., 1] - final[..., 0])
+            else:
+                bitlogits = final.squeeze(-1)
+            bits = (bitlogits.sigmoid() > 0.5).to(torch.uint8)
+        out[sl] = bits.detach().cpu().numpy()
+    return out
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Coset-aware LER evaluator")
-    ap.add_argument('--decoder', required=True, choices=['mghd','mwpm','mwpf','relay','fastpath','garnet'])
+    ap.add_argument('--decoder', required=True, choices=['mghd','mghd_forward','mwpm','mwpf','relay','fastpath','garnet'])
     ap.add_argument('--checkpoint', type=str, default=None, help='Required for decoder=mghd')
     ap.add_argument('--metric', choices=['coset','coset_parity'], default='coset_parity')
     ap.add_argument('--N-per-p', type=int, default=10000)
@@ -205,7 +280,7 @@ def main():
     # Decoder params / flops (rough)
     params = {}
     approx_flops = None
-    if args.decoder == 'mghd' and args.checkpoint:
+    if args.decoder in ('mghd','mghd_forward') and args.checkpoint:
         try:
             import torch
             from poc_my_models import MGHD
@@ -245,6 +320,11 @@ def main():
                 print("--checkpoint required for decoder=mghd", file=sys.stderr)
                 sys.exit(2)
             y_pred = decode_mghd(s_bin, args.checkpoint, device=args.device)
+        elif args.decoder == 'mghd_forward':
+            if not args.checkpoint:
+                print("--checkpoint required for decoder=mghd_forward", file=sys.stderr)
+                sys.exit(2)
+            y_pred = decode_mghd_forward(s_bin, args.checkpoint, device=args.device)
         elif args.decoder == 'garnet':
             # For now treat Garnet as LUT baseline at d=3
             y_pred = decode_fastpath(synd_bytes)
