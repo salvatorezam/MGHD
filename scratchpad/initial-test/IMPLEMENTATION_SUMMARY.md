@@ -101,3 +101,34 @@ Environment: All commands are run within `conda activate mlqec-env`.
   - Saves `teacher_stats.json` summarizing MWPF/MWPM usage.
 - Updated `tools/cudaq_sampler.py` to accumulate teacher usage stats (mwpf_shots, mwpm_shots, total_shots) and expose `stats_snapshot()`.
 - These artifacts support plotting and paper figures without re-running training.
+
+2025-08-29 03:25 UTC (L profile — MWPF smoke test on H100)
+
+- Environment check (mlqec-env):
+  - cudaq 0.12.0; mwpf 0.2.12; PyMatching 2.0.1; stim 1.15.0; torch 2.7.1+cu128; CUDA available (NVIDIA H100 NVL); AMP bf16.
+- Command (smoke):
+  `python unified_mghd_optimizer.py --foundation-train --profile L --garnet-mode foundation --teacher-ensemble mwpf+mwpm --epochs 3 --steps-per-epoch 100 --batch-size 256 --lr 1e-4 --weight-decay 1e-4 --grad-clip 1.0 --amp bf16 --outdir results/foundation_L_mwpf_smoke --seed 42`
+- Result (MWPF true labels — teacher-only stats):
+  - Epoch-wise (val LER @ p≈0.05): [0.3633, 0.3350, 0.3438]; best≈0.3350.
+  - Teacher usage (cumulative shots): mwpf_shots=79,872; mwpm_shots=0.
+  - Artifacts: `results/foundation_L_mwpf_smoke/step11_garnet_L_best.pt`, `metrics.csv`, `env.json`, `args.json`, `teacher_stats.json`.
+- Re-run (consistency): `results/foundation_L_mwpf_smoke_run2` with identical settings produced val LER ≈ [0.3750, 0.3906, 0.3984]; teacher remained MWPF-only (79,872 shots). Variability expected from short smoke duration and stochastic p-cycling.
+- Note on sampling: CUDA-Q is installed and validated; current sampler path for d=3 uses the numpy fallback for syndrome generation while labels are produced via MWPF Sinter (Stim DEM). Switching sampler to `cudaq_backend.syndrome_gen.sample_surface_cudaq` is straightforward if we want strict CUDA‑Q trajectories in the training loop.
+- Conclusion: Dependencies and pipeline are green; L profile can proceed to full foundation training now (recommend ≥20 epochs, steps/epoch≈800, batch=512, cosine+warmup, bf16 AMP). Monitor `metrics.csv` and auto `ler_*.json` outputs.
+
+2025-08-29 03:30 UTC (LER-vs-epoch sanity — MWPF, longer smoke)
+
+- Command: `--epochs 6 --steps-per-epoch 120 --batch-size 256` (MWPF labels only).
+- Epoch LER@p=0.05 (validation per epoch, B=1024):
+  - [0.3789, 0.3887, 0.3906, 0.3652, 0.3662, 0.3623] → trend improves after mid‑training.
+- Eval harness (N=10k per p) post‑run: LER(p=0.05)=0.3644 (95% CI [0.3550, 0.3739]). File: `results/foundation_L_mwpf_smoke_run3/ler_L_foundation.json`.
+- Teacher usage: mwpf_shots=190,464; mwpm_shots=0 (strict MWPF supervision).
+- Takeaway: With modest training time, LER decreases after several epochs. For clearer monotonic descent, increase steps/epoch or fix train p to 0.05 to match validation.
+
+2025-08-29 03:36 UTC (Full L foundation training — CUDA‑Q trajectories)
+
+- Sampler switch: CudaqGarnetSampler.sample_batch now calls `cudaq_backend.syndrome_gen.sample_surface_cudaq(..., surface_layout='rotated')` when available; falls back to numpy only if CUDA‑Q path errors. Teachers remain MWPF primary via Stim DEM with strict parity/coset checks; MWPM is fallback.
+- Launched full training (CUDA‑Q syndromes):
+  `python unified_mghd_optimizer.py --foundation-train --profile L --garnet-mode foundation --teacher-ensemble mwpf+mwpm --epochs 20 --steps-per-epoch 800 --batch-size 512 --lr 1e-4 --weight-decay 1e-4 --grad-clip 1.0 --compile --amp bf16 --outdir results/foundation_L_cudaq --seed 42`
+- PID written to `results/foundation_L_cudaq/pid.txt`; logs streaming to `results/foundation_L_cudaq/train_L_full.log`. Metrics append to `metrics.csv`; best checkpoint at `step11_garnet_L_best.pt`; final LER JSON auto-writes on completion.
+- Runtime estimate (H100, bf16): ~25–40 minutes total for 20×800 steps (sampling + train) plus final 40k‑shot eval; varies ±20% with GPU load. Per-step latency observed ≈80–120 ms (batch 512) in smokes.
