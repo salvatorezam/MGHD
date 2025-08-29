@@ -187,13 +187,10 @@ class CudaqGarnetSampler:
     def _build_stim_dem_rotated_d3(self, Hx: np.ndarray, Hz: np.ndarray) -> 'stim.DetectorErrorModel':
         if not _HAS_STIM:
             raise RuntimeError("stim is required for MWPF Sinter path")
-        # Minimal DEM: 8 detectors, 9 observables proxy; weights are uniform for now.
+        # Minimal DEM: define relationships between 8 detectors and 9 logical observables
+        # by adding small-probability error mechanisms that toggle specific detectors
+        # and tag a corresponding observable L{j}. No explicit OBSERVABLE_INCLUDE lines required.
         dem = stim.DetectorErrorModel()
-        # Create 9 observables (one per data qubit) so that teacher can return a 9‑bit correction proxy
-        for _ in range(9):
-            dem.append("obs_include")
-        # For each data qubit j, attach error that flips appropriate detectors according to Hx/Hz columns.
-        # This is a simplified mapping to let MWPF see a meaningful DEM; real circuit mapping can refine weights/heralds.
         for j in range(9):
             dets = []
             # Z checks (first 4 detectors)
@@ -204,7 +201,12 @@ class CudaqGarnetSampler:
             for i in range(4):
                 if int(Hx[i, j]) & 1:
                     dets.append(4 + i)
-            dem.append("error", 0.001, [f"D{d}" for d in dets], [f"L{j}"])  # link to observable j
+            # Build DEM targets using Stim's typed targets
+            targets = [stim.target_relative_detector_id(int(d)) for d in dets]
+            targets.append(stim.target_logical_observable_id(int(j)))
+            # Append an error that flips the relevant detectors and links to logical observable j
+            # Using a tiny probability keeps weights uniform and avoids biasing the decoder.
+            dem.append("error", 1e-6, targets=targets)
         return dem
 
     def _labels_via_mwpf_stim(self, s_bin: np.ndarray) -> np.ndarray:
@@ -214,9 +216,8 @@ class CudaqGarnetSampler:
         from cudaq_backend.circuits import build_H_rotated_d3_from_cfg
         Hx, Hz, meta = build_H_rotated_d3_from_cfg({})
         dem = self._build_stim_dem_rotated_d3(Hx, Hz)
-        # Attach a minimal circuit (metadata only) and compile decoder for DEM
-        circuit = stim.Circuit()
-        sinter_dec = SinterMWPFDecoder().with_circuit(circuit)
+        # Compile decoder directly from DEM without attaching a circuit
+        sinter_dec = SinterMWPFDecoder()
         compiled = sinter_dec.compile_decoder_for_dem(dem=dem)
         # Pack detection events [B,8] -> [B,1] LSBF
         B = s_bin.shape[0]
