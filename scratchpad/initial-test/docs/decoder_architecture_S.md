@@ -1,77 +1,53 @@
-# MGHD Decoder (S Profile) — Architecture and Rationale
+# MGHD Decoder (S Profile) — Current Architecture and Results
 
-## Summary
-- Profile: S (promoted from Optuna Trial 12)
-- Objective: Beat MWPF at p=0.05 with minimal size and sub‑ms B=1 latency.
-- Best short‑run val LER (p=0.05): ~0.1758 (sweep); promotion run trending ~0.184–0.188 so far (EMA‑validated).
-
-## Model Topology
-- Hybrid: Mamba SSM over check‑node sequence → ChannelSE attention → Projection → GNN message passing on Tanner graph → Binary head per data qubit.
-- Rotated d=3 enforcement: 8 checks + 9 data nodes; static indices derived from Hx/Hz.
+## Topology (Rotated d=3)
+- Hybrid: Mamba SSM over check‑node sequence → ChannelSE attention → Projection → GNN message passing (Astra‑style) → Binary head (2 logits/qubit).
+- Rotated layout enforced: 8 checks + 9 data nodes (17 total); indices built from authoritative Hx/Hz (Z→X ordering) used by sampler/evaluator.
 
 ### Mamba Block
-- Layers: 1 (single Mamba block)
-- Widths: d_model=192, d_state=80, d_conv=2, expand=4
-- Attention: ChannelSE (Squeeze‑Excitation), reduction=8
-- Optional stabilization: post‑Mamba LayerNorm (off for the sweep; configurable in trainer)
+- Layers: 1 (single Mamba)
+- d_model=192, d_state=32, d_conv=2, expand=3
+- Attention: ChannelSE (reduction=4)
+- Optional: post‑Mamba LayerNorm (configurable)
 
-### GNN Block (Astra‑style `GNNDecoder`)
-- Message‑passing iters: n_iters=8
-- Node/edge widths: n_node_features=160, n_edge_features=256
-- Message MLP size: msg_net_size=80
-- Dropouts: msg=0.04135, gru=0.09564
+### GNN Block
+- Message‑passing iters: n_iters=7
+- Node/edge widths: n_node_features=128, n_edge_features=128
+- Message MLP size: msg_net_size=96
+- Dropout: msg≈0.04, gru≈0.11
 
 ### Interfaces
-- Input embedding: Linear(n_node_inputs=9 → d_model)
-- Projection: Linear(d_model → n_node_inputs=9)
-- Binary head: via logit difference across 2‑logit head on qubit nodes; BCEWithLogits for training
+- Input embedding: Linear(9 → d_model), projection: Linear(d_model → 9)
+- Binary head via logit difference; BCEWithLogits training
 
-## Parameter Count (S Trial‑12)
-- Total: 926,707 parameters
-- Breakdown:
-  - Mamba: 648,960
-  - GNN: 264,658
-  - ChannelSE: 9,432
-  - Projection: 1,737
-  - Other: 1,920
+## Size and Latency
+- Parameters: ~566,834 (from evaluator param count)
+- Latency (H100, B=1): eager ≈3.0 ms p50; TorchScript ≈2.3 ms; CUDA Graph ≈1.7 ms; batch‑256 ≈109 µs/shot (reference; re‑measure per checkpoint as needed)
+- Fastpath persistent LUT (rotated d=3): ≈50 µs single‑shot (separate decoder, LUT‑based)
 
-## Training/Eval Configuration
-- Data: CUDA‑Q Garnet, rotated d=3; MWPF primary labels, MWPM fallback; strict parity/coset checks.
-- p‑regime: Fixed p=0.05 for promotion; sweep used p=0.05 focus for selection.
-- Loss:
-  - Primary: BCEWithLogits (optionally with label smoothing: y' = (1−s)·y + 0.5·s)
-  - Auxiliary (optional): Parity‑aware loss via differentiable XOR expectation on Hx/Hz parities (computed FP32)
-- Stabilization: EMA (typ. 0.999) used for validation; optional post‑Mamba LN.
-- AMP: bf16; compile optionally enabled (promotion run uses compile; A/B disables to match sweep numerics)
-- Evaluation: forward‑path evaluator (`--decoder mghd_forward`) mirrors training path with channel attention.
+## Training/Eval (Circuit‑Level)
+- Data: CUDA‑Q trajectory sims (Garnet), MWPF primary teacher, parity guard; Hx/Hz aligned end‑to‑end.
+- Loss: BCEWithLogits (label smoothing ~0.09); optional parity aux (λ~0.03); EMA 0.999.
+- p‑grid support: explicit grids and curriculum presets; evaluator mirrors training forward path.
 
-## Why These Features
-- Mamba SSM: Efficient long‑range sequence modeling over check nodes with excellent throughput on GPU.
-- ChannelSE attention: Empirically best (channel >> cross >> none) for LER; strengthens salient channels post‑SSM.
-- GNN message passing: Encodes Tanner graph structure; complements SSM’s sequence modeling.
-- Rotated layout enforcement: Eliminates shape/ordering pitfalls; consistent packing and parity logic.
-- EMA: Stabilizes validation; typically improves test LER without runtime cost.
-- Parity loss: Aligns logits with parity constraints; reduces coset errors when tuned (λ small).
-- Label smoothing: Improves calibration; sweep winners favor ~0.09–0.14.
+## Recent LER (N=10k per‑p)
+- Acceptance grid (CUDA‑Q): p=0.02→0.1485; 0.03→0.2086; 0.05→0.3280; 0.08→0.4540
+- Low grid (CUDA‑Q): p=0.02→0.1302; 0.03→0.2071; 0.05→0.3171; 0.08→0.4621
+- Baselines: MWPF p=0.05→0.3139; MWPM p=0.05→0.3248
 
-## Relevant Files
-- Model: `poc_my_models.py` (MGHD, ChannelSE, FiLM, forward path, rotated layout helpers)
-- Trainer: `unified_mghd_optimizer.py` (foundation training; overrides for S; EMA, parity loss, smoothing, schedules)
-- Sampler: `tools/cudaq_sampler.py` (CUDA‑Q / LUT fallback, MWPF/MWPM teachers)
-- Eval: `tools/eval_ler.py` (coset‑aware LER; `mghd_forward` to mirror training; channel attention enforced)
-- Sweeps: `tools/sweep_s_optuna.py` (S‑profile Optuna; p=0.05 short runs; manual label smoothing)
-- Auto Eval: `tools/auto_post_eval.py` (post‑run forward eval watcher)
+## Curriculum (Recommended)
+- Grid: {0.001,0.002,0.003,0.004,0.005,0.006,0.008,0.010,0.012,0.015}
+- Sampling: 40% from [0.001,0.004], 45% from [0.004,0.008], 15% from [0.008,0.015]
+- Epoch phases: warm (bias 0.008–0.010), mid (0.005–0.007), final (0.003–0.006)
 
-## What We Tried (Chronology)
-- L foundation (30 epochs, curriculum): best forward LER(p=0.05) ≈ 0.207–0.211; underperformed MWPF (~0.1952)
-- XL (L+) curriculum: early per‑epoch best ~0.163 but didn’t hold at N=10k; auto forward eval queued
-- Parity loss + EMA + post‑Mamba LN integrated into trainer
-- Forward‑path evaluator added and attention parity enforced in eval
-- S Optuna sweep (p=0.05 focus): best Trial 12 ≈ 0.1758 (beats MWPF baseline); promoted to 20‑epoch run
-- A/B queue: constant LR + smoothing (A) vs +small parity (B) to reconcile sweep/promotion differences
+## Next Improvements
+- Add nullspace/coset regularizer (tiny weight) to prefer teacher’s representative while preserving parity.
+- p‑aware smoothing (lower at high‑p), keep parity λ small; consider post‑Mamba LN.
+- Optional micro‑tuning within size budget to improve p=0.05 without hurting latency.
 
-## Next Steps
-- Complete S promotion run; confirm with N=10k per‑p forward eval and latency
-- Select best of A/B and (if better) re‑promote with same post‑run suite
-- If needed, small capacity tweak (e.g., edges=384; msg=96) within latency budget; re‑validate
-- Lock S for deployment; proceed to distillation / QAT / engines as needed
+## Files
+- Model: `poc_my_models.py`
+- Trainer: `unified_mghd_optimizer.py`
+- CUDA‑Q: `cudaq_backend/` (noise scaling via phys_p/noise_scale)
+- Sampler: `tools/cudaq_sampler.py`
+- Eval: `tools/eval_ler.py`

@@ -679,6 +679,15 @@ def main():
     parser.add_argument('--teacher-ensemble', default='mwpf+mwpm')
     parser.add_argument('--teacher', choices=['mwpf','mwpm','lut','ensemble','mwpf+mwpm'], default='mwpm',
                         help='Teacher for labels during training/validation (default: mwpm for robust d=3)')
+    # Coset regularizer and p-aware smoothing
+    parser.add_argument('--coset-reg', type=float, default=0.01,
+                        help='Small weight for coset/teacher consistency (|sigmoid(logits)-y|)')
+    parser.add_argument('--smoothing-base', type=float, default=0.09,
+                        help='Base label smoothing (overrides --label-smoothing)')
+    parser.add_argument('--smoothing-highp-threshold', type=float, default=0.05,
+                        help='p threshold above which to reduce smoothing')
+    parser.add_argument('--smoothing-highp-factor', type=float, default=0.6,
+                        help='Multiply smoothing by this factor when p_train >= threshold')
     parser.add_argument('--steps-per-epoch', type=int, default=800)
     parser.add_argument('--batch-size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -698,6 +707,9 @@ def main():
                         help='Comma-separated training p grid (e.g., "0.002,0.003,0.005,0.008"). Overrides fixed --train-p and curriculum.')
     parser.add_argument('--train-p-weights', type=str, default=None,
                         help='Comma-separated weights aligned with --train-p-grid (e.g., "0.5,0.3,0.15,0.05"). Optional; uniform if omitted.')
+    # Curriculum preset for circuit-level p-schedule
+    parser.add_argument('--curriculum', choices=['none','circuit_v1'], default='none',
+                        help='Enable circuit-level p scheduling over epochs')
     # S-arch overrides and improvements
     parser.add_argument('--ov-n-iters', type=int, default=None)
     parser.add_argument('--ov-node-feats', type=int, default=None)
@@ -947,16 +959,38 @@ def run_foundation_train(args):
                 train_w = [1.0/len(train_grid)]*len(train_grid)
         except Exception:
             train_grid, train_w = None, None
+
+    # Circuit-level curriculum default grid and buckets
+    CIRCUIT_GRID = [0.001,0.002,0.003,0.004,0.005,0.006,0.008,0.010,0.012,0.015]
+    def _bucket_weight(p: float) -> float:
+        if 0.001 <= p <= 0.004: return 0.40/4.0  # spread uniformly within bucket
+        if 0.004 < p <= 0.008: return 0.45/4.0
+        if 0.008 < p <= 0.015: return 0.15/3.0
+        return 0.0
+    def _stage_boost(p: float, epoch: int, total_epochs: int) -> float:
+        # Stage windows: warm (epochs 1-2): 0.008–0.010; mid (next ~5): 0.005–0.007; final: 0.003–0.006
+        if epoch < 2:
+            return 3.0 if (0.008 <= p <= 0.010) else 1.0
+        elif epoch < 7:
+            return 2.0 if (0.005 <= p <= 0.007) else 1.0
+        else:
+            return 2.0 if (0.003 <= p <= 0.006) else 1.0
     for epoch in range(args.epochs):
         epoch_losses = []
         samples_epoch = 0
         nan_batches = 0
         for step in range(args.steps_per_epoch):
-            # Choose p with precedence: explicit grid > fixed --train-p > built-in curriculum
+            # Choose p with precedence: explicit grid > fixed --train-p > curriculum preset > built-in
             if train_grid is not None:
                 p_train = float(rng.choice(train_grid, p=train_w))
             elif getattr(args, 'train_p', None) is not None:
                 p_train = float(args.train_p)
+            elif getattr(args, 'curriculum', 'none') == 'circuit_v1':
+                weights = np.array([_bucket_weight(p) * _stage_boost(p, epoch, args.epochs) for p in CIRCUIT_GRID], dtype=np.float64)
+                if weights.sum() <= 0:
+                    weights = np.ones(len(CIRCUIT_GRID), dtype=np.float64)
+                weights /= weights.sum()
+                p_train = float(rng.choice(CIRCUIT_GRID, p=weights))
             else:
                 if epoch < 10:
                     ps, ws = [0.08, 0.05, 0.03, 0.02], [0.5, 0.3, 0.15, 0.05]
@@ -992,12 +1026,12 @@ def run_foundation_train(args):
                     bitlogits = final.squeeze(-1)
                 # Guard against NaNs/Infs before BCE
                 bitlogits = torch.nan_to_num(bitlogits, nan=0.0, posinf=30.0, neginf=-30.0)
-                # Optional label smoothing: y' = (1-s)*y + 0.5*s
-                if float(getattr(args, 'label_smoothing', 0.0)) > 0.0:
-                    s_ = float(getattr(args, 'label_smoothing', 0.0))
-                    y_eff = y * (1.0 - s_) + 0.5 * s_
-                else:
-                    y_eff = y
+                # p-aware label smoothing: y' = (1-s)*y + 0.5*s
+                s_base = float(getattr(args, 'smoothing_base', getattr(args, 'label_smoothing', 0.0)))
+                highp_thr = float(getattr(args, 'smoothing_highp_threshold', 0.05))
+                highp_fac = float(getattr(args, 'smoothing_highp_factor', 0.6))
+                s_eff = s_base * (highp_fac if p_train >= highp_thr else 1.0)
+                y_eff = y * (1.0 - s_eff) + 0.5 * s_eff
                 loss_main = torch.nn.functional.binary_cross_entropy_with_logits(bitlogits, y_eff, reduction='mean')
                 # Parity auxiliary loss (differentiable XOR expectation)
                 if float(getattr(args, 'parity_lambda', 0.0)) > 0.0:
@@ -1019,6 +1053,13 @@ def run_foundation_train(args):
                     loss = loss_main + float(getattr(args, 'parity_lambda', 0.0)) * loss_par
                 else:
                     loss = loss_main
+                # Coset/teacher consistency (small weight): encourage matching teacher representative
+                coset_w = float(getattr(args, 'coset_reg', 0.0))
+                if coset_w > 0.0:
+                    with torch.cuda.amp.autocast(enabled=False):
+                        pprob = bitlogits.sigmoid().float()
+                        l1 = torch.abs(pprob - y.float()).mean()
+                        loss = loss + coset_w * l1
 
             # Skip update on non-finite loss to avoid poisoning epoch mean
             if not torch.isfinite(loss):
