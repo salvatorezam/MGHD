@@ -81,6 +81,11 @@ class MGHD(nn.Module):
             # Until real priors are threaded in, keep a buffer as placeholder
             self.register_buffer('hardware_priors', torch.zeros(1, self.prior_dim))
         
+        # Optional stabilization: LayerNorm after Mamba (+attention)
+        self.post_mamba_ln = bool(mamba_params.get('post_mamba_ln', False))
+        if self.post_mamba_ln:
+            self.mamba_ln = nn.LayerNorm(C)
+        
         # --- Part 3: The Spatial Processor (GNN) ---
         self.gnn = GNNDecoder(**gnn_params)
         
@@ -105,6 +110,9 @@ class MGHD(nn.Module):
         self.register_buffer('_src_ids', None, persistent=False)
         self.register_buffer('_dst_ids', None, persistent=False)
         self.register_buffer('_edge_index', None, persistent=False)
+        # Optional authoritative Hx/Hz overrides (to ensure exact parity with external samplers)
+        self.register_buffer('_auth_Hx', None, persistent=False)
+        self.register_buffer('_auth_Hz', None, persistent=False)
     
     def set_rotated_layout(self):
         """Configure the model to use rotated surface code layout."""
@@ -124,36 +132,52 @@ class MGHD(nn.Module):
                 current_device = next(self.gnn.final_digits.parameters()).device
                 self.gnn.final_digits = nn.Linear(self.gnn.n_node_features, 2).to(current_device)
 
+    def set_authoritative_mats(self, Hx: np.ndarray, Hz: np.ndarray, device: str | torch.device = None):
+        """Optionally override code matrices used to build graph indices.
+        Ensures MGHD graph aligns exactly with external H matrices (e.g., from canonical pack/LUT).
+        """
+        dev = device if device is not None else next(self.parameters()).device
+        Hx_t = torch.from_numpy(np.asarray(Hx, dtype=np.uint8)).to(dev)
+        Hz_t = torch.from_numpy(np.asarray(Hz, dtype=np.uint8)).to(dev)
+        # Register/replace buffers
+        self.register_buffer('_auth_Hx', Hx_t, persistent=False)
+        self.register_buffer('_auth_Hz', Hz_t, persistent=False)
+        # Clear cached indices to rebuild with new matrices
+        self._check_node_indices = None
+        self._src_ids = None
+        self._dst_ids = None
+        self._edge_index = None
+
     def _build_authoritative_indices(self, device):
         """
         Build authoritative gather indices from actual code matrices.
         Creates proper bipartite graph structure from Hx/Hz matrices.
         """
         from panqec.codes import surface_2d
-        
+
         code_type = self.code_config['type']
         distance = self.code_config['distance']
         layout = self.code_config.get('layout', 'planar')
-        
+
         if code_type == 'surface':
-            # Create surface code using existing Astra code
-            if layout == 'rotated':
-                code = surface_2d.RotatedPlanar2DCode(distance)
+            # Prefer explicitly provided authoritative H matrices (from pack/LUT)
+            if (self._auth_Hx is not None) and (self._auth_Hz is not None):
+                Hx = self._auth_Hx.detach().to(device).to(torch.uint8).cpu().numpy()
+                Hz = self._auth_Hz.detach().to(device).to(torch.uint8).cpu().numpy()
             else:
-                code = surface_2d.Planar2DCode(distance)
+                # Build from panqec for generality
+                if layout == 'rotated':
+                    code = surface_2d.RotatedPlanar2DCode(distance)
+                else:
+                    code = surface_2d.Planar2DCode(distance)
+                # Extract stabilizer matrices
+                Hx = code.Hx.toarray()  # X stabilizers
+                Hz = code.Hz.toarray()  # Z stabilizers
             
-            # Get the stabilizer matrix (Hx and Hz combined)
-            # For surface codes, we need to construct the bipartite graph
-            # between check nodes (syndrome bits) and data qubits
-            
-            # Extract Hx and Hz matrices
-            Hx = code.Hx.toarray()  # X stabilizers
-            Hz = code.Hz.toarray()  # Z stabilizers
-            
-            # Number of check nodes (syndrome bits)
-            num_x_checks = Hx.shape[0]  # X stabilizers
-            num_z_checks = Hz.shape[0]  # Z stabilizers
-            num_check_nodes = num_x_checks + num_z_checks
+            # Canonical ordering for rotated layouts is Z checks first, then X checks
+            num_z_checks = Hz.shape[0]
+            num_x_checks = Hx.shape[0]
+            num_check_nodes = num_z_checks + num_x_checks
             
             # Number of data qubits
             num_data_qubits = Hx.shape[1]  # Should equal Hz.shape[1]
@@ -161,31 +185,29 @@ class MGHD(nn.Module):
             # Total nodes: check nodes + data qubits
             total_nodes = num_check_nodes + num_data_qubits
             
-            # Build edge indices from Hx and Hz matrices (directed, add reverse to match training)
+            # Build edge indices from Hz (Z) then Hx (X) matrices (directed),
+            # and add reverse edges to mirror message passing in training utilities
             src_ids = []
             dst_ids = []
             
-            # Add edges from Hx matrix (X stabilizers to data qubits)
-            for i in range(num_x_checks):
-                for j in range(num_data_qubits):
-                    if Hx[i, j] == 1:
-                        # Edge from check node i to data qubit j
-                        src_ids.append(i)
-                        dst_ids.append(num_check_nodes + j)
-            
-            # Add edges from Hz matrix (Z stabilizers to data qubits)
+            # Z stabilizers occupy check indices [0, num_z_checks)
             for i in range(num_z_checks):
                 for j in range(num_data_qubits):
                     if Hz[i, j] == 1:
-                        # Edge from check node (num_x_checks + i) to data qubit j
-                        src_ids.append(num_x_checks + i)
+                        src_ids.append(i)
+                        dst_ids.append(num_check_nodes + j)
+            # X stabilizers occupy check indices [num_z_checks, num_z_checks+num_x_checks)
+            for i in range(num_x_checks):
+                for j in range(num_data_qubits):
+                    if Hx[i, j] == 1:
+                        src_ids.append(num_z_checks + i)
                         dst_ids.append(num_check_nodes + j)
             
-            # Add reverse edges (data -> check) to mirror message passing in training utilities
-            src_ids_rev = [num_check_nodes + j for _i in range(num_x_checks) for j in range(num_data_qubits) if Hx[_i, j] == 1]
-            dst_ids_rev = [i for i in range(num_x_checks) for j in range(num_data_qubits) if Hx[i, j] == 1]
-            src_ids_rev += [num_check_nodes + j for _i in range(num_z_checks) for j in range(num_data_qubits) if Hz[_i, j] == 1]
-            dst_ids_rev += [num_x_checks + i for i in range(num_z_checks) for j in range(num_data_qubits) if Hz[i, j] == 1]
+            # Add reverse edges (data -> check)
+            src_ids_rev = [num_check_nodes + j for _i in range(num_z_checks) for j in range(num_data_qubits) if Hz[_i, j] == 1]
+            dst_ids_rev = [i for i in range(num_z_checks) for j in range(num_data_qubits) if Hz[i, j] == 1]
+            src_ids_rev += [num_check_nodes + j for _i in range(num_x_checks) for j in range(num_data_qubits) if Hx[_i, j] == 1]
+            dst_ids_rev += [num_z_checks + i for i in range(num_x_checks) for j in range(num_data_qubits) if Hx[i, j] == 1]
 
             src_ids_all = src_ids + src_ids_rev
             dst_ids_all = dst_ids + dst_ids_rev
@@ -227,30 +249,33 @@ class MGHD(nn.Module):
             Hx = code.hx.astype(int)
             Hz = code.hz.astype(int)
 
-            num_x_checks = Hx.shape[0]
+            # Canonical ordering: Z then X
             num_z_checks = Hz.shape[0]
-            num_check_nodes = num_x_checks + num_z_checks
+            num_x_checks = Hx.shape[0]
+            num_check_nodes = num_z_checks + num_x_checks
             num_data_qubits = Hx.shape[1]
             total_nodes = num_check_nodes + num_data_qubits
 
             src_ids = []
             dst_ids = []
-            for i in range(num_x_checks):
-                for j in range(num_data_qubits):
-                    if Hx[i, j] == 1:
-                        src_ids.append(i)
-                        dst_ids.append(num_check_nodes + j)
+            # Z checks first
             for i in range(num_z_checks):
                 for j in range(num_data_qubits):
                     if Hz[i, j] == 1:
-                        src_ids.append(num_x_checks + i)
+                        src_ids.append(i)
+                        dst_ids.append(num_check_nodes + j)
+            # X checks next
+            for i in range(num_x_checks):
+                for j in range(num_data_qubits):
+                    if Hx[i, j] == 1:
+                        src_ids.append(num_z_checks + i)
                         dst_ids.append(num_check_nodes + j)
 
             # Add reverse edges
-            src_ids_rev = [num_check_nodes + j for _i in range(num_x_checks) for j in range(num_data_qubits) if Hx[_i, j] == 1]
-            dst_ids_rev = [i for i in range(num_x_checks) for j in range(num_data_qubits) if Hx[i, j] == 1]
-            src_ids_rev += [num_check_nodes + j for _i in range(num_z_checks) for j in range(num_data_qubits) if Hz[_i, j] == 1]
-            dst_ids_rev += [num_x_checks + i for i in range(num_z_checks) for j in range(num_data_qubits) if Hz[i, j] == 1]
+            src_ids_rev = [num_check_nodes + j for _i in range(num_z_checks) for j in range(num_data_qubits) if Hz[_i, j] == 1]
+            dst_ids_rev = [i for i in range(num_z_checks) for j in range(num_data_qubits) if Hz[i, j] == 1]
+            src_ids_rev += [num_check_nodes + j for _i in range(num_x_checks) for j in range(num_data_qubits) if Hx[_i, j] == 1]
+            dst_ids_rev += [num_z_checks + i for i in range(num_x_checks) for j in range(num_data_qubits) if Hx[i, j] == 1]
 
             src_ids_all = src_ids + src_ids_rev
             dst_ids_all = dst_ids + dst_ids_rev
@@ -501,6 +526,8 @@ class MGHD(nn.Module):
                 priors = self.hardware_priors.expand(batch_size, -1)
             mamba_output_sequence = self.film(mamba_output_sequence, priors)
         # 'none' case: no additional processing
+        if self.post_mamba_ln:
+            mamba_output_sequence = self.mamba_ln(mamba_output_sequence)
         
         temporal_features = mamba_output_sequence.reshape(-1, self.mamba_params['d_model'])
 

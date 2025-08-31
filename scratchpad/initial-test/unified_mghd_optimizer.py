@@ -674,9 +674,11 @@ def main():
     # Back-compat: keep --step11-train as alias for --foundation-train
     parser.add_argument('--foundation-train', action='store_true', help='Run Garnet foundation training (formerly Step-11)')
     parser.add_argument('--step11-train', action='store_true', help='Alias for --foundation-train (deprecated)')
-    parser.add_argument('--profile', choices=['S','M','L'], default='S')
+    parser.add_argument('--profile', choices=['S','M','L','XL','Lplus'], default='S')
     parser.add_argument('--garnet-mode', choices=['foundation','student'], default='foundation')
     parser.add_argument('--teacher-ensemble', default='mwpf+mwpm')
+    parser.add_argument('--teacher', choices=['mwpf','mwpm','lut','ensemble','mwpf+mwpm'], default='mwpm',
+                        help='Teacher for labels during training/validation (default: mwpm for robust d=3)')
     parser.add_argument('--steps-per-epoch', type=int, default=800)
     parser.add_argument('--batch-size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -690,6 +692,29 @@ def main():
     parser.add_argument('--train-p', type=float, default=None, help='Fix training p (e.g., 0.05); default uses curriculum')
     parser.add_argument('--val-N', type=int, default=1024, help='Validation shots per epoch (default: 1024)')
     parser.add_argument('--init-ckpt', type=str, default=None, help='Optional checkpoint to initialize model weights')
+    parser.add_argument('--val-p', type=float, default=0.05, help='Validation physical error rate p (default: 0.05)')
+    # Custom training p-grid (overrides built-in curriculum when provided)
+    parser.add_argument('--train-p-grid', type=str, default=None,
+                        help='Comma-separated training p grid (e.g., "0.002,0.003,0.005,0.008"). Overrides fixed --train-p and curriculum.')
+    parser.add_argument('--train-p-weights', type=str, default=None,
+                        help='Comma-separated weights aligned with --train-p-grid (e.g., "0.5,0.3,0.15,0.05"). Optional; uniform if omitted.')
+    # S-arch overrides and improvements
+    parser.add_argument('--ov-n-iters', type=int, default=None)
+    parser.add_argument('--ov-node-feats', type=int, default=None)
+    parser.add_argument('--ov-edge-feats', type=int, default=None)
+    parser.add_argument('--ov-msg-size', type=int, default=None)
+    parser.add_argument('--ov-msg-drop', type=float, default=None)
+    parser.add_argument('--ov-gru-drop', type=float, default=None)
+    parser.add_argument('--ov-mamba-d-model', type=int, default=None)
+    parser.add_argument('--ov-mamba-d-state', type=int, default=None)
+    parser.add_argument('--ov-mamba-expand', type=int, default=None)
+    parser.add_argument('--post-mamba-ln', action='store_true')
+    parser.add_argument('--ema-decay', type=float, default=0.0)
+    parser.add_argument('--parity-lambda', type=float, default=0.0)
+    parser.add_argument('--label-smoothing', type=float, default=0.0)
+    parser.add_argument('--lr-schedule', choices=['cosine','constant'], default='cosine')
+    # S-arch overrides and improvements
+    
 
     args = parser.parse_args()
 
@@ -733,16 +758,22 @@ def run_foundation_train(args):
         torch.cuda.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # H matrices for validation/coset checks
+    # H matrices for validation/coset checks (authoritative)
     Hx, Hz, meta = get_code_mats()
     Hx_t = torch.from_numpy(Hx.astype(np.uint8))
     Hz_t = torch.from_numpy(Hz.astype(np.uint8))
+    # Masks for parity loss (shape [4,9])
+    _mask_x = (Hx_t.to(torch.float32) > 0)
+    _mask_z = (Hz_t.to(torch.float32) > 0)
 
     # Model profiles
     profiles = {
         'S': dict(n_iters=7, n_node_features=128, n_edge_features=128, msg_net=96, d_model=192, d_state=32),
         'M': dict(n_iters=8, n_node_features=192, n_edge_features=192, msg_net=128, d_model=256, d_state=48),
         'L': dict(n_iters=9, n_node_features=256, n_edge_features=256, msg_net=160, d_model=320, d_state=64),
+        # XL (L+) modest capacity bump: +1 iter, wider Mamba + head
+        'XL': dict(n_iters=10, n_node_features=256, n_edge_features=256, msg_net=192, d_model=384, d_state=64),
+        'Lplus': dict(n_iters=10, n_node_features=256, n_edge_features=256, msg_net=192, d_model=384, d_state=64),
     }
     pf = profiles[args.profile]
 
@@ -751,8 +782,28 @@ def run_foundation_train(args):
         n_iters=pf['n_iters'], n_node_features=pf['n_node_features'], n_edge_features=pf['n_edge_features'],
         msg_net_size=pf['msg_net'], msg_net_dropout_p=0.04, gru_dropout_p=0.11,
     )
+    # Apply overrides if provided (for S tuning)
+    if getattr(args, 'ov_n_iters', None) is not None:
+        gnn_params['n_iters'] = args.ov_n_iters
+    if getattr(args, 'ov_node_feats', None) is not None:
+        gnn_params['n_node_features'] = args.ov_node_feats
+    if getattr(args, 'ov_edge_feats', None) is not None:
+        gnn_params['n_edge_features'] = args.ov_edge_feats
+    if getattr(args, 'ov_msg_size', None) is not None:
+        gnn_params['msg_net_size'] = args.ov_msg_size
     mamba_params = dict(d_model=pf['d_model'], d_state=pf['d_state'], d_conv=2, expand=3,
-                        attention_mechanism='channel_attention', se_reduction=4)
+                        attention_mechanism='channel_attention', se_reduction=4,
+                        post_mamba_ln=bool(getattr(args, 'post_mamba_ln', False)))
+    if getattr(args, 'ov_msg_drop', None) is not None:
+        gnn_params['msg_net_dropout_p'] = args.ov_msg_drop
+    if getattr(args, 'ov_gru_drop', None) is not None:
+        gnn_params['gru_dropout_p'] = args.ov_gru_drop
+    if getattr(args, 'ov_mamba_d_model', None) is not None:
+        mamba_params['d_model'] = args.ov_mamba_d_model
+    if getattr(args, 'ov_mamba_d_state', None) is not None:
+        mamba_params['d_state'] = args.ov_mamba_d_state
+    if getattr(args, 'ov_mamba_expand', None) is not None:
+        mamba_params['expand'] = args.ov_mamba_expand
     model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
     # Optional init from checkpoint for fine-tuning
     if getattr(args, 'init_ckpt', None):
@@ -765,6 +816,12 @@ def run_foundation_train(args):
     # Enforce rotated layout behavior (8 checks + 9 qubits; binary head)
     try:
         model.set_rotated_layout()
+        # Align MGHD graph indices with authoritative H matrices to ensure parity alignment with sampler/teacher
+        try:
+            import numpy as _np
+            model.set_authoritative_mats(Hx, Hz, device=device)
+        except Exception:
+            pass
     except Exception:
         pass
     model.train()
@@ -775,15 +832,19 @@ def run_foundation_train(args):
         pass
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    # Cosine with warmup
+    # LR schedule
     total_epochs = args.epochs
-    warmup = max(1, int(0.05 * total_epochs))
-    base_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
-    def lr_lambda(epoch):
-        if epoch < warmup:
-            return (epoch + 1) / float(max(1, warmup))
-        return 1.0
-    warmup_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    if getattr(args, 'lr_schedule', 'cosine') == 'cosine':
+        warmup = max(1, int(0.05 * total_epochs))
+        base_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
+        def lr_lambda(epoch):
+            if epoch < warmup:
+                return (epoch + 1) / float(max(1, warmup))
+            return 1.0
+        warmup_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        base_sched = None
+        warmup_sched = None
 
     # AMP settings
     use_amp = args.amp != 'off'
@@ -797,6 +858,10 @@ def run_foundation_train(args):
             pass
 
     sampler = CudaqGarnetSampler(args.garnet_mode)
+    # EMA setup
+    ema_decay = float(getattr(args, 'ema_decay', 0.0))
+    use_ema = ema_decay > 0.0
+    ema_state = {k: v.detach().clone() for k, v in model.state_dict().items() if v.dtype.is_floating_point} if use_ema else None
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -866,23 +931,41 @@ def run_foundation_train(args):
 
     # Curriculum p-schedule for training
     rng = np.random.default_rng(args.seed)
+    # Pre-parse training p-grid if provided
+    train_grid = None
+    train_w = None
+    if getattr(args, 'train_p_grid', None):
+        try:
+            train_grid = [float(x) for x in str(args.train_p_grid).split(',') if x]
+            if getattr(args, 'train_p_weights', None):
+                train_w = [float(x) for x in str(args.train_p_weights).split(',') if x]
+                s = sum(train_w)
+                if s > 0:
+                    train_w = [w/s for w in train_w]
+            # If weights missing or mismatched, fall back to uniform
+            if (not train_w) or (len(train_w) != len(train_grid)):
+                train_w = [1.0/len(train_grid)]*len(train_grid)
+        except Exception:
+            train_grid, train_w = None, None
     for epoch in range(args.epochs):
         epoch_losses = []
         samples_epoch = 0
+        nan_batches = 0
         for step in range(args.steps_per_epoch):
-            # Choose p with curriculum schedule across epochs (or fixed via --train-p)
-            if getattr(args, 'train_p', None) is not None:
+            # Choose p with precedence: explicit grid > fixed --train-p > built-in curriculum
+            if train_grid is not None:
+                p_train = float(rng.choice(train_grid, p=train_w))
+            elif getattr(args, 'train_p', None) is not None:
                 p_train = float(args.train_p)
-            elif epoch < 10:
-                ps, ws = [0.08, 0.05, 0.03, 0.02], [0.5, 0.3, 0.15, 0.05]
-                p_train = float(rng.choice(ps, p=ws))
-            elif epoch < 20:
-                ps, ws = [0.05, 0.03, 0.08, 0.02], [0.5, 0.3, 0.15, 0.05]
-                p_train = float(rng.choice(ps, p=ws))
             else:
-                ps, ws = [0.03, 0.02, 0.05, 0.08], [0.5, 0.3, 0.15, 0.05]
+                if epoch < 10:
+                    ps, ws = [0.08, 0.05, 0.03, 0.02], [0.5, 0.3, 0.15, 0.05]
+                elif epoch < 20:
+                    ps, ws = [0.05, 0.03, 0.08, 0.02], [0.5, 0.3, 0.15, 0.05]
+                else:
+                    ps, ws = [0.03, 0.02, 0.05, 0.08], [0.5, 0.3, 0.15, 0.05]
                 p_train = float(rng.choice(ps, p=ws))
-            s_bin, labels_x, labels_z = sampler.sample_batch(args.batch_size, p=p_train, rng=rng)
+            s_bin, labels_x, labels_z = sampler.sample_batch(args.batch_size, p=p_train, teacher=getattr(args,'teacher','mwpm'), rng=rng)
             samples_epoch += int(s_bin.shape[0])
             # Targets: use labels_x (d=3 symmetric)
             y = torch.from_numpy(labels_x.astype(np.float32)).to(device)
@@ -907,7 +990,41 @@ def run_foundation_train(args):
                 else:
                     # Fallback: assume single logit already
                     bitlogits = final.squeeze(-1)
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(bitlogits, y, reduction='mean')
+                # Guard against NaNs/Infs before BCE
+                bitlogits = torch.nan_to_num(bitlogits, nan=0.0, posinf=30.0, neginf=-30.0)
+                # Optional label smoothing: y' = (1-s)*y + 0.5*s
+                if float(getattr(args, 'label_smoothing', 0.0)) > 0.0:
+                    s_ = float(getattr(args, 'label_smoothing', 0.0))
+                    y_eff = y * (1.0 - s_) + 0.5 * s_
+                else:
+                    y_eff = y
+                loss_main = torch.nn.functional.binary_cross_entropy_with_logits(bitlogits, y_eff, reduction='mean')
+                # Parity auxiliary loss (differentiable XOR expectation)
+                if float(getattr(args, 'parity_lambda', 0.0)) > 0.0:
+                    p = bitlogits.sigmoid()
+                    q = 1.0 - 2.0 * p  # [B,9]
+                    q_exp = q.unsqueeze(1)  # [B,1,9]
+                    mz = _mask_z.to(q_exp.device).unsqueeze(0)
+                    mx = _mask_x.to(q_exp.device).unsqueeze(0)
+                    z_prod = torch.where(mz, q_exp, torch.ones_like(q_exp)).prod(dim=2)  # [B,4]
+                    x_prod = torch.where(mx, q_exp, torch.ones_like(q_exp)).prod(dim=2)  # [B,4]
+                    z_par = 0.5 * (1.0 - z_prod)
+                    x_par = 0.5 * (1.0 - x_prod)
+                    sZ_t = torch.from_numpy(s_bin[:, :4].astype(np.float32)).to(device)
+                    sX_t = torch.from_numpy(s_bin[:, 4:8].astype(np.float32)).to(device)
+                    # Compute BCE for parity outside autocast (FP32) to avoid unsafe autocast path
+                    with torch.cuda.amp.autocast(enabled=False):
+                        loss_par = torch.nn.functional.binary_cross_entropy(z_par.float(), sZ_t.float()) + \
+                                   torch.nn.functional.binary_cross_entropy(x_par.float(), sX_t.float())
+                    loss = loss_main + float(getattr(args, 'parity_lambda', 0.0)) * loss_par
+                else:
+                    loss = loss_main
+
+            # Skip update on non-finite loss to avoid poisoning epoch mean
+            if not torch.isfinite(loss):
+                nan_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             optimizer.zero_grad(set_to_none=True)
             if scaler.is_enabled():
@@ -917,24 +1034,49 @@ def run_foundation_train(args):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
+                if use_ema:
+                    for k, v in model.state_dict().items():
+                        if v.dtype.is_floating_point and k in ema_state:
+                            ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=(1.0 - ema_decay))
             else:
                 loss.backward()
                 if args.grad_clip and args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
-            epoch_losses.append(float(loss.detach().cpu().item()))
+                if use_ema:
+                    for k, v in model.state_dict().items():
+                        if v.dtype.is_floating_point and k in ema_state:
+                            ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=(1.0 - ema_decay))
+            try:
+                lv = float(loss.detach().cpu().item())
+                if not (lv == lv):  # NaN check
+                    nan_batches += 1
+                else:
+                    epoch_losses.append(lv)
+            except Exception:
+                nan_batches += 1
 
             if _stop_flag["stop"]:
                 break
 
-        # Warmup then base schedule
-        warmup_sched.step(epoch)
-        base_sched.step()
+        # Step LR schedules if enabled
+        if warmup_sched is not None:
+            warmup_sched.step(epoch)
+        if base_sched is not None:
+            base_sched.step()
 
         # Validation (small batch for parity/coset)
         with torch.no_grad():
             vN = int(getattr(args, 'val_N', 1024))
-            v_s, v_lx, v_lz = sampler.sample_batch(vN, p=0.05, rng=rng)
+            vP = float(getattr(args, 'val_p', 0.05))
+            v_s, v_lx, v_lz = sampler.sample_batch(vN, p=vP, teacher=getattr(args,'teacher','mwpm'), rng=rng)
+            # If EMA enabled, temporarily evaluate with EMA weights
+            _saved = {}
+            if use_ema:
+                for k, v in model.state_dict().items():
+                    if v.dtype.is_floating_point and k in ema_state:
+                        _saved[k] = v.detach().clone()
+                        v.data.copy_(ema_state[k])
             # Use model to predict
             B = v_s.shape[0]
             node_inputs = torch.zeros(B, 17, 9, device=device, dtype=torch.float32)
@@ -947,17 +1089,32 @@ def run_foundation_train(args):
                 bits = (final.squeeze(-1).sigmoid() > 0.5)
             y_pred = bits.to(torch.uint8).cpu().numpy()
             succ = _coset_success(Hz, Hx, v_s, y_pred, v_lx)
+            # Debug metrics: parity accuracy and teacher parity consistency
+            sZ = v_s[:, :Hz.shape[0]]; sX = v_s[:, Hz.shape[0]:Hz.shape[0]+Hx.shape[0]]
+            sZ_pred = (Hz @ y_pred.T) % 2; sX_pred = (Hx @ y_pred.T) % 2
+            parity_ok = ((sZ_pred.T == sZ) & (sX_pred.T == sX)).all(axis=1)
+            par_acc = float(parity_ok.mean())
+            sZ_lab = (Hz @ v_lx.T) % 2; sX_lab = (Hx @ v_lx.T) % 2
+            teach_par_ok = ((sZ_lab.T == sZ) & (sX_lab.T == sX)).all(axis=1)
+            teach_par_acc = float(teach_par_ok.mean())
             val_ler = 1.0 - float(succ.mean())
+            if use_ema and _saved:
+                for k, v in model.state_dict().items():
+                    if k in _saved:
+                        v.data.copy_(_saved[k])
 
-        history.append(dict(epoch=epoch+1, loss=float(np.mean(epoch_losses)), val_ler=val_ler))
-        print(f"[Foundation] epoch {epoch+1}/{args.epochs} loss={np.mean(epoch_losses):.4f} val_LER={val_ler:.4f}")
+        # Compute finite mean only
+        train_loss_mean = float(np.mean(epoch_losses)) if len(epoch_losses) > 0 else float('nan')
+        history.append(dict(epoch=epoch+1, loss=train_loss_mean, val_ler=val_ler, nan_batches=nan_batches))
+        nan_note = f" (nan_batches={nan_batches})" if nan_batches else ""
+        print(f"[Foundation] epoch {epoch+1}/{args.epochs} loss={train_loss_mean:.4f} val_LER={val_ler:.4f} par_acc={par_acc:.3f} teach_par={teach_par_acc:.3f}{nan_note}")
         # Append metrics row
         try:
             import csv as _csv
             st = sampler.stats_snapshot()
             with open(outdir / 'metrics.csv', 'a', newline='') as f:
                 w = _csv.writer(f)
-                w.writerow([epoch+1, f"{np.mean(epoch_losses):.6f}", f"{val_ler:.6f}", samples_epoch, st.get('mwpf_shots',0), st.get('mwpm_shots',0)])
+                w.writerow([epoch+1, f"{train_loss_mean:.6f}", f"{val_ler:.6f}", samples_epoch, st.get('mwpf_shots',0), st.get('mwpm_shots',0)])
                 try:
                     f.flush(); _os.fsync(f.fileno())
                 except Exception:

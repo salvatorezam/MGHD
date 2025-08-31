@@ -123,6 +123,7 @@ def _infer_profile_from_args(ckpt: str) -> str:
 def _build_mghd_from_ckpt_meta(ckpt: str, device: str = 'cuda'):
     import torch
     from poc_my_models import MGHD
+    from tools.cudaq_sampler import get_code_mats as _get_code_mats
     prof = _infer_profile_from_args(ckpt)
     profiles = {
         'S': dict(n_iters=7, n_node_features=128, n_edge_features=128, msg_net=96, d_model=192, d_state=32),
@@ -146,7 +147,9 @@ def _build_mghd_from_ckpt_meta(ckpt: str, device: str = 'cuda'):
         'd_state': pf['d_state'],
         'd_conv': 2,
         'expand': 3,
-        'attention_mechanism': 'none',
+        # Ensure evaluation mirrors training: keep channel attention active
+        'attention_mechanism': 'channel_attention',
+        'se_reduction': 4,
     }
     model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
     try:
@@ -156,6 +159,12 @@ def _build_mghd_from_ckpt_meta(ckpt: str, device: str = 'cuda'):
         pass
     try:
         model.set_rotated_layout()
+        # Ensure graph indices align with the same H matrices used by sampler/evaluator
+        try:
+            Hx, Hz, _ = _get_code_mats()
+            model.set_authoritative_mats(Hx, Hz, device=device)
+        except Exception:
+            pass
     except Exception:
         pass
     try:
@@ -261,6 +270,8 @@ def main():
     ap.add_argument('--out', type=str, required=True)
     ap.add_argument('--device', type=str, default='cuda')
     ap.add_argument('--ci', type=float, default=0.95)
+    ap.add_argument('--teacher', type=str, choices=['mwpf','mwpm','lut','ensemble','mwpf+mwpm'], default='lut',
+                   help='Teacher used to generate reference labels for evaluation (default: lut for d=3)')
     args = ap.parse_args()
 
     if args.N_per_p < 10000:
@@ -304,7 +315,7 @@ def main():
 
     for p in p_vals:
         # Sample syndromes + teacher labels
-        s_bin, labels_x, labels_z = sampler.sample_batch(args.N_per_p, p, teacher='mwpf')
+        s_bin, labels_x, labels_z = sampler.sample_batch(args.N_per_p, p, teacher=args.teacher)
         synd_bytes = _pack_bits_rows(s_bin)[:, 0]
 
         # Decode and time

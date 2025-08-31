@@ -206,7 +206,7 @@ class GarnetNoiseModel:
     suitable for circuit-level Monte-Carlo simulation.
     """
     
-    def __init__(self, params: Dict[str, Union[Dict, float]]):
+    def __init__(self, params: Dict[str, Union[Dict, float]], scale: float = 1.0):
         """
         Initialize noise model from device parameters.
         
@@ -215,6 +215,10 @@ class GarnetNoiseModel:
                    Keys: 'F1Q', 'F2Q', 'T1_us', 'T2_us', 'eps0', 'eps1', 't_prx_ns', 't_cz_ns'
         """
         self.params = params
+        # Global noise scale to emulate different physical error regimes.
+        # Applied via complementary transform: p' = 1 - (1 - p) ** scale
+        # scale=1.0 leaves p unchanged; scale>1 increases; scale<1 decreases.
+        self.scale = max(0.0, float(scale))
         
         # Extract timing parameters
         self.t_prx_ns = params['t_prx_ns']
@@ -270,7 +274,8 @@ class GarnetNoiseModel:
             Depolarizing probability for PRX gate
         """
         F_1q = self.F1Q.get(q, FOUNDATION_DEFAULTS["F1Q_median"])
-        return self.p_depol_from_F(F_1q, d=2)
+        base = self.p_depol_from_F(F_1q, d=2)
+        return 1.0 - (1.0 - base) ** self.scale
     
     def depol_2q_p(self, edge: Tuple[int, int]) -> float:
         """
@@ -291,7 +296,8 @@ class GarnetNoiseModel:
             # Fallback to median if edge not in calibration
             F_2q = FOUNDATION_DEFAULTS["F2Q_median"]
         
-        return self.p_depol_from_F(F_2q, d=4)
+        base = self.p_depol_from_F(F_2q, d=4)
+        return 1.0 - (1.0 - base) ** self.scale
     
     def idle_params(self, q: int, dt_ns: float) -> Tuple[float, float]:
         """
@@ -325,7 +331,9 @@ class GarnetNoiseModel:
         p_dephase = 1.0 - np.exp(-dt_ns / Tphi_ns)
         
         # Clamp to [0,1]
-        return np.clip(p_amp, 0.0, 1.0), np.clip(p_dephase, 0.0, 1.0)
+        p_amp_s = 1.0 - (1.0 - p_amp) ** self.scale
+        p_dep_s = 1.0 - (1.0 - p_dephase) ** self.scale
+        return np.clip(p_amp_s, 0.0, 1.0), np.clip(p_dep_s, 0.0, 1.0)
     
     def meas_asym_errors(self, q: int) -> Tuple[float, float]:
         """
@@ -339,4 +347,7 @@ class GarnetNoiseModel:
         """
         eps0 = self.eps0.get(q, FOUNDATION_DEFAULTS["eps0_median"])
         eps1 = self.eps1.get(q, FOUNDATION_DEFAULTS["eps1_median"])
-        return eps0, eps1
+        # Scale asymmetrically but monotonically with same transform
+        e0s = 1.0 - (1.0 - eps0) ** self.scale
+        e1s = 1.0 - (1.0 - eps1) ** self.scale
+        return e0s, e1s

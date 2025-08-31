@@ -114,6 +114,9 @@ class CudaqGarnetSampler:
         self.Hx, self.Hz, self.meta = get_code_mats()
         self._cudaq_ready = False
         self._tried_import = False
+        # One-time p-guard: verifies CUDA-Q honors p; falls back to numpy if not
+        self._p_guard_done = False
+        self._p_guard_result = None
         # Teacher usage statistics (for logging/reporting)
         self._stats = {
             'mwpf_shots': 0,
@@ -167,7 +170,7 @@ class CudaqGarnetSampler:
             try:
                 from cudaq_backend import sample_surface_cudaq  # type: ignore
                 # Two rounds are sufficient to assemble one Z and one X stabilizer round
-                syn = sample_surface_cudaq(
+                base_kwargs = dict(
                     mode=self.mode,
                     batch_size=B,
                     T=2,
@@ -176,6 +179,20 @@ class CudaqGarnetSampler:
                     bitpack=False,
                     surface_layout="rotated",
                 )
+                syn = None
+                # Try to pass physical error rate; attempt several common kw names
+                for k in ("p", "p_phys", "p_error", "phys_p", "p_physical"):
+                    try:
+                        kw = dict(base_kwargs)
+                        kw[k] = float(p)
+                        syn = sample_surface_cudaq(**kw)
+                        break
+                    except TypeError:
+                        syn = None
+                        continue
+                if syn is None:
+                    # Fall back without explicit p (backend may use its own schedule)
+                    syn = sample_surface_cudaq(**base_kwargs)
                 # syn: [B,8] LSBF, Z-first then X
                 s_bin = syn.astype(np.uint8, copy=False)
                 if s_bin.shape != (B, 8):
@@ -187,6 +204,41 @@ class CudaqGarnetSampler:
                 # Update stats backend tag
                 self._stats['sampler_backend'] = 'cudaq_rotated_d3'
                 self._stats['cudaq_calls'] += 1
+
+                # One-time p-honor guard (optional; can disable via MGHD_P_GUARD=0)
+                if (not self._p_guard_done) and os.getenv('MGHD_P_GUARD', '1') == '1':
+                    try:
+                        # Probe two distinct p values and compare syndrome bit means
+                        p_small = 0.005 if p >= 0.01 else max(1e-4, p)
+                        p_large = 0.05 if p <= 0.02 else min(0.2, p)
+                        for_probe = 2048
+                        def _probe(pp: float):
+                            syn2 = None
+                            for k2 in ("p", "p_phys", "p_error", "phys_p", "p_physical"):
+                                try:
+                                    kw2 = dict(base_kwargs); kw2['batch_size'] = for_probe; kw2[k2] = float(pp)
+                                    syn2 = sample_surface_cudaq(**kw2); break
+                                except TypeError:
+                                    syn2 = None; continue
+                            if syn2 is None:
+                                syn2 = sample_surface_cudaq(**{**base_kwargs, 'batch_size': for_probe})
+                            sb = syn2.astype(np.uint8, copy=False)
+                            if sb.ndim == 2 and sb.shape[1] == 1:
+                                sb = _unpack_byte_lsbf(sb[:, 0])
+                            return sb.mean(axis=0)
+                        m_small = _probe(p_small)
+                        m_large = _probe(p_large)
+                        delta = float(abs(m_large.mean() - m_small.mean()))
+                        self._p_guard_result = dict(p_small=p_small, p_large=p_large, delta=delta)
+                        # If the difference in mean syndrome rate is tiny, assume p not honored; fall back to numpy
+                        if delta < 0.01:
+                            # Log warning only; do not auto-fallback. CUDA‑Q must be used.
+                            print(f"[sampler] WARNING: CUDA-Q sampler appears insensitive to p (Δmean≈{delta:.4f}); please verify backend p plumbing.")
+                    except Exception:
+                        # Non-fatal: continue without guard
+                        pass
+                    finally:
+                        self._p_guard_done = True
             except Exception as e:
                 # Soft fallback to numpy if CUDA-Q path fails
                 e_msg = str(e)
@@ -206,23 +258,49 @@ class CudaqGarnetSampler:
             self._stats['sampler_backend'] = 'numpy_fallback'
             self._stats['numpy_calls'] += 1
 
-        # Teacher labels: MWPF primary via Stim DEM metadata; MWPM fallback.
-        teacher_used = 'mwpf'
-        try:
-            labels9 = self._labels_via_mwpf_stim(s_bin)
-        except Exception as e:
-            if not _HAS_PYMATCHING:
-                raise RuntimeError(f"MWPF teacher failed and PyMatching not available: {e}")
+        # Teacher labels according to request (mwpf|mwpm|lut|ensemble)
+        teacher = (teacher or 'mwpf').lower()
+        teacher_used = teacher
+        labels9: np.ndarray
+        if teacher == 'lut':
+            labels9 = _teacher_labels_from_lut(_pack_bits_lsbf(s_bin))
+            teacher_used = 'lut'
+        elif teacher == 'mwpm':
             labels9 = self._labels_via_mwpm(hx=Hx, hz=Hz, s_bin=s_bin)
             teacher_used = 'mwpm'
+        elif teacher in ('mwpf', 'ensemble', 'mwpf+mwpm'):
+            # Try MWPF; validate parity consistency; fall back to MWPM on any mismatch
+            try:
+                labels9 = self._labels_via_mwpf_stim(s_bin)
+                teacher_used = 'mwpf'
+                # Parity validation against provided Hx/Hz and s_bin
+                sZ_hat = (Hz @ labels9.T) % 2
+                sX_hat = (Hx @ labels9.T) % 2
+                sZ = s_bin[:, :Hz.shape[0]].T
+                sX = s_bin[:, Hz.shape[0]:Hz.shape[0]+Hx.shape[0]].T
+                mism = int((sZ_hat != sZ).sum() + (sX_hat != sX).sum())
+                if mism != 0:
+                    # Fallback to MWPM to preserve correctness
+                    if not _HAS_PYMATCHING:
+                        raise RuntimeError("MWPF produced parity-mismatched labels and PyMatching unavailable for fallback")
+                    labels9 = self._labels_via_mwpm(hx=Hx, hz=Hz, s_bin=s_bin)
+                    teacher_used = 'mwpm'
+            except Exception as e:
+                if not _HAS_PYMATCHING:
+                    raise RuntimeError(f"MWPF teacher failed and PyMatching not available: {e}")
+                labels9 = self._labels_via_mwpm(hx=Hx, hz=Hz, s_bin=s_bin)
+                teacher_used = 'mwpm'
+        else:
+            raise ValueError(f"Unknown teacher: {teacher}")
         # For d=3 rotated we set labels_x and labels_z identical (bit‑flip corrections)
         labels_x = labels9.copy(); labels_z = labels9.copy()
         # Update stats
         self._stats['total_shots'] += int(B)
         if teacher_used == 'mwpf':
             self._stats['mwpf_shots'] += int(B)
-        else:
+        elif teacher_used == 'mwpm':
             self._stats['mwpm_shots'] += int(B)
+        # lut and other teachers don't increment mwpf/mwpm counters
         return s_bin, labels_x, labels_z
 
     def stats_snapshot(self) -> Dict:

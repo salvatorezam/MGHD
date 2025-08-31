@@ -447,7 +447,8 @@ def pack_syndrome_and_errors(syndrome: np.ndarray, x_errors: np.ndarray, z_error
 
 def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, Any],
                         rng: np.random.Generator, bitpack: bool = False,
-                        surface_layout: str = "planar") -> np.ndarray:
+                        surface_layout: str = "planar",
+                        phys_p: float = None, noise_scale: float = None) -> np.ndarray:
     """
     Sample surface code syndromes using CUDA-Q with circuit-level noise.
     
@@ -472,7 +473,23 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, A
     else:
         raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
     
-    noise_model = GarnetNoiseModel(params)
+    # Determine noise scaling from requested phys_p or explicit noise_scale
+    scale = 1.0
+    if noise_scale is not None:
+        try:
+            scale = float(noise_scale)
+        except Exception:
+            scale = 1.0
+    elif phys_p is not None:
+        # Map requested physical error rate to a global noise scaling.
+        # Use a heuristic baseline p_ref for d=3, e.g., 0.03 (mid acceptance grid).
+        p_ref = 0.03
+        try:
+            scale = max(0.1, min(5.0, float(phys_p) / p_ref))
+        except Exception:
+            scale = 1.0
+
+    noise_model = GarnetNoiseModel(params, scale=scale)
     simulator = CudaQSimulator(noise_model, batch_size, rng)
 
     # Optional rotated layout override for d=3
