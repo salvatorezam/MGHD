@@ -30,7 +30,8 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 
 ### Install other dependencies
-pip install numpy matplotlib panqec ldpc
+pip install -U ldpc numpy scipy torch
+pip install matplotlib panqec
 
 
 

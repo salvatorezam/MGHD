@@ -1,0 +1,31 @@
+mghd:
+  ckpt: "/u/home/kulp/MGHD/scratchpad/initial-test/results/foundation_S_core_cq_circuit_v1_20250831_093641/step11_garnet_S_best.pt"
+  model_import: "poc_my_models:MGHD"
+  forward_kind: "logits"
+  feature_builder_surface: "mghd_clustered.features:build_features_surface"
+  feature_builder_bb: "mghd_clustered.features:build_features_bb"
+  init_kwargs:
+    gnn_params:
+      dist: 3
+      n_node_inputs: 9
+      n_node_outputs: 9
+      n_iters: 7
+      n_node_features: 128
+      n_edge_features: 128
+      msg_net_size: 96
+      msg_net_dropout_p: 0.04
+      gru_dropout_p: 0.11
+    mamba_params:
+      d_model: 192
+      d_state: 32
+      d_conv: 2
+      expand: 3
+      attention_mechanism: "channel_attention"
+      se_reduction: 4
+      post_mamba_ln: false
+bench:
+  shots: 10000
+  p_surface: 0.002
+  p_bb: 0.001
+  bits_per_step_clustered: 16
+  seed: 42
