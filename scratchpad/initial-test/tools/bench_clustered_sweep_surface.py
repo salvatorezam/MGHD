@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -177,6 +178,16 @@ def main():
     ap.add_argument("--out-json", type=str, default=None,
                     help="Output results to JSON file")
     
+    # LER sanity injection for validation
+    ap.add_argument("--inject-ler", "--inject-logical-rate", action="store_true",
+                    help="Inject logical errors at specified rate for sanity testing")
+    ap.add_argument("--inject-ler-rate", type=float, default=0.1,
+                    help="Rate of logical error injection when --inject-ler is enabled")
+    
+    # CI enforcement
+    ap.add_argument("--enforce-mghd", action="store_true",
+                    help="Fail if MGHD was never invoked in mixed/mixed_tight modes")
+    
     args = ap.parse_args()
     
     # Process tier-0 mode presets
@@ -317,41 +328,41 @@ def main():
                         warmup_info = {'warmup_us': 0.0, 'graph_used': False, 'path': 'failed'}
                 
                 # Configure tier-0 limits based on mode and distance
-                if args.tier0_mode == "aggressive":
-                    # Use aggressive limits for all distances
-                    tier0_k_max = 15
-                    tier0_r_max = 20
-                elif args.tier0_mode == "mixed":
-                    # Use conservative limits - forces more MGHD usage
-                    tier0_k_max = 5
-                    tier0_r_max = 6
-                elif args.tier0_mode == "mixed_tight":
-                    # Very tight limits - forces MGHD on modest clusters at d=3
-                    if d == 3:
-                        tier0_k_max = 1
-                        tier0_r_max = 0
-                    else:
-                        # For d>3, use aggressive since MGHD only works for d=3
+                # Start with mode defaults or CLI args
+                tier0_k_max = args.tier0_k_max
+                tier0_r_max = args.tier0_r_max
+                
+                # Only override with mode presets if using defaults and no explicit CLI override
+                cli_k_explicit = "--tier0-k-max" in ' '.join(sys.argv)
+                cli_r_explicit = "--tier0-r-max" in ' '.join(sys.argv)
+                
+                if not cli_k_explicit and not cli_r_explicit:
+                    # Use mode presets when no explicit CLI overrides
+                    if args.tier0_mode == "aggressive":
                         tier0_k_max = 15
                         tier0_r_max = 20
-                elif args.tier0_mode == "off":
-                    # Tier-0 disabled, all clusters go to MGHD
-                    if d == 3:
-                        tier0_k_max = 0
-                        tier0_r_max = 0
-                    else:
-                        # For d>3, use aggressive since MGHD doesn't work
-                        tier0_k_max = 15
-                        tier0_r_max = 20
-                else:
-                    # Default behavior: use CLI args for d=3, scale for larger distances
-                    if d == 3:
-                        tier0_k_max = args.tier0_k_max
-                        tier0_r_max = args.tier0_r_max
-                    else:
-                        # For larger distances, increase tier-0 limits since MGHD only trained for d=3
-                        tier0_k_max = min(15, d * 3)  # Scale with distance but cap at 15
-                        tier0_r_max = min(20, d * 4)  # Scale with distance but cap at 20
+                    elif args.tier0_mode == "mixed":
+                        tier0_k_max = 5
+                        tier0_r_max = 6
+                    elif args.tier0_mode == "mixed_tight":
+                        if d == 3:
+                            tier0_k_max = 1
+                            tier0_r_max = 0
+                        else:
+                            tier0_k_max = 15
+                            tier0_r_max = 20
+                    elif args.tier0_mode == "off":
+                        if d == 3:
+                            tier0_k_max = 0
+                            tier0_r_max = 0
+                        else:
+                            tier0_k_max = 15
+                            tier0_r_max = 20
+                    elif args.tier0_mode is None:
+                        # Default behavior for no mode: scale for larger distances
+                        if d != 3:
+                            tier0_k_max = min(15, d * 3)
+                            tier0_r_max = min(20, d * 4)
                 
                 # Configure p_channel
                 if args.p_channel == "auto":
@@ -408,7 +419,18 @@ def main():
 
                     out = dec.decode(s)
                     e_hat = out["e_hat"]
-                    failures += int(not np.array_equal((H @ e_hat) % 2, s))
+                    
+                    # Apply LER injection for sanity testing if enabled
+                    if args.inject_ler:
+                        # Inject logical errors at specified rate
+                        if rng.random() < args.inject_ler_rate:
+                            # Flip the logical result
+                            is_correct = np.array_equal((H @ e_hat) % 2, s)
+                            failures += int(is_correct)  # Count as failure if it was correct
+                        else:
+                            failures += int(not np.array_equal((H @ e_hat) % 2, s))
+                    else:
+                        failures += int(not np.array_equal((H @ e_hat) % 2, s))
 
                     # Timing in microseconds
                     lat_total.append(out["t_total_us"])
@@ -569,6 +591,26 @@ def main():
         with open(args.out_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         print(f"WROTE {args.out_json}")
+    
+    # CI guard: require MGHD to be exercised when Tier-0 is not 'off' or 'aggressive'
+    if args.enforce_mghd and args.tier0_mode in ("mixed", "mixed_tight"):
+        # Check aggregate MGHD usage across all sides and conditions
+        total_mghd_invoked = 0
+        max_tier0_frac = 0.0
+        
+        for d_key, d_data in payload.items():
+            if not isinstance(d_data, dict):
+                continue
+            for p_key, p_data in d_data.items():
+                if not isinstance(p_data, dict):
+                    continue
+                for side_key, side_data in p_data.items():
+                    if side_key in ("X", "Z") and isinstance(side_data, dict):
+                        total_mghd_invoked += side_data.get("mghd_invoked_shots", 0)
+                        max_tier0_frac = max(max_tier0_frac, side_data.get("tier0_frac", 1.0))
+        
+        if total_mghd_invoked <= 0 or max_tier0_frac >= 0.99:
+            raise SystemExit("MGHD was not exercised under mixed gating — adjust k_max/r_max or investigate.")
     
     return payload
 

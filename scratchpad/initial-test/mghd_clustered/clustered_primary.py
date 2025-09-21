@@ -35,8 +35,9 @@ class MGHDPrimaryClustered:
         r_cap: int = 20,
         batched: bool = True,
         tier0_enable: bool = True,
-        tier0_k_max: int = TIER0_K_MAX,
-        tier0_r_max: int = TIER0_R_MAX,
+        tier0_k_max: int | None = None,
+        tier0_r_max: int | None = None,
+        tier0_mode: str = "mixed",
         p_channel: float | None = None,
         default_p: float | None = None,
     ):
@@ -49,8 +50,24 @@ class MGHDPrimaryClustered:
         self.mb_mode = "batched" if batched else "unbatched"
         self.side = self._infer_side()
         self.tier0_enable = bool(tier0_enable)
-        self.tier0_k_max = int(tier0_k_max)
-        self.tier0_r_max = int(tier0_r_max)
+        
+        # Production gating (balanced): force some MGHD without huge latency.
+        # Defaults apply when user did not set explicit caps.
+        if tier0_k_max is None and tier0_r_max is None:
+            if tier0_mode in ("mixed", "mixed_tight", "aggressive"):
+                # PROD DEFAULT: k_max=3, r_max=4 (empirically engages MGHD on Z-side,
+                # keeps X-side mostly Tier-0 at low p, good latency)
+                self.tier0_k_max, self.tier0_r_max = 3, 4
+            elif tier0_mode == "off":
+                self.tier0_k_max, self.tier0_r_max = 0, 0
+            else:
+                # Fallback to original defaults
+                self.tier0_k_max, self.tier0_r_max = TIER0_K_MAX, TIER0_R_MAX
+        else:
+            # Use explicit values provided by user
+            self.tier0_k_max = int(tier0_k_max or TIER0_K_MAX)
+            self.tier0_r_max = int(tier0_r_max or TIER0_R_MAX)
+        
         self.p_channel = p_channel
         self.default_p = default_p
 
@@ -274,3 +291,15 @@ class MGHDPrimaryClustered:
             p_channel_used=tier0_stats["p_channel_used"],
             tier0_stats=tier0_stats,
         )
+
+    def set_tier0_k_max(self, k: int):
+        """Set tier0 cluster size threshold."""
+        self.tier0_k_max = int(k)
+
+    def set_tier0_r_max(self, r: int):
+        """Set tier0 nullity (rank) threshold."""
+        self.tier0_r_max = int(r)
+
+    def get_tier0_caps(self) -> Tuple[int, int]:
+        """Get current tier0 thresholds as (k_max, r_max) tuple."""
+        return (self.tier0_k_max or 0), (self.tier0_r_max or 0)

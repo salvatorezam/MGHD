@@ -266,8 +266,7 @@ PROJECT_SUMMARY.md
 **/PROJECT_SUMMARY.md
 
 # Exclude development documentation files
-scratchpad/initial-test/Agents.md
-
-scratchpad/initial-test/IMPLEMENTATION_SUMMARY.md
-scratchpad/initial-test/STEP2_COMPLETE.md
+**/Agents.md
+**/IMPLEMENTATION_SUMMARY.md
+**/STEP2_COMPLETE.md
 
