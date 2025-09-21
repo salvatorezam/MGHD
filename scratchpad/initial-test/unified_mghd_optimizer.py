@@ -32,6 +32,82 @@ from panq_functions import (GNNDecoder, collate, fraction_of_solved_puzzles,
 from ldpc.mod2 import nullspace
 from poc_my_models import MGHD
 
+def detect_model_version(checkpoint_path: str) -> str:
+    """Auto-detect model version from checkpoint metadata"""
+    try:
+        if not os.path.exists(checkpoint_path):
+            return 'v1'  # Default to v1 for missing files
+            
+        # Try to load checkpoint metadata
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        except Exception:
+            return 'v1'  # Default on load failure
+        
+        # Check for v2 indicators in checkpoint
+        v2_indicators = [
+            'model_version',  # Explicit version tag
+            'crop_metadata',  # Crops dataset metadata
+            'distance_agnostic',  # Distance-agnostic flag
+            'hilbert_ordering',  # Hilbert space-filling curve
+            'packed_features',  # Packed crop features
+        ]
+        
+        # Check in top-level metadata
+        for indicator in v2_indicators:
+            if indicator in checkpoint:
+                if checkpoint.get('model_version') == 'v2' or checkpoint.get(indicator):
+                    return 'v2'
+        
+        # Check in args/config if present
+        if 'args' in checkpoint:
+            args_dict = checkpoint['args'] if isinstance(checkpoint['args'], dict) else vars(checkpoint['args'])
+            for indicator in v2_indicators:
+                if args_dict.get(indicator):
+                    return 'v2'
+            # Also check strategy
+            if args_dict.get('strategy') == 'direct_crops_v2':
+                return 'v2'
+        
+        # Check model state dict for v2-specific layers
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+            v2_layer_patterns = [
+                'crop_encoder',  # Crop encoding layers
+                'distance_proj',  # Distance projection
+                'hilbert_embed',  # Hilbert embeddings
+                'packed_conv',   # Packed convolutions
+            ]
+            for key in state_dict.keys():
+                for pattern in v2_layer_patterns:
+                    if pattern in key:
+                        return 'v2'
+        
+        return 'v1'  # Default to v1 if no v2 indicators found
+        
+    except Exception:
+        return 'v1'  # Safe default
+
+def load_model_with_autodetect(checkpoint_path: str = None, **model_kwargs):
+    """Load model with automatic version detection"""
+    if checkpoint_path:
+        version = detect_model_version(checkpoint_path)
+        print(f"🔍 Auto-detected model version: {version}")
+        
+        if version == 'v2':
+            try:
+                # Import v2 model (CUDA-lazy)
+                from mghd_public.model_v2 import MGHDv2
+                print("   Using MGHDv2 (distance-agnostic)")
+                return MGHDv2(**model_kwargs), version
+            except ImportError as e:
+                print(f"   Warning: Could not import MGHDv2, falling back to v1: {e}")
+                return MGHD(**model_kwargs), 'v1'
+    
+    # Default to v1
+    print("   Using MGHD v1 (distance-specific)")
+    return MGHD(**model_kwargs), 'v1'
+
 # Device setup
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -448,7 +524,7 @@ class ComprehensiveMGHDOptimizer:
         self.config.use_full_dataset = True
         dataset_params = self.get_dataset_params()
         
-        # Create optimized model
+        # Create optimized model with auto-detection support
         gnn_params = {
             'dist': self.d, 'n_node_inputs': 4, 'n_node_outputs': 4,
             'n_iters': best_params['n_iters'],
@@ -466,12 +542,30 @@ class ComprehensiveMGHDOptimizer:
             'expand': best_params['mamba_expand']
         }
         
-        optimized_model = MGHD(gnn_params=gnn_params, mamba_params=mamba_params).to(device)
+        # Use auto-detection for model loading if checkpoint available
+        init_checkpoint = getattr(self.config, 'init_checkpoint', None)
+        optimized_model, model_version = load_model_with_autodetect(
+            checkpoint_path=init_checkpoint,
+            gnn_params=gnn_params, 
+            mamba_params=mamba_params
+        )
+        optimized_model = optimized_model.to(device)
+        
+        # Load checkpoint if provided
+        if init_checkpoint and os.path.exists(init_checkpoint):
+            try:
+                checkpoint = torch.load(init_checkpoint, map_location=device)
+                if 'model' in checkpoint:
+                    optimized_model.load_state_dict(checkpoint['model'], strict=False)
+                    print(f"   Loaded checkpoint: {init_checkpoint}")
+            except Exception as e:
+                print(f"   Warning: Could not load checkpoint: {e}")
+        
         optimizer_opt = optim.AdamW(optimized_model.parameters(), 
                                   lr=best_params['lr'], 
                                   weight_decay=best_params['weight_decay'])
         
-        print(f"Optimized model parameters: {sum(p.numel() for p in optimized_model.parameters()):,}")
+        print(f"Optimized model ({model_version}) parameters: {sum(p.numel() for p in optimized_model.parameters()):,}")
         print(f"Using LR: {best_params['lr']:.6f}, Weight Decay: {best_params['weight_decay']:.6f}")
         
         # Add ReduceLROnPlateau scheduler (from your best config)
@@ -663,8 +757,8 @@ class ComprehensiveMGHDOptimizer:
 
 def main():
     parser = argparse.ArgumentParser(description='Comprehensive MGHD Optimization + Step-11')
-    # Legacy optimization path
-    parser.add_argument('--strategy', choices=['basic', 'advanced', 'ensemble', 'direct'], 
+    # Legacy optimization path + v2 crops training
+    parser.add_argument('--strategy', choices=['basic', 'advanced', 'ensemble', 'direct', 'direct_crops_v2'], 
                        default='basic', help='Optimization strategy')
     parser.add_argument('--trials', type=int, default=30, help='Number of Optuna trials')
     parser.add_argument('--epochs', type=int, default=20, help='Training epochs per trial')
@@ -710,6 +804,24 @@ def main():
     # Curriculum preset for circuit-level p-schedule
     parser.add_argument('--curriculum', choices=['none','circuit_v1'], default='none',
                         help='Enable circuit-level p scheduling over epochs')
+    
+    # Crops v2 training specific parameters
+    parser.add_argument('--crops-dataset', type=str, default=None,
+                        help='Path to crops dataset NPZ shards (for strategy=direct_crops_v2)')
+    parser.add_argument('--crops-config', type=str, default=None,
+                        help='Path to crops metadata JSON config')
+    parser.add_argument('--crops-epochs', type=int, default=30,
+                        help='Epochs for crops training (default: 30)')
+    parser.add_argument('--crops-lr', type=float, default=1e-4,
+                        help='Learning rate for crops training (default: 1e-4)')
+    parser.add_argument('--crops-batch-size', type=int, default=64,
+                        help='Batch size for crops training (default: 64)')
+    parser.add_argument('--crops-weight-decay', type=float, default=1e-4,
+                        help='Weight decay for crops training (default: 1e-4)')
+    parser.add_argument('--crops-val-samples', type=int, default=1024,
+                        help='Validation samples for crops training (default: 1024)')
+    parser.add_argument('--crops-outdir', type=str, default='results/crops_v2',
+                        help='Output directory for crops training results')
     # S-arch overrides and improvements
     parser.add_argument('--ov-n-iters', type=int, default=None)
     parser.add_argument('--ov-node-feats', type=int, default=None)
@@ -732,6 +844,10 @@ def main():
 
     if getattr(args, 'foundation_train', False) or getattr(args, 'step11_train', False):
         return run_foundation_train(args)
+    
+    # Crops v2 training path
+    if args.strategy == 'direct_crops_v2':
+        return run_crops_v2_training(args)
 
     # Legacy path
     config = OptimizationConfig(
@@ -747,6 +863,86 @@ def main():
     print("\n🏆 Optimization Complete!")
     print(f"Strategy: {results['strategy']}")
     print(f"Best LER achieved: {min([res['lers'][-1] for res in results['training_results'].values()]):.6f}")
+
+
+def run_crops_v2_training(args):
+    """Run distance-agnostic crops v2 training with established ergonomics"""
+    try:
+        # Import crops training system with CUDA-lazy loading
+        from training.cluster_crops_train import train_inprocess
+        import argparse as _ap
+    except ImportError as e:
+        print(f"❌ Error: Could not import crops v2 training system: {e}")
+        print("   Make sure training/cluster_crops_train.py is available and dependencies are installed")
+        return 1
+    
+    print("🌾 Starting Distance-Agnostic Crops v2 Training...")
+    
+    # Validate required parameters
+    if not args.crops_dataset:
+        print("❌ Error: --crops-dataset is required for strategy=direct_crops_v2")
+        print("   Use tools/make_cluster_crops.py to generate dataset first")
+        return 1
+    
+    # Build namespace for crops training using established parameter mapping
+    crops_ns = _ap.Namespace()
+    
+    # Core training parameters (use established names from foundation training)
+    crops_ns.dataset_path = args.crops_dataset
+    crops_ns.config_path = getattr(args, 'crops_config', None)
+    crops_ns.epochs = getattr(args, 'crops_epochs', 30)
+    crops_ns.lr = getattr(args, 'crops_lr', 1e-4)
+    crops_ns.batch_size = getattr(args, 'crops_batch_size', 64)
+    crops_ns.weight_decay = getattr(args, 'crops_weight_decay', 1e-4)
+    crops_ns.val_samples = getattr(args, 'crops_val_samples', 1024)
+    crops_ns.outdir = getattr(args, 'crops_outdir', 'results/crops_v2')
+    crops_ns.seed = getattr(args, 'seed', 42)
+    
+    # Inherit established training ergonomics from foundation args
+    crops_ns.amp = getattr(args, 'amp', 'bf16')
+    crops_ns.compile = getattr(args, 'compile', False)
+    crops_ns.grad_clip = getattr(args, 'grad_clip', 1.0)
+    crops_ns.lr_schedule = getattr(args, 'lr_schedule', 'cosine')
+    crops_ns.ema_decay = getattr(args, 'ema_decay', 0.0)
+    crops_ns.label_smoothing = getattr(args, 'label_smoothing', 0.0)
+    
+    # Optional crops-specific overrides
+    if hasattr(args, 'crops_profile'):
+        crops_ns.profile = args.crops_profile
+    
+    try:
+        # Call in-process training
+        checkpoint_path = train_inprocess(crops_ns)
+        
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            print(f"✅ Crops v2 training completed successfully!")
+            print(f"   Best checkpoint: {checkpoint_path}")
+            
+            # Create unified handoff for consistency
+            handoff = {
+                'strategy': 'direct_crops_v2',
+                'checkpoint': checkpoint_path,
+                'outdir': crops_ns.outdir,
+                'dataset': crops_ns.dataset_path,
+                'config': crops_ns.config_path,
+                'args': vars(args)
+            }
+            
+            handoff_path = os.path.join(crops_ns.outdir, 'unified_handoff.json')
+            os.makedirs(crops_ns.outdir, exist_ok=True)
+            with open(handoff_path, 'w') as f:
+                json.dump(handoff, f, indent=2)
+            
+            return 0
+        else:
+            print(f"❌ Error: Training completed but no checkpoint found at: {checkpoint_path}")
+            return 1
+            
+    except Exception as e:
+        print(f"❌ Error during crops v2 training: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 def run_foundation_train(args):
@@ -1208,6 +1404,174 @@ def run_foundation_train(args):
 # Back-compat entry for older scripts
 def run_step11_garnet_train(args):
     return run_foundation_train(args)
+
+def compare_v1_v2_models(v1_checkpoint: str, v2_checkpoint: str, 
+                        output_dir: str = "results/comparison", 
+                        eval_samples: int = 10000):
+    """A/B comparison tool for v1 vs v2 models"""
+    print("🔬 Starting V1 vs V2 Model Comparison...")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Load models with auto-detection
+    print("\n📂 Loading Models...")
+    v1_model, v1_version = load_model_with_autodetect(checkpoint_path=v1_checkpoint)
+    v2_model, v2_version = load_model_with_autodetect(checkpoint_path=v2_checkpoint)
+    
+    v1_model = v1_model.to(device).eval()
+    v2_model = v2_model.to(device).eval()
+    
+    # Load checkpoints
+    v1_state = torch.load(v1_checkpoint, map_location=device)
+    v2_state = torch.load(v2_checkpoint, map_location=device)
+    
+    if 'model' in v1_state:
+        v1_model.load_state_dict(v1_state['model'], strict=False)
+    if 'model' in v2_state:
+        v2_model.load_state_dict(v2_state['model'], strict=False)
+    
+    print(f"   V1 Model ({v1_version}): {sum(p.numel() for p in v1_model.parameters()):,} parameters")
+    print(f"   V2 Model ({v2_version}): {sum(p.numel() for p in v2_model.parameters()):,} parameters")
+    
+    # Evaluation setup
+    from panqec.codes import surface_2d
+    from panqec.error_models import PauliErrorModel
+    
+    d = 3
+    code = surface_2d.RotatedPlanar2DCode(d)
+    error_model = PauliErrorModel(0.34, 0.32, 0.34)
+    
+    # Test across multiple error rates
+    p_values = [0.02, 0.03, 0.05, 0.08, 0.10]
+    results = {
+        'p_values': p_values,
+        'v1_lers': [],
+        'v2_lers': [],
+        'v1_times': [],
+        'v2_times': [],
+        'comparison_summary': {}
+    }
+    
+    print(f"\n🧪 Evaluating across {len(p_values)} error rates with {eval_samples} samples each...")
+    
+    for p in p_values:
+        print(f"\n  Testing p = {p:.3f}...")
+        
+        # Generate test data
+        testset = adapt_trainset(
+            generate_syndrome_error_volume(
+                code, error_model, p=p, 
+                batch_size=eval_samples, for_training=False
+            ), code, num_classes=4, for_training=False
+        )
+        testloader = DataLoader(testset, batch_size=512, collate_fn=collate, shuffle=False)
+        
+        # Evaluate V1
+        start_time = time.time()
+        with torch.no_grad():
+            _, _, v1_ler = logical_error_rate(v1_model, testloader, code)
+        v1_time = time.time() - start_time
+        
+        # Evaluate V2  
+        start_time = time.time()
+        with torch.no_grad():
+            # Handle potential differences in v2 evaluation
+            try:
+                _, _, v2_ler = logical_error_rate(v2_model, testloader, code)
+            except Exception as e:
+                print(f"    Warning: V2 evaluation failed with standard harness: {e}")
+                # Fallback evaluation for v2 if needed
+                v2_ler = float('inf')
+        v2_time = time.time() - start_time
+        
+        results['v1_lers'].append(v1_ler)
+        results['v2_lers'].append(v2_ler)
+        results['v1_times'].append(v1_time)
+        results['v2_times'].append(v2_time)
+        
+        print(f"    V1 LER: {v1_ler:.6f} ({v1_time:.2f}s)")
+        print(f"    V2 LER: {v2_ler:.6f} ({v2_time:.2f}s)")
+        
+        if v2_ler < float('inf'):
+            improvement = ((v1_ler - v2_ler) / v1_ler * 100) if v1_ler > 0 else 0.0
+            speedup = (v1_time / v2_time) if v2_time > 0 else 1.0
+            print(f"    Improvement: {improvement:+.2f}%, Speedup: {speedup:.2f}x")
+    
+    # Summary analysis
+    valid_comparisons = [(v1, v2) for v1, v2 in zip(results['v1_lers'], results['v2_lers']) if v2 < float('inf')]
+    
+    if valid_comparisons:
+        avg_v1_ler = np.mean([v1 for v1, v2 in valid_comparisons])
+        avg_v2_ler = np.mean([v2 for v1, v2 in valid_comparisons])
+        overall_improvement = ((avg_v1_ler - avg_v2_ler) / avg_v1_ler * 100) if avg_v1_ler > 0 else 0.0
+        
+        avg_v1_time = np.mean(results['v1_times'])
+        avg_v2_time = np.mean(results['v2_times'])
+        overall_speedup = (avg_v1_time / avg_v2_time) if avg_v2_time > 0 else 1.0
+        
+        results['comparison_summary'] = {
+            'avg_v1_ler': avg_v1_ler,
+            'avg_v2_ler': avg_v2_ler,
+            'improvement_percent': overall_improvement,
+            'avg_v1_time': avg_v1_time,
+            'avg_v2_time': avg_v2_time,
+            'speedup_factor': overall_speedup,
+            'valid_comparisons': len(valid_comparisons),
+            'total_comparisons': len(p_values)
+        }
+        
+        print(f"\n📊 Overall Results:")
+        print(f"   Average V1 LER: {avg_v1_ler:.6f}")
+        print(f"   Average V2 LER: {avg_v2_ler:.6f}")
+        print(f"   Performance Improvement: {overall_improvement:+.2f}%")
+        print(f"   Speed Improvement: {overall_speedup:.2f}x")
+    else:
+        print("\n❌ No valid comparisons could be completed")
+        results['comparison_summary'] = {'error': 'No valid comparisons'}
+    
+    # Save detailed results
+    comparison_file = os.path.join(output_dir, "v1_v2_comparison.json")
+    with open(comparison_file, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    
+    # Create visualization if matplotlib available
+    try:
+        import matplotlib.pyplot as plt
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # LER comparison
+        ax1.plot(p_values, results['v1_lers'], 'o-', label='V1 (distance-specific)', color='blue')
+        valid_v2 = [ler if ler < float('inf') else None for ler in results['v2_lers']]
+        ax1.plot(p_values, valid_v2, 's-', label='V2 (distance-agnostic)', color='red')
+        ax1.set_xlabel('Physical Error Rate (p)')
+        ax1.set_ylabel('Logical Error Rate')
+        ax1.set_yscale('log')
+        ax1.set_title('Logical Error Rate Comparison')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Timing comparison
+        ax2.bar(['V1', 'V2'], [np.mean(results['v1_times']), np.mean(results['v2_times'])], 
+                color=['blue', 'red'], alpha=0.7)
+        ax2.set_ylabel('Average Evaluation Time (s)')
+        ax2.set_title('Inference Speed Comparison')
+        ax2.grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'v1_v2_comparison.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"   Visualization saved: {os.path.join(output_dir, 'v1_v2_comparison.png')}")
+        
+    except ImportError:
+        print("   (matplotlib not available for visualization)")
+    except Exception as e:
+        print(f"   (visualization failed: {e})")
+    
+    print(f"\n✅ Comparison complete! Results saved to: {comparison_file}")
+    return results
 
 if __name__ == "__main__":
     main()

@@ -2,7 +2,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 from collections import deque
-from typing import List, Tuple, Dict, Iterable
+from typing import List, Tuple, Dict, Iterable, Optional
 
 
 def _as_dense_uint8(M: sp.csr_matrix) -> np.ndarray:
@@ -79,6 +79,57 @@ def gf2_nullspace(H: sp.csr_matrix):
     if not basis:
         return np.zeros((n, 0), dtype=np.uint8)
     return np.stack(basis, axis=1)  # n × r
+
+
+# Tier-0 defaults for small-cluster solver
+TIER0_K_MAX = 3
+TIER0_R_MAX = 6
+
+
+def solve_small_cluster_channel_ml(
+    H_sub: sp.csr_matrix,
+    s_sub: np.ndarray,
+    *,
+    p_channel: float,
+    k_max: int = TIER0_K_MAX,
+    r_cap: int = TIER0_R_MAX,
+) -> Optional[np.ndarray]:
+    """Channel-only exact ML for tiny clusters; returns None if cluster too large."""
+    m_sub, n_sub = H_sub.shape
+    e0 = gf2_solve_particular(H_sub, s_sub)
+    N = gf2_nullspace(H_sub)
+    r = N.shape[1]
+    if not (n_sub <= k_max or r <= r_cap):
+        return None
+
+    eps = 1e-9
+    p = np.clip(float(p_channel), eps, 1 - eps)
+    w = np.full(n_sub, np.log((1 - p) / p), dtype=np.float64)
+
+    best_e = e0.copy()
+    best_cost = float(np.dot(w, best_e))
+
+    if r == 0:
+        pass
+    else:
+        for z_int in range(1 << r):
+            e = e0.copy()
+            bits = z_int
+            k = 0
+            while bits:
+                if bits & 1:
+                    e ^= N[:, k]
+                bits >>= 1
+                k += 1
+            cost = float(np.dot(w, e))
+            if cost < best_cost:
+                best_cost = cost
+                best_e = e
+
+    parity = (H_sub @ best_e) % 2
+    if not np.array_equal(parity.astype(np.uint8) % 2, s_sub.astype(np.uint8) % 2):
+        raise AssertionError("Tier-0 solver produced invalid correction")
+    return best_e.astype(np.uint8)
 
 
 def ml_parity_project(H_sub: sp.csr_matrix,
