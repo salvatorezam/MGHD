@@ -73,6 +73,23 @@ def _bucket_size(size: int) -> str:
     return str(bucket)
 
 
+def _parse_bucket_spec(spec: str) -> List[Tuple[int, int, int]]:
+    spec = (spec or "").strip()
+    if not spec:
+        return []
+    buckets: List[Tuple[int, int, int]] = []
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        fields = [int(x) for x in part.split(",")]
+        if len(fields) != 3:
+            raise ValueError(f"Invalid bucket spec fragment '{part}'")
+        buckets.append(tuple(fields))
+    buckets.sort()
+    return buckets
+
+
 def _aggregate_mb_stats(reports):
     agg = dict(
         shots=len(reports),
@@ -85,14 +102,16 @@ def _aggregate_mb_stats(reports):
     total = 0.0
     count = 0
     device = None
+    graph_flag = False
     for rep in reports:
         if not rep:
             continue
         agg["fast_path_batches"] += int(rep.get("fast_path_batches", 0))
         agg["fixed_d3_batches"] += int(rep.get("fixed_d3_batches", 0))
         agg["fallback_loops"] += int(rep.get("fallback_loops", 0))
-        if rep.get("graph_used"):
-            agg["graph_used_shots"] += 1
+        graph_used_shots = int(rep.get("graph_used_shots", 0))
+        agg["graph_used_shots"] += graph_used_shots
+        graph_flag = graph_flag or bool(rep.get("graph_used")) or graph_used_shots > 0
         sizes = rep.get("batch_sizes", [])
         total += float(np.sum(sizes)) if len(sizes) else 0.0
         count += len(sizes)
@@ -103,7 +122,7 @@ def _aggregate_mb_stats(reports):
             device = rep["device"]
     agg["avg_batch_size"] = (total / count) if count else 0.0
     agg["batch_histogram"] = {k: int(v) for k, v in sorted(hist.items(), key=lambda kv: int(kv[0]))}
-    agg["graph_used"] = bool(agg["graph_used_shots"])
+    agg["graph_used"] = graph_flag
     agg["device"] = device or {}
     return agg
 
@@ -167,6 +186,10 @@ def main():
     
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="results/sweeps")
+    ap.add_argument("--min-nullity", type=int, default=None,
+                    help="Resample until at least one cluster has nullity ≥ value (up to limits)")
+    ap.add_argument("--min-size", type=int, default=None,
+                    help="Resample until at least one cluster has ≥ value qubits (up to limits)")
     
     # Expert model selection
     ap.add_argument("--expert", type=str, default="v1", choices=["v1","v2","auto"], 
@@ -183,13 +206,27 @@ def main():
                     help="Inject logical errors at specified rate for sanity testing")
     ap.add_argument("--inject-ler-rate", type=float, default=0.1,
                     help="Rate of logical error injection when --inject-ler is enabled")
-    
+    ap.add_argument("--bucket-spec", type=str, default="32,64,32;64,128,64",
+                    help="Semicolon-separated bucket ceilings (nodes,edges,seq) for v2 batching.")
+    ap.add_argument("--microbatch", type=int, default=64,
+                    help="Target microbatch size for cross-shot batching.")
+    ap.add_argument("--flush-ms", type=float, default=1.0,
+                    help="Flush partial microbatch after this many milliseconds of waiting.")
+    ap.add_argument("--target-ler-ci", type=float, default=1e-4,
+                    help="Early-stop a (d,p,side) once the 95% Wilson upper bound is below this value.")
+
     # CI enforcement
     ap.add_argument("--enforce-mghd", action="store_true",
                     help="Fail if MGHD was never invoked in mixed/mixed_tight modes")
     
     args = ap.parse_args()
-    
+
+    bucket_spec = _parse_bucket_spec(args.bucket_spec)
+    args.microbatch = max(1, int(args.microbatch))
+    args.flush_ms = max(0.0, float(args.flush_ms))
+    if args.target_ler_ci is not None and args.target_ler_ci < 0:
+        args.target_ler_ci = None
+
     # Process tier-0 mode presets
     if args.tier0_mode == "aggressive":
         args.tier0 = True
@@ -197,32 +234,11 @@ def main():
         args.tier0_r_max = 20
     elif args.tier0_mode == "mixed":
         args.tier0 = True
-        args.tier0_k_max = 5
-        args.tier0_r_max = 6
+        args.tier0_k_max = 2
+        args.tier0_r_max = 1
     elif args.tier0_mode == "off":
         args.tier0 = False
-    
-    # Process p_channel auto
-    if args.p_channel != "auto":
-        try:
-            args.p_channel = float(args.p_channel)
-        except ValueError:
-            raise ValueError(f"Invalid p_channel value: {args.p_channel}. Use 'auto' or a float.")
-    
-    args = ap.parse_args()
-    
-    # Process tier-0 mode presets
-    if args.tier0_mode == "aggressive":
-        args.tier0 = True
-        args.tier0_k_max = 15
-        args.tier0_r_max = 20
-    elif args.tier0_mode == "mixed":
-        args.tier0 = True
-        args.tier0_k_max = 5
-        args.tier0_r_max = 6
-    elif args.tier0_mode == "off":
-        args.tier0 = False
-    
+
     # Process p_channel auto
     if args.p_channel != "auto":
         try:
@@ -261,7 +277,13 @@ def main():
 
     results: Dict[str, Dict[str, Dict[str, Dict[str, object]]]] = {"grid": [], "meta": {}}
     results["meta"]["expert"] = args.expert
-    results["meta"]["graph_capture"] = bool(getattr(args,"graph_capture",False))
+    results["meta"]["graph_capture"] = bool(getattr(args, "graph_capture", False))
+    results["meta"]["min_nullity"] = args.min_nullity
+    results["meta"]["min_size"] = args.min_size
+    results["meta"]["bucket_spec"] = [list(b) for b in bucket_spec]
+    results["meta"]["microbatch"] = args.microbatch
+    results["meta"]["flush_ms"] = args.flush_ms
+    results["meta"]["target_ler_ci"] = args.target_ler_ci
     base_rng = np.random.default_rng(args.seed)
 
     # Create MGHD decoder with expert selection
@@ -386,6 +408,9 @@ def main():
                     tier0_r_max=tier0_r_max,
                     p_channel=p_channel,
                     default_p=p,
+                    bucket_spec=bucket_spec,
+                    microbatch=args.microbatch,
+                    flush_ms=args.flush_ms,
                 )
 
                 lat_total = []
@@ -405,51 +430,80 @@ def main():
                 nullity_hist = Counter()
 
                 failures = 0
+                shots_taken = 0
+                early_stopped = False
+                check_interval = max(1, min(1000, args.shots))
 
-                for _ in range(args.shots):
-                    _, s = sample_bsc(H, p, rng)
-                    count, sizes, sz_hist, null_hist = cluster_stats_from_checks(H, s)
-                    cluster_counts.append(count)
-                    if sizes:
-                        max_cluster_sizes.append(max(sizes))
-                    else:
-                        max_cluster_sizes.append(0)
-                    size_hist.update(sz_hist)
-                    nullity_hist.update(null_hist)
+                while shots_taken < args.shots:
+                    attempts = 0
+                    while True:
+                        _, s = sample_bsc(H, p, rng)
+                        checks_list, qubits_list = active_components(H, s, halo=args.halo)
+                        sizes = []
+                        nullities = []
+                        sz_hist_local: Counter = Counter()
+                        null_hist_local: Counter = Counter()
+                        for ci, qi in zip(checks_list, qubits_list):
+                            H_sub, s_sub, _, _ = extract_subproblem(H, s, ci, qi)
+                            n_qubits_local = int(qi.size)
+                            nullity_local = int(gf2_nullspace(H_sub).shape[1])
+                            sizes.append(n_qubits_local)
+                            nullities.append(nullity_local)
+                            size_key = str(n_qubits_local) if n_qubits_local <= 8 else "9+"
+                            sz_hist_local[size_key] += 1
+                            null_key = str(nullity_local) if nullity_local <= 8 else "9+"
+                            null_hist_local[null_key] += 1
+
+                        passes_size = True if args.min_size is None else any(size >= args.min_size for size in sizes)
+                        passes_nullity = True if args.min_nullity is None else any(null_val >= args.min_nullity for null_val in nullities)
+
+                        if passes_size and passes_nullity:
+                            break
+                        attempts += 1
+                        if attempts >= 64:
+                            break
+
+                    cluster_counts.append(len(sizes))
+                    max_cluster_sizes.append(max(sizes) if sizes else 0)
+                    size_hist.update(sz_hist_local)
+                    nullity_hist.update(null_hist_local)
 
                     out = dec.decode(s)
                     e_hat = out["e_hat"]
-                    
-                    # Apply LER injection for sanity testing if enabled
+
                     if args.inject_ler:
-                        # Inject logical errors at specified rate
                         if rng.random() < args.inject_ler_rate:
-                            # Flip the logical result
                             is_correct = np.array_equal((H @ e_hat) % 2, s)
-                            failures += int(is_correct)  # Count as failure if it was correct
+                            failures += int(is_correct)
                         else:
                             failures += int(not np.array_equal((H @ e_hat) % 2, s))
                     else:
                         failures += int(not np.array_equal((H @ e_hat) % 2, s))
 
-                    # Timing in microseconds
                     lat_total.append(out["t_total_us"])
                     lat_cluster.append(out["t_cluster_us"])
                     lat_tier0.append(out.get("t_tier0_us", 0.0))
                     lat_mghd.append(out["t_mghd_us"])
                     lat_proj.append(out["t_project_us"])
-                    
-                    # Collect MGHD invoke times (if any MGHD was used)
+
                     if out.get("mghd_invoked", False) and out["t_mghd_us"] > 0:
-                        # For now, we collect the total MGHD time per shot
-                        # In a more sophisticated implementation, we'd collect per-invoke times
                         mghd_invoke_times.append(out["t_mghd_us"])
-                    
+
                     mb_reports.append(out.get("mb_stats", {}))
                     tier0_clusters.append(out.get("tier0_clusters", 0))
                     tier0_qubits.append(out.get("tier0_qubits", 0))
                     mghd_clusters.append(out.get("mghd_clusters", 0))
                     mghd_invoked_flags.append(bool(out.get("mghd_invoked", False)))
+
+                    shots_taken += 1
+                    if args.target_ler_ci is not None and (shots_taken % check_interval == 0):
+                        ub = wilson_ci_upper(failures, shots_taken)
+                        if ub <= args.target_ler_ci:
+                            early_stopped = True
+                            break
+
+                if shots_taken == 0:
+                    continue
 
                 tier0_total = int(np.sum(tier0_clusters))
                 total_clusters = int(np.sum(cluster_counts))
@@ -466,9 +520,9 @@ def main():
                 )
 
                 # Calculate LER with Wilson CI
-                ler = failures / args.shots
-                wilson_hi = wilson_ci_upper(failures, args.shots)
-                ler_point, ler_lo, ler_hi = wilson_ci(failures, args.shots)
+                ler = failures / shots_taken
+                wilson_hi = wilson_ci_upper(failures, shots_taken)
+                ler_point, ler_lo, ler_hi = wilson_ci(failures, shots_taken)
                 
                 # Latency quantiles
                 lat_total_arr = np.array(lat_total)
@@ -478,7 +532,7 @@ def main():
                 
                 # Tier-0 fraction and MGHD clusters per shot
                 tier0_frac = tier0_pct / 100.0
-                mghd_clusters_per_shot = float(mghd_total / args.shots)
+                mghd_clusters_per_shot = float(mghd_total / shots_taken)
                 
                 # Calculate non-zero MGHD invoke statistics
                 mghd_invoke_times_arr = np.array(mghd_invoke_times) if mghd_invoke_times else np.array([])
@@ -490,7 +544,9 @@ def main():
                 }
                 
                 side_result = dict(
-                    shots=args.shots,
+                    shots=shots_taken,
+                    shots_target=args.shots,
+                    stopped_early=bool(early_stopped),
                     failures=int(failures),
                     ler=float(ler_point),
                     ler_lo=float(ler_lo),
@@ -514,7 +570,7 @@ def main():
                         tier0_qubits=int(np.sum(tier0_qubits)),
                         tier0_pct=tier0_pct,
                         mghd_clusters=mghd_total,
-                        mghd_clusters_per_shot=float(mghd_total / args.shots),
+                        mghd_clusters_per_shot=float(mghd_total / shots_taken),
                         mghd_invoked_shots=int(np.sum(mghd_invoked_flags)),
                         mghd_invoked=bool(mghd_total),
                         p_channel_used=float(p_channel),
@@ -541,12 +597,18 @@ def main():
                 # Store in grid format for new enhanced output
                 entry = {
                     "d": d, "p": p,
-                    "shots": args.shots,
+                    "shots": shots_taken,
+                    "shots_target": args.shots,
+                    "stopped_early": bool(early_stopped),
                     "ler": float(ler_point), "ler_lo": float(ler_lo), "ler_hi": float(ler_hi),
                     "lat_p50_us": lat_p50_us, "lat_p95_us": lat_p95_us, "lat_p99_us": lat_p99_us,
                     "tier0_frac": float(tier0_frac),
                     "mghd_clusters_per_shot": float(mghd_clusters_per_shot),
                 }
+                if args.min_size is not None:
+                    entry["min_size"] = int(args.min_size)
+                if args.min_nullity is not None:
+                    entry["min_nullity"] = int(args.min_nullity)
                 if args.log_kappa_hist: 
                     entry["kappa_hist"] = cluster_stats["size_hist"]
                 if args.log_nullity_hist: 
@@ -555,9 +617,11 @@ def main():
                 
                 results[str(d)][f"{p:.3f}"][side] = side_result
                 total_p95_us = side_result["latency_total_us"]["p95"]
+                mghd_rate = mghd_total / shots_taken if shots_taken else 0.0
                 print(
                     f"    {side}: p95={total_p95_us:.1f}μs, LER={ler:.2e}, "
-                    f"Tier0={tier0_pct:.1f}%, MGHD={mghd_total/args.shots:.3f}/shot, "
+                    f"Tier0={tier0_pct:.1f}%, MGHD={mghd_rate:.3f}/shot, "
+                    f"shots={shots_taken}{' (early stop)' if early_stopped else ''}, "
                     f"max_κ_p95={cluster_stats['max_cluster_p95']:.1f}"
                 )
 
@@ -579,6 +643,12 @@ def main():
             device=args.device,
             graph_capture=args.graph_capture,
             expert=args.expert,
+            min_nullity=args.min_nullity,
+            min_size=args.min_size,
+            bucket_spec=[list(b) for b in bucket_spec],
+            microbatch=args.microbatch,
+            flush_ms=args.flush_ms,
+            target_ler_ci=args.target_ler_ci,
         ),
         results=results,
     )
@@ -597,19 +667,30 @@ def main():
         # Check aggregate MGHD usage across all sides and conditions
         total_mghd_invoked = 0
         max_tier0_frac = 0.0
-        
-        for d_key, d_data in payload.items():
-            if not isinstance(d_data, dict):
-                continue
-            for p_key, p_data in d_data.items():
-                if not isinstance(p_data, dict):
-                    continue
-                for side_key, side_data in p_data.items():
-                    if side_key in ("X", "Z") and isinstance(side_data, dict):
-                        total_mghd_invoked += side_data.get("mghd_invoked_shots", 0)
-                        max_tier0_frac = max(max_tier0_frac, side_data.get("tier0_frac", 1.0))
-        
-        if total_mghd_invoked <= 0 or max_tier0_frac >= 0.99:
+        total_shots = 0
+
+        def _walk(node: object) -> None:
+            nonlocal total_mghd_invoked, max_tier0_frac, total_shots
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key in ("X", "Z") and isinstance(value, dict):
+                        invoked = value.get("mghd_invoked_shots")
+                        if invoked is None:
+                            invoked = value.get("tier0_stats", {}).get("mghd_invoked_shots", 0)
+                        total_mghd_invoked += int(invoked or 0)
+                        total_shots += int(value.get("shots", 0) or 0)
+                        max_tier0_frac = max(max_tier0_frac, value.get("tier0_frac", 1.0))
+                    else:
+                        _walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        _walk(payload)
+
+        invoked_frac = float(total_mghd_invoked) / float(total_shots or 1)
+
+        if total_mghd_invoked <= 0 or (max_tier0_frac >= 0.99 and invoked_frac < 0.01):
             raise SystemExit("MGHD was not exercised under mixed gating — adjust k_max/r_max or investigate.")
     
     return payload

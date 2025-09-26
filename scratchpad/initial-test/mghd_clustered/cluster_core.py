@@ -135,7 +135,8 @@ def solve_small_cluster_channel_ml(
 def ml_parity_project(H_sub: sp.csr_matrix,
                       s_sub: np.ndarray,
                       p_flip: np.ndarray,
-                      r_cap: int = 20) -> np.ndarray:
+                      r_cap: int = 20,
+                      stats_out: Dict[str, int] | None = None) -> np.ndarray:
     """
     Exact ML projection under independent bit model:
       minimize w·e subject to H_sub e = s_sub (mod2), w_j = log((1-p)/p).
@@ -150,31 +151,85 @@ def ml_parity_project(H_sub: sp.csr_matrix,
     r = N.shape[1]
 
     if r == 0:
+        if stats_out is not None:
+            stats_out.update(states_visited=1, states_pruned=0)
         return e0
 
     if r > r_cap:
         # fallback
+        if stats_out is not None:
+            stats_out.update(states_visited=0, states_pruned=0)
         return greedy_parity_project(H_sub, s_sub, p_flip)
 
-    # enumerate all z ∈ {0,1}^r
-    best_cost = float("inf"); best_e = None
-    # bit patterns from 0..(2^r - 1)
-    for z_int in range(1 << r):
-        # build e = e0 ⊕ N z
-        z_bits = np.frombuffer(np.array([z_int], dtype=np.uint64), dtype=np.uint8)
-        # compute Nz efficiently: sum columns where z_k=1 (mod2)
-        e = e0.copy()
-        k = 0; zz = z_int
-        while zz:
-            if zz & 1:
-                e ^= N[:, k]
-            k += 1
-            zz >>= 1
-        # if r small, the loop above is fine; else vectorize (but r<=r_cap)
-        cost = float(np.dot(w, e))
-        if cost < best_cost:
-            best_cost = cost; best_e = e
+    N_bool = (N != 0)
+    columns = [N[:, idx].astype(np.uint8) for idx in range(r)]
+    suffix_cover = np.zeros((r + 1, N.shape[0]), dtype=bool)
+    for idx in range(r - 1, -1, -1):
+        suffix_cover[idx] = suffix_cover[idx + 1] | N_bool[:, idx]
+
+    e = e0.copy()
+    cost = float(np.dot(w, e))
+    best_cost = cost
+    best_e = e.copy()
+    visited = 0
+    pruned = 0
+
+    def lower_bound(idx: int) -> float:
+        cover = suffix_cover[idx]
+        fixed = ~cover
+        bound = 0.0
+        if fixed.any():
+            bound += float(np.dot(w[fixed], e[fixed].astype(np.float64)))
+        if cover.any():
+            bound += float(np.sum(np.minimum(0.0, w[cover])))
+        return bound
+
+    def search(idx: int) -> None:
+        nonlocal cost, best_cost, best_e, visited, pruned, e
+        lb = lower_bound(idx)
+        if lb >= best_cost - 1e-12:
+            pruned += 1
+            return
+        if idx == r:
+            visited += 1
+            if cost < best_cost - 1e-12:
+                best_cost = cost
+                best_e = e.copy()
+            return
+
+        column = columns[idx]
+        delta = _delta_cost(e, column, w)
+
+        # Prefer beneficial flip branch first to tighten best_cost sooner
+        if delta < 0:
+            e ^= column
+            cost += delta
+            search(idx + 1)
+            cost -= delta
+            e ^= column
+            search(idx + 1)
+        else:
+            search(idx + 1)
+            e ^= column
+            cost += delta
+            search(idx + 1)
+            cost -= delta
+            e ^= column
+
+    search(0)
+
+    if stats_out is not None:
+        stats_out.update(states_visited=visited, states_pruned=pruned)
+
     return best_e.astype(np.uint8)
+
+
+def _delta_cost(e: np.ndarray, column: np.ndarray, w: np.ndarray) -> float:
+    mask = column.astype(bool)
+    if not mask.any():
+        return 0.0
+    bits = e[mask].astype(np.float64)
+    return float(np.dot(w[mask], 1.0 - 2.0 * bits))
 
 
 def active_components(H: sp.csr_matrix, s: np.ndarray, *, halo: int = 0) -> Tuple[List[np.ndarray], List[np.ndarray]]:

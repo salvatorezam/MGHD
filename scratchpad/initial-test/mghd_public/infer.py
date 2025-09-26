@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import inspect
+import math
+import time
+from collections import defaultdict
+from types import SimpleNamespace
+from typing import Any, Dict, List, Tuple, Sequence
+
 import numpy as np
 import scipy.sparse as sp
-import time
 import torch
-from typing import Any, Dict, List, Tuple
 
 from .config import MGHDConfig
 from .model import load_mghd_checkpoint
 from .features import features_rotated_d3, features_from_subgraph
+from .features_v2 import pack_cluster, PackedCrop, infer_bucket_id
+from mghd_clustered.microbatcher import CrossShotBatcher, stack_crops_pinned
+from mghd_clustered.cluster_core import gf2_nullspace
 
 
 __all__ = ['warmup_and_capture', 'MGHDDecoderPublic', 'load_mghd_auto']
@@ -288,6 +295,217 @@ def _collate_flat_batches(batches: List[Dict[str, torch.Tensor]]) -> Dict[str, t
     }
 
 
+def _pad_to_multiple(value: int, base: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    if base <= 0:
+        raise ValueError("base must be positive")
+    padded = int(math.ceil(max(value, 1) / base) * base)
+    if minimum is not None:
+        padded = max(padded, minimum)
+    if maximum is not None:
+        padded = min(padded, maximum)
+    return padded
+
+
+def _v2_bucket_key(H_sub: sp.csr_matrix, *, max_nodes: int = 512, max_edges: int = 4096, max_seq: int = 512) -> Tuple[int, int, int]:
+    n_checks, n_qubits = H_sub.shape
+    nodes = n_checks + n_qubits
+    edges = int(H_sub.nnz)
+    seq = n_checks
+    node_pad = _pad_to_multiple(nodes, 8, minimum=16, maximum=max_nodes)
+    edge_pad = _pad_to_multiple(max(edges, 1), 16, minimum=32, maximum=max_edges)
+    seq_pad = _pad_to_multiple(seq, 8, minimum=8, maximum=max_seq)
+    return (node_pad, edge_pad, seq_pad)
+
+
+def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if tensor.device == device:
+        return tensor
+    return tensor.to(device, non_blocking=True)
+
+
+def _collate_v2_batch(
+    entries: List[Tuple[sp.csr_matrix, np.ndarray, np.ndarray, np.ndarray | None]],
+    extras: List[Dict[str, Any]],
+    bucket: Tuple[int, int, int],
+) -> Tuple[SimpleNamespace, List[Dict[str, Any]]]:
+    node_pad, edge_pad, seq_pad = bucket
+    packed_crops: List[PackedCrop] = []
+    cluster_infos: List[Dict[str, Any]] = []
+
+    for (H_sub, s_sub, _q_l2g, _c_l2g), extra in zip(entries, extras):
+        pack = pack_cluster(
+            H_sub=H_sub.toarray(),
+            xy_qubit=extra["xy_qubit"],
+            xy_check=extra["xy_check"],
+            synd_Z_then_X_bits=np.asarray(s_sub, dtype=np.uint8),
+            k=extra["k"],
+            r=extra["r"],
+            bbox_xywh=extra["bbox"],
+            kappa_stats=extra["kappa_stats"],
+            y_bits_local=np.zeros(extra["k"], dtype=np.uint8),
+            side=extra["side"],
+            d=extra["d"],
+            p=extra["p"],
+            seed=0,
+            N_max=node_pad,
+            E_max=edge_pad,
+            S_max=seq_pad,
+            add_jump_edges=False,
+        )
+        packed_crops.append(pack)
+
+    B = len(packed_crops)
+    if B == 0:
+        raise ValueError("_collate_v2_batch requires at least one crop")
+
+    feat_dim = packed_crops[0].x_nodes.shape[1]
+    edge_feat_dim = packed_crops[0].edge_attr.shape[1]
+    g_dim = int(packed_crops[0].g_token.numel())
+
+    x_nodes = torch.zeros((B, node_pad, feat_dim), dtype=torch.float32)
+    node_mask = torch.zeros((B, node_pad), dtype=torch.bool)
+    node_type = torch.zeros((B, node_pad), dtype=torch.int8)
+    g_tokens = torch.zeros((B, g_dim), dtype=torch.float32)
+
+    edge_index = torch.zeros((2, B * edge_pad), dtype=torch.long)
+    edge_attr = torch.zeros((B * edge_pad, edge_feat_dim), dtype=torch.float32)
+    edge_mask = torch.zeros((B * edge_pad,), dtype=torch.bool)
+
+    seq_idx = torch.zeros((B * seq_pad,), dtype=torch.long)
+    seq_mask = torch.zeros((B * seq_pad,), dtype=torch.bool)
+
+    node_offset = 0
+
+    for i, (pack, extra, entry) in enumerate(zip(packed_crops, extras, entries)):
+        H_sub, _s_sub, q_l2g, _c_l2g = entry
+
+        x_nodes[i, :, :] = pack.x_nodes
+        node_mask[i, :] = pack.node_mask
+        node_type[i, :] = pack.node_type
+        g_tokens[i, :] = pack.g_token.view(-1).to(torch.float32)
+
+        edge_base = i * edge_pad
+        seq_base = i * seq_pad
+
+        edge_index[:, edge_base : edge_base + edge_pad] = pack.edge_index + node_offset
+        edge_attr[edge_base : edge_base + edge_pad, :] = pack.edge_attr
+        edge_mask[edge_base : edge_base + edge_pad] = pack.edge_mask
+
+        seq_idx[seq_base : seq_base + seq_pad] = pack.seq_idx + node_offset
+        seq_mask[seq_base : seq_base + seq_pad] = pack.seq_mask
+
+        data_positions = torch.nonzero((pack.node_type == 0) & pack.node_mask, as_tuple=False).squeeze(-1)
+
+        cluster_infos.append(
+            dict(
+                data_idx=(data_positions + node_offset),
+                q_l2g=q_l2g,
+                nullity=int(extra["r"]),
+                data_count=int(extra["k"]),
+                bucket=bucket,
+            )
+        )
+
+        node_offset += node_pad
+
+    batch = SimpleNamespace(
+        x_nodes=x_nodes,
+        node_mask=node_mask,
+        node_type=node_type,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        edge_mask=edge_mask,
+        seq_idx=seq_idx,
+        seq_mask=seq_mask,
+        g_token=g_tokens,
+        batch_size=B,
+        nodes_pad=node_pad,
+        edges_pad=edge_pad,
+        seq_pad=seq_pad,
+        bucket=bucket,
+    )
+
+    return batch, cluster_infos
+
+
+def _get_v2_graph_state(
+    cache: Dict[Tuple[int, int, int, int], Dict[str, Any]],
+    key: Tuple[int, int, int],
+    batch_size: int,
+    packed: SimpleNamespace,
+    model,
+) -> Dict[str, Any]:
+    full_key = (key[0], key[1], key[2], batch_size)
+    state = cache.get(full_key)
+    if state is not None:
+        return state
+
+    tensors: Dict[str, torch.Tensor] = {}
+    for attr in ("x_nodes", "node_mask", "node_type", "edge_index", "edge_attr", "edge_mask", "seq_idx", "seq_mask", "g_token"):
+        value = getattr(packed, attr)
+        tensors[attr] = value.clone()
+
+    static_ns = SimpleNamespace(**tensors)
+    if tensors["x_nodes"].is_cuda:
+        # Warm up once outside of the capture so modules that lazily allocate
+        # device state (e.g. v2's adaptive global projection) are materialised
+        # before we enter CUDA graph capture. Otherwise CUDA forbids those ops
+        # during capture and we observe "operation not permitted" failures.
+        with torch.cuda.device(tensors["x_nodes"].device):
+            with torch.no_grad():
+                model(static_ns)
+            torch.cuda.synchronize(tensors["x_nodes"].device)
+    else:
+        pass
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        logits, _ = model(static_ns)
+    state = dict(graph=graph, tensors=tensors, output=logits)
+    cache[full_key] = state
+    return state
+
+
+def _run_v2_batch(
+    decoder,
+    bucket: Tuple[int, int, int],
+    batch: SimpleNamespace,
+) -> torch.Tensor:
+    device = decoder.device
+    pack_device = SimpleNamespace(
+        x_nodes=_to_device(batch.x_nodes, device),
+        node_mask=_to_device(batch.node_mask, device),
+        node_type=_to_device(batch.node_type, device),
+        edge_index=_to_device(batch.edge_index, device),
+        edge_attr=_to_device(batch.edge_attr, device),
+        edge_mask=_to_device(batch.edge_mask, device),
+        seq_idx=_to_device(batch.seq_idx, device),
+        seq_mask=_to_device(batch.seq_mask, device),
+        g_token=_to_device(batch.g_token, device),
+        batch_size=batch.batch_size,
+        nodes_pad=batch.nodes_pad,
+    )
+
+    if device.type == "cuda" and decoder._graph_capture_enabled:
+        try:
+            state = _get_v2_graph_state(decoder._v2_graph_states, bucket, batch.batch_size, pack_device, decoder.model)
+            for name, tensor in state["tensors"].items():
+                tensor.copy_(getattr(pack_device, name))
+            state["graph"].replay()
+            logits = state["output"]
+            decoder._last_graph_used = True
+            return logits
+        except RuntimeError:
+            # CUDA graph capture may fail for certain dynamic control-flow
+            # patterns. Disable capture for the remainder of the session and
+            # fall back to eager execution so validation can proceed.
+            decoder._graph_capture_enabled = False
+            decoder._v2_graph_states.clear()
+            decoder._last_graph_used = False
+
+    logits, _ = decoder.model(pack_device)
+    return logits
+
+
 class MGHDDecoderPublic:
     """Thin wrapper around the training MGHD module for inference."""
 
@@ -307,8 +525,13 @@ class MGHDDecoderPublic:
         if expert == "auto":
             self.model, self.load_info = load_mghd_auto(ckpt_path, cfg, device=device)
             self.model_version = self.load_info["version"]
+        elif expert == "v2":
+            self.model, self.load_info = load_mghd_auto(ckpt_path, cfg, device=device)
+            if self.load_info.get("version") != "v2":
+                raise ValueError("Requested expert='v2' but checkpoint is not a v2 model")
+            self.model_version = "v2"
         else:
-            # Legacy path: assume v1 if not auto
+            # Legacy path: assume v1 if not auto/v2
             if cfg is None:
                 cfg = MGHDConfig(n_checks=72, n_qubits=72, n_node_inputs=4)
             self.model, self.load_info = load_mghd_checkpoint(ckpt_path, cfg, device=device)
@@ -337,6 +560,8 @@ class MGHDDecoderPublic:
         self._graph_capture_enabled = bool(graph_capture) and self.device.type == "cuda"
         self._graph_max_batch = int(max(1, max_batch_d3))
         self._graph_state = None  # lazily created for fixed d=3 batching
+        self._v2_graph_states: Dict[Tuple[int, int, int, int], Dict[str, Any]] = {}
+        self._last_graph_used = False
 
     def bind_code(self, Hx: sp.csr_matrix, Hz: sp.csr_matrix) -> None:
         self._Hx = Hx.tocsr()
@@ -375,31 +600,14 @@ class MGHDDecoderPublic:
             info.setdefault("name", str(self.device))
         return info
 
-    def _call_model(self, feats: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # Handle v2 models that expect PackedCrop format
+    def _call_model(self, feats: Dict[str, torch.Tensor] | PackedCrop) -> torch.Tensor:
+        if isinstance(feats, PackedCrop):
+            logits, _ = self.model(feats)
+            return logits
+
         if self.model_version == "v2":
-            try:
-                from .features_v2 import PackedCrop
-                
-                # Convert features to PackedCrop format
-                packed = PackedCrop(
-                    x_nodes=feats["node_inputs_flat"],
-                    node_mask=torch.ones(feats["node_inputs_flat"].shape[0], dtype=torch.bool, device=self.device),
-                    node_type=torch.ones(feats["node_inputs_flat"].shape[0], dtype=torch.int8, device=self.device),  # Default node type
-                    edge_index=feats.get("edge_index", torch.stack([feats["src_ids"], feats["dst_ids"]], dim=0)),
-                    edge_attr=feats.get("edge_attr", torch.ones((feats["src_ids"].shape[0], 1), device=self.device)),
-                    edge_mask=torch.ones(feats["src_ids"].shape[0], dtype=torch.bool, device=self.device),
-                    seq_mask=torch.ones(min(128, feats["node_inputs_flat"].shape[0] // 2), dtype=torch.bool, device=self.device),  # Default sequence mask
-                    g_token=torch.zeros(64, device=self.device),  # Default global token
-                )
-                
-                logits, node_mask = self.model(packed)
-                return logits
-                
-            except Exception:
-                # Fallback to v1 calling mechanism
-                pass
-        
+            raise RuntimeError("PackedCrop features required for MGHD v2 model")
+
         # v1 model calling (original logic)
         m = self.model
         sig = inspect.signature(m.forward)
@@ -473,6 +681,7 @@ class MGHDDecoderPublic:
             "fallback_loops": 0,
             "batch_sizes": [],
             "graph_used": False,
+            "graph_used_shots": 0,
             "device": self._device_info(),
         }
 
@@ -671,6 +880,9 @@ class MGHDDecoderPublic:
         if side not in {"X", "Z"}:
             raise ValueError("side must be 'X' or 'Z'")
 
+        if self.model_version == "v2":
+            raise NotImplementedError("priors_from_syndrome is not supported for MGHD v2 models")
+
         vec = np.zeros(self._n_z + self._n_x, dtype=np.float32)
         if side == "Z":
             vec[: self._n_z] = np.asarray(s, dtype=np.float32).ravel()
@@ -693,6 +905,8 @@ class MGHDDecoderPublic:
 
     @torch.no_grad()
     def priors_from_subgraph(self, H_sub: sp.csr_matrix, s_sub: np.ndarray, *, temp: float = 1.0) -> np.ndarray:
+        if self.model_version == "v2":
+            raise NotImplementedError("Use priors_from_subgraphs_batched with metadata for MGHD v2 models")
         feats = features_from_subgraph(H_sub, s_sub, n_node_inputs=self.cfg.n_node_inputs)
         raw = self._call_model(feats)
         m_sub = int(feats["n_checks"]); n_sub = int(feats["n_qubits"])
@@ -737,6 +951,10 @@ class MGHDDecoderPublic:
         temp: float = 1.0,
         bucket: str | None = None,
         use_masked_fullgraph_fallback: bool = True,
+        bucket_spec: Sequence[Tuple[int, int, int]] | None = None,
+        microbatch: int = 64,
+        flush_ms: float = 1.0,
+        use_graphs: bool = True,
     ) -> Tuple[List[np.ndarray], Dict[str, Any]]:
         """Return per-cluster priors using a single MGHD forward when possible."""
 
@@ -744,14 +962,19 @@ class MGHDDecoderPublic:
             return [], self._init_mb_report()
 
         processed: List[Tuple[sp.csr_matrix, np.ndarray, np.ndarray, np.ndarray | None]] = []
+        extras: List[Dict[str, Any] | None] = []
         feats: List[Dict[str, torch.Tensor]] = []
 
         for entry in items:
             if len(entry) == 3:
                 H_sub, s_sub, q_l2g = entry  # type: ignore[misc]
                 c_l2g = None
+                extra = None
+            elif len(entry) >= 5:
+                H_sub, s_sub, q_l2g, c_l2g, extra = entry[:5]  # type: ignore[misc]
             elif len(entry) >= 4:
                 H_sub, s_sub, q_l2g, c_l2g = entry[:4]  # type: ignore[misc]
+                extra = None
             else:
                 raise ValueError("Each item must provide at least (H_sub, s_sub, q_l2g)")
 
@@ -766,11 +989,25 @@ class MGHDDecoderPublic:
                     None if c_l2g is None else np.asarray(c_l2g, dtype=np.int64),
                 )
             )
-            feats.append(features_from_subgraph(H_sub, s_sub, n_node_inputs=self.cfg.n_node_inputs))
+            extras.append(extra)
+            if self.model_version != "v2":
+                feats.append(features_from_subgraph(H_sub, s_sub, n_node_inputs=self.cfg.n_node_inputs))
 
         report = self._init_mb_report()
         batch_size = len(processed)
         report["batch_sizes"].append(batch_size)
+        if self.model_version == "v2":
+            probs_list, v2_report = self._priors_from_subgraphs_v2(
+                processed,
+                extras,
+                temp=temp,
+                bucket_spec=bucket_spec,
+                microbatch=microbatch,
+                flush_ms=flush_ms,
+                use_graphs=use_graphs,
+            )
+            report.update({k: v2_report.get(k, report.get(k)) for k in v2_report})
+            return probs_list, report
         try:
             batch = _collate_flat_batches(feats)
             meta = batch.pop("meta")
@@ -816,3 +1053,191 @@ class MGHDDecoderPublic:
                 final_probs.append(np.asarray(probs_full, dtype=np.float64)[q_l2g])
             fallback_report["batch_sizes"] = [batch_size]
             return final_probs, fallback_report
+
+        raise RuntimeError("priors_from_subgraphs_batched failed to produce probabilities")
+
+    def _move_packed_crop(self, packed: PackedCrop, device: torch.device) -> PackedCrop:
+        tensor_fields = (
+            "x_nodes",
+            "node_mask",
+            "node_type",
+            "edge_index",
+            "edge_attr",
+            "edge_mask",
+            "seq_idx",
+            "seq_mask",
+            "g_token",
+            "y_bits",
+        )
+        for field in tensor_fields:
+            value = getattr(packed, field, None)
+            if torch.is_tensor(value):
+                setattr(packed, field, value.to(device))
+        return packed
+
+    def _priors_from_subgraphs_v2(
+        self,
+        processed: List[Tuple[sp.csr_matrix, np.ndarray, np.ndarray, np.ndarray | None]],
+        extras: List[Dict[str, Any] | None],
+        *,
+        temp: float,
+        bucket_spec: Sequence[Tuple[int, int, int]] | None,
+        microbatch: int,
+        flush_ms: float,
+        use_graphs: bool,
+    ) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+        if any(extra is None for extra in extras):
+            raise ValueError("V2 model requires geometry metadata for every subgraph")
+
+        if not processed:
+            return [], self._init_mb_report()
+
+        device = self.device
+        use_graphs = bool(use_graphs and self._graph_capture_enabled and device.type == "cuda")
+
+        if not bucket_spec:
+            buckets = sorted({_v2_bucket_key(entry[0]) for entry in processed})
+            bucket_spec = buckets
+        bucket_spec = tuple(bucket_spec)
+
+        batcher = CrossShotBatcher(
+            bucket_spec=bucket_spec,
+            microbatch=microbatch,
+            flush_ms=flush_ms,
+            pin_host=True,
+        )
+
+        report = self._init_mb_report()
+        report.setdefault("bucket_histogram", {})
+        report.setdefault("graph_used_shots", 0)
+
+        final_probs: List[np.ndarray | None] = [None] * len(processed)
+
+        class _BucketContext:
+            def __init__(self, decoder: "MGHDDecoderPublic", meta: Dict[str, int], enabled: bool) -> None:
+                self.decoder = decoder
+                self.model = decoder.model
+                self.device = decoder.device
+                self.meta = meta
+                self.enabled = enabled
+                self.static_inputs: SimpleNamespace | None = None
+                self.static_output: Tuple[torch.Tensor, torch.Tensor] | None = None
+                self.graph: torch.cuda.CUDAGraph | None = None
+                self.graph_used = 0
+
+            def ensure(self) -> None:
+                if not self.enabled or self.graph is not None:
+                    return
+                try:
+                    self.static_inputs = self.model.allocate_static_batch(
+                        batch_size=self.meta["batch_size"],
+                        nodes_pad=self.meta["nodes_pad"],
+                        edges_pad=self.meta["edges_pad"],
+                        seq_pad=self.meta["seq_pad"],
+                        feat_dim=self.meta["feat_dim"],
+                        edge_feat_dim=self.meta["edge_feat_dim"],
+                        g_dim=self.meta["g_dim"],
+                        device=self.device,
+                    )
+                    warm_logits, warm_mask = self.model(self.static_inputs)
+                    torch.cuda.synchronize(self.device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        logits_cap, mask_cap = self.model(self.static_inputs)
+                    self.static_output = (logits_cap, mask_cap)
+                    self.graph = graph
+                except Exception:
+                    self.enabled = False
+                    self.static_inputs = None
+                    self.static_output = None
+                    self.graph = None
+
+            def run(self, host_batch: SimpleNamespace) -> Tuple[Tuple[torch.Tensor, torch.Tensor], bool]:
+                if self.enabled and self.graph is not None and self.static_inputs is not None and self.static_output is not None:
+                    self.model.copy_into_static(self.static_inputs, host_batch, non_blocking=True)
+                    torch.cuda.synchronize(self.device)
+                    self.graph.replay()
+                    torch.cuda.synchronize(self.device)
+                    self.graph_used += host_batch.batch_size
+                    return self.model.gather_from_static(self.static_output), True
+                dev_batch = self.model.move_packed_to_device(host_batch, self.device)
+                return self.model(dev_batch), False
+
+        bucket_contexts: Dict[Tuple[int, int], _BucketContext] = {}
+        report_graph_used = False
+
+        def process_ready(ready: Dict[int, List[PackedCrop]]) -> None:
+            nonlocal report_graph_used
+            for bucket_id, crops in ready.items():
+                if not crops:
+                    continue
+                host_batch, cluster_infos, meta = stack_crops_pinned(crops, pin=True)
+                ctx_key = (bucket_id, meta["batch_size"])
+                ctx = bucket_contexts.get(ctx_key)
+                if ctx is None:
+                    ctx = _BucketContext(self, meta, use_graphs)
+                    if use_graphs:
+                        ctx.ensure()
+                    bucket_contexts[ctx_key] = ctx
+                outputs, used_graph = ctx.run(host_batch)
+                logits, node_mask = outputs
+                self._last_graph_used = used_graph
+                cluster_probs_t = self.model.scatter_outputs(logits, cluster_infos, temp=temp)
+                for info, probs_tensor in zip(cluster_infos, cluster_probs_t):
+                    idx = info.get("record_index")
+                    if idx is None:
+                        raise RuntimeError("Packed crop is missing record index for scattering")
+                    final_probs[idx] = probs_tensor.detach().cpu().numpy().astype(np.float64)
+
+                report["fast_path_batches"] += 1
+                report["batch_sizes"].append(len(crops))
+                bucket_key = f"{meta['nodes_pad']}-{meta['edges_pad']}-{meta['seq_pad']}"
+                hist = report.setdefault("bucket_histogram", {})
+                hist[bucket_key] = hist.get(bucket_key, 0) + len(crops)
+                if used_graph:
+                    report_graph_used = True
+                    report["graph_used_shots"] = report.get("graph_used_shots", 0) + len(crops)
+
+        now_ms = lambda: time.monotonic() * 1e3
+
+        for idx, (entry, extra) in enumerate(zip(processed, extras)):
+            assert extra is not None
+            H_sub, s_sub, q_l2g, c_l2g = entry
+            pack = pack_cluster(
+                H_sub=H_sub.toarray(),
+                xy_qubit=extra["xy_qubit"],
+                xy_check=extra["xy_check"],
+                synd_Z_then_X_bits=np.asarray(s_sub, dtype=np.uint8),
+                k=extra["k"],
+                r=extra["r"],
+                bbox_xywh=extra["bbox"],
+                kappa_stats=extra["kappa_stats"],
+                y_bits_local=np.zeros(extra["k"], dtype=np.uint8),
+                side=extra["side"],
+                d=extra["d"],
+                p=extra["p"],
+                seed=0,
+                N_max=None,
+                E_max=None,
+                S_max=None,
+                bucket_spec=bucket_spec,
+                add_jump_edges=False,
+            )
+            setattr(pack, "_record_index", idx)
+            batcher.add(pack)
+            ready = batcher.pop_ready_batches()
+            if ready:
+                process_ready(ready)
+            if batcher.flush_due(now_ms()):
+                ready = batcher.pop_ready_batches()
+                if ready:
+                    process_ready(ready)
+
+        for bucket_id, crops in batcher.finalize():
+            process_ready({bucket_id: crops})
+
+        if any(prob is None for prob in final_probs):
+            raise RuntimeError("priors_from_subgraphs_batched failed to produce probabilities")
+
+        report["graph_used"] = report_graph_used
+        return [prob for prob in final_probs if prob is not None], report

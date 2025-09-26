@@ -1,7 +1,7 @@
 # NOTE: No CUDA/CUDA-Q initialization at import.
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, Sequence
 import math
 import numpy as np
 import torch
@@ -19,6 +19,10 @@ class CropMeta:
     kappa: int               # cluster size (nodes)
     seed: int
     sha_short: str = ""
+    bucket_id: int = -1
+    pad_nodes: int = 0
+    pad_edges: int = 0
+    pad_seq: int = 0
 
 @dataclass
 class PackedCrop:
@@ -111,6 +115,15 @@ def hilbert_order_within_bbox(check_xy: np.ndarray, bbox_xywh: Tuple[int,int,int
 
 # ---- Public packer ----------------------------------------------------------
 
+def infer_bucket_id(n_nodes: int, n_edges: int, n_seq: int, bucket_spec: Sequence[Tuple[int, int, int]]) -> int:
+    for idx, (node_cap, edge_cap, seq_cap) in enumerate(bucket_spec):
+        if n_nodes <= node_cap and n_edges <= edge_cap and n_seq <= seq_cap:
+            return idx
+    raise ValueError(
+        f"No bucket accommodates nodes={n_nodes}, edges={n_edges}, seq={n_seq}"
+    )
+
+
 def pack_cluster(
     H_sub: np.ndarray,
     xy_qubit: np.ndarray,
@@ -126,9 +139,10 @@ def pack_cluster(
     d: int,
     p: float,
     seed: int,
-    N_max: int,
-    E_max: int,
-    S_max: int,
+    N_max: Optional[int],
+    E_max: Optional[int],
+    S_max: Optional[int],
+    bucket_spec: Optional[Sequence[Tuple[int, int, int]]] = None,
     add_jump_edges: bool = True,
     jump_k: int = 2,
 ) -> PackedCrop:
@@ -214,6 +228,14 @@ def pack_cluster(
     N = nQ + nC
     E_tot = edge_index.shape[1]
     S = nC
+    if bucket_spec:
+        bucket_idx = infer_bucket_id(N, E_tot, S, bucket_spec)
+        N_max, E_max, S_max = bucket_spec[bucket_idx]
+    else:
+        bucket_idx = -1
+        if N_max is None or E_max is None or S_max is None:
+            raise ValueError("N_max, E_max, S_max must be provided when bucket_spec is None")
+
     assert N <= N_max and E_tot <= E_max and S <= S_max, "Increase pad limits."
 
     x_nodes = torch.zeros((N_max, base_nodes.shape[1]), dtype=torch.float32)
@@ -239,7 +261,20 @@ def pack_cluster(
     # Place labels only on data-qubit section [0:nQ)
     y_bits_t[:nQ] = torch.from_numpy(y_bits_local.astype(np.int8))
 
-    meta = CropMeta(k=k, r=r, bbox_xywh=bbox_xywh, side=side, d=d, p=p, kappa=int(kappa_stats.get("size", N)), seed=seed)
+    meta = CropMeta(
+        k=k,
+        r=r,
+        bbox_xywh=bbox_xywh,
+        side=side,
+        d=d,
+        p=p,
+        kappa=int(kappa_stats.get("size", N)),
+        seed=seed,
+        bucket_id=bucket_idx,
+        pad_nodes=int(N_max),
+        pad_edges=int(E_max),
+        pad_seq=int(S_max),
+    )
     return PackedCrop(
         x_nodes=x_nodes, node_mask=node_mask, node_type=node_type_t,
         edge_index=edge_index_t, edge_attr=edge_attr_t, edge_mask=edge_mask,
@@ -250,4 +285,4 @@ def pack_cluster(
         idx_check_local=np.arange(nC, dtype=np.int32),
     )
 
-__all__ = ["CropMeta","PackedCrop","pack_cluster","hilbert_order_within_bbox"]
+__all__ = ["CropMeta","PackedCrop","pack_cluster","hilbert_order_within_bbox","infer_bucket_id"]

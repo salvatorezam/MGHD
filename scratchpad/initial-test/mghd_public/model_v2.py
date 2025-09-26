@@ -3,7 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Sequence, Dict, List
+from types import SimpleNamespace
 
 ## ---- REQUIRED building blocks from your stack (fail-fast if missing) ----
 from poc_my_models import ChannelSE as _ChannelSE         # Channel squeeze-excitation
@@ -130,29 +131,111 @@ class MGHDv2(nn.Module):
         x = packed.x_nodes.float()
         eidx = packed.edge_index.long()
         eatt = packed.edge_attr.float()
-        nmask = packed.node_mask.bool()
         emask = packed.edge_mask.bool()
-        gtok  = packed.g_token.float()
-        
-        # project inputs with adaptive global projection
-        if self.g_proj is None or self.g_proj.in_features != gtok.size(0):
-            self.g_proj = nn.Linear(gtok.size(0), self.node_in.out_features).to(gtok.device)
-        
-        x = self.node_in(x) + self.g_proj(gtok).unsqueeze(0)  # broadcast global token
+        gtok = packed.g_token.float()
+
+        # Handle node-level tensors that may include an explicit batch dimension.
+        if x.dim() == 3:
+            batch_size, nodes_pad, feat_dim = x.shape
+            x = x.view(batch_size * nodes_pad, feat_dim)
+            nmask = packed.node_mask.view(batch_size * nodes_pad).bool()
+            node_type = packed.node_type.view(batch_size * nodes_pad).long()
+        else:
+            batch_size = 1
+            nodes_pad = x.shape[0]
+            nmask = packed.node_mask.bool()
+            node_type = packed.node_type.long()
+
+        # Adaptive global-token projection. Accept either [F] or [B, F].
+        if gtok.dim() == 2:
+            g_dim = gtok.size(-1)
+            if self.g_proj is None or self.g_proj.in_features != g_dim:
+                self.g_proj = nn.Linear(g_dim, self.node_in.out_features).to(gtok.device)
+            g_bias = self.g_proj(gtok)  # [B, d_model]
+            g_bias = g_bias.unsqueeze(1).expand(batch_size, nodes_pad, -1).reshape(batch_size * nodes_pad, -1)
+        else:
+            g_dim = gtok.numel()
+            if self.g_proj is None or self.g_proj.in_features != g_dim:
+                self.g_proj = nn.Linear(g_dim, self.node_in.out_features).to(gtok.device)
+            g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0)
+            g_bias = g_bias.expand(x.shape[0], -1)
+
+        x = self.node_in(x) + g_bias
         e = self.edge_in(eatt)
-        
+
         # 1) Mamba over check sequence (Z-then-X; Hilbert within bbox)
-        x = self.seq_encoder(x, packed.seq_idx, packed.seq_mask, node_type=packed.node_type)
-        
+        x = self.seq_encoder(x, packed.seq_idx.long(), packed.seq_mask.bool(), node_type=node_type)
+
         # 2) Channel-SE (apply to all nodes, expecting [B, T, C] format)
         # Reshape x to [1, N, d_model] for ChannelSE which expects [B, T, C]
         x_se_input = x.unsqueeze(0)  # [1, N, d_model]
         x_se_output = self.se(x_se_input)  # [1, N, d_model]
         x = x_se_output.squeeze(0)  # Back to [N, d_model]
-        
+
         # 3) Astra GNN -> per-node binary head
         logits = self.gnn(x, eidx, e, nmask, emask)
         return logits, nmask
+
+    # --- Static batch helpers for CUDA graph capture ---
+    def allocate_static_batch(
+        self,
+        *,
+        batch_size: int,
+        nodes_pad: int,
+        edges_pad: int,
+        seq_pad: int,
+        feat_dim: int,
+        edge_feat_dim: int,
+        g_dim: int,
+        device: torch.device,
+    ) -> SimpleNamespace:
+        def zeros(shape, dtype):
+            return torch.zeros(shape, dtype=dtype, device=device)
+
+        return SimpleNamespace(
+            x_nodes=zeros((batch_size, nodes_pad, feat_dim), torch.float32),
+            node_mask=zeros((batch_size, nodes_pad), torch.bool),
+            node_type=zeros((batch_size, nodes_pad), torch.int8),
+            edge_index=zeros((2, batch_size * edges_pad), torch.long),
+            edge_attr=zeros((batch_size * edges_pad, edge_feat_dim), torch.float32),
+            edge_mask=zeros((batch_size * edges_pad,), torch.bool),
+            seq_idx=zeros((batch_size * seq_pad,), torch.long),
+            seq_mask=zeros((batch_size * seq_pad,), torch.bool),
+            g_token=zeros((batch_size, g_dim), torch.float32),
+            batch_size=batch_size,
+            nodes_pad=nodes_pad,
+        )
+
+    def copy_into_static(self, static_ns: SimpleNamespace, host_ns: SimpleNamespace, *, non_blocking: bool = True) -> None:
+        for name in ("x_nodes", "node_mask", "node_type", "edge_index", "edge_attr", "edge_mask", "seq_idx", "seq_mask", "g_token"):
+            getattr(static_ns, name).copy_(getattr(host_ns, name), non_blocking=non_blocking)
+
+    def move_packed_to_device(self, host_ns: SimpleNamespace, device: torch.device) -> SimpleNamespace:
+        tensors = {}
+        for name in ("x_nodes", "node_mask", "node_type", "edge_index", "edge_attr", "edge_mask", "seq_idx", "seq_mask", "g_token"):
+            tensor = getattr(host_ns, name)
+            tensors[name] = tensor.to(device, non_blocking=True)
+        tensors["batch_size"] = host_ns.batch_size
+        tensors["nodes_pad"] = host_ns.nodes_pad
+        return SimpleNamespace(**tensors)
+
+    def gather_from_static(self, static_output: Sequence[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        logits, node_mask = static_output
+        return logits, node_mask
+
+    def scatter_outputs(
+        self,
+        logits: torch.Tensor,
+        cluster_infos: Sequence[Dict[str, torch.Tensor]],
+        *,
+        temp: float = 1.0,
+    ) -> List[torch.Tensor]:
+        probs_all = torch.sigmoid((logits[:, 1] - logits[:, 0]) / float(temp)).clamp(1e-6, 1 - 1e-6)
+        out: List[torch.Tensor] = []
+        for info in cluster_infos:
+            data_idx = info["data_idx"].to(probs_all.device)
+            out.append(probs_all.index_select(0, data_idx))
+        return out
 
     # --- Interface shims for v1 parity with infer/eval pipelines ---
     def set_authoritative_mats(self, Hx=None, Hz=None, device=None):
