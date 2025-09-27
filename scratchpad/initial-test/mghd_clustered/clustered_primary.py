@@ -152,16 +152,22 @@ class MGHDPrimaryClustered:
             raise ValueError(f"Invalid micro-batch mode: {mode}")
         return mode
 
-    def decode(self, s: np.ndarray, *, batched: bool | str | None = None) -> Dict[str, Any]:
+    def decode(
+        self,
+        s: np.ndarray,
+        *,
+        batched: bool | str | None = None,
+        perf_only: bool = False,
+    ) -> Dict[str, Any]:
         """Decode one syndrome vector with optional micro-batch override."""
         mode = self._resolve_mode(batched)
-        return self._decode_impl(s, mode=mode)
+        return self._decode_impl(s, mode=mode, perf_only=perf_only)
 
-    def decode_unbatched(self, s: np.ndarray) -> Dict[str, Any]:
+    def decode_unbatched(self, s: np.ndarray, *, perf_only: bool = False) -> Dict[str, Any]:
         """Legacy single-cluster path (micro-batching disabled)."""
-        return self._decode_impl(s, mode="unbatched")
+        return self._decode_impl(s, mode="unbatched", perf_only=perf_only)
 
-    def _decode_impl(self, s: np.ndarray, *, mode: str) -> Dict[str, Any]:
+    def _decode_impl(self, s: np.ndarray, *, mode: str, perf_only: bool = False) -> Dict[str, Any]:
         n = self.H.shape[1]
         s = np.asarray(s, dtype=np.uint8).ravel()
         t0 = time.perf_counter()
@@ -389,6 +395,7 @@ class MGHDPrimaryClustered:
             mghd_invoked=tier0_stats["mghd_invoked"],
             p_channel_used=tier0_stats["p_channel_used"],
             tier0_stats=tier0_stats,
+            perf_only=perf_only,
         )
 
     def set_tier0_k_max(self, k: int):

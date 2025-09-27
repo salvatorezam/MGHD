@@ -22,19 +22,6 @@ def short_sha(*objs) -> str:
             h.update(repr(o).encode())
     return h.hexdigest()[:8]
 
-def cudaq_sample_syndrome(d: int, p: float, side: str, seed: int):
-    # Initialize CUDA-Q inside this function only.
-    # Placeholder that delegates to existing sampler infrastructure
-    try:
-        from tools.cudaq_sampler import CudaqGarnetSampler
-        sampler = CudaqGarnetSampler()
-        # For now, generate a single sample for the given d,p,side,seed
-        # TODO: Adapt this to return the actual clustering interface expected
-        # This is a placeholder - wire to actual cluster_one_shot_cudaq when available
-        raise NotImplementedError("Replace with actual cluster_one_shot_cudaq call")
-    except ImportError:
-        raise NotImplementedError("CUDA-Q Garnet sampler not available")
-
 def run(args):
     rng = np.random.default_rng(args.seed)
     out_root = Path(args.out)
@@ -126,62 +113,6 @@ def run(args):
     
     # write manifest
     (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
-
-def create_synthetic_clusters(d: int, p: float, side: str, seed: int):
-    """Create synthetic clusters for testing when actual clusterer is not available."""
-    rng = np.random.default_rng(seed)
-    
-    # Create a small synthetic cluster
-    n_checks = rng.integers(2, 6)
-    n_qubits = rng.integers(3, 8)
-    
-    # Random sparse H_sub
-    H_sub = np.zeros((n_checks, n_qubits), dtype=np.uint8)
-    for i in range(n_checks):
-        # Each check connects to 2-4 qubits
-        n_conn = rng.integers(2, min(5, n_qubits+1))
-        qubits = rng.choice(n_qubits, size=n_conn, replace=False)
-        H_sub[i, qubits] = 1
-    
-    # Random coordinates
-    base_x, base_y = rng.integers(0, d*2, size=2)
-    xy_qubit = np.column_stack([
-        base_x + rng.integers(0, d, size=n_qubits),
-        base_y + rng.integers(0, d, size=n_qubits)
-    ])
-    xy_check = np.column_stack([
-        base_x + rng.integers(0, d, size=n_checks),
-        base_y + rng.integers(0, d, size=n_checks)
-    ])
-    
-    # Random syndrome
-    synd_bits = rng.integers(0, 2, size=n_checks, dtype=np.uint8)
-    
-    # Bounding box
-    all_x = np.concatenate([xy_qubit[:, 0], xy_check[:, 0]])
-    all_y = np.concatenate([xy_qubit[:, 1], xy_check[:, 1]])
-    bbox_xywh = (int(all_x.min()), int(all_y.min()), int(all_x.max() - all_x.min() + 1), int(all_y.max() - all_y.min() + 1))
-    
-    comp = {
-        "H_sub": H_sub,
-        "xy_qubit": xy_qubit,
-        "xy_check": xy_check,
-        "synd_bits": synd_bits,
-        "bbox_xywh": bbox_xywh,
-        "k": n_qubits,
-        "r": max(0, n_qubits - np.linalg.matrix_rank(H_sub.astype(np.float64))),
-        "kappa_stats": {"size": n_checks + n_qubits, "radius": 2, "ecc": 0.5, "bdensity": 0.3}
-    }
-    
-    return [comp]
-
-class DummyMWPF:
-    def decode(self, H_sub, synd_bits, side):
-        # Trivial placeholder; returns zeros and weight 0
-        return np.zeros(H_sub.shape[1], dtype=np.uint8), 0
-
-class DummyMWPM(DummyMWPF): 
-    pass
 
 def main():
     ap = argparse.ArgumentParser()

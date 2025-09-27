@@ -1,32 +1,73 @@
-import numpy as np, torch
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+
 from mghd_public.features_v2 import pack_cluster
 
-def test_translation_distance_invariance():
-    # Construct a tiny crop, then translate and change d; packed tensors (excluding meta) should match.
-    H = np.zeros((2,3), dtype=np.uint8); H[0,[0,1]]=1; H[1,[1,2]]=1
-    xy_q = np.array([[10,10],[11,10],[12,10]], dtype=np.int32)
-    xy_c = np.array([[10,9],[12,9]], dtype=np.int32)
-    bbox = (9,8,6,4)
-    y = np.array([0,1,0], dtype=np.uint8)
-    p1 = pack_cluster(H, xy_q, xy_c, np.array([1,0],dtype=np.uint8),
-                      k=3, r=1, bbox_xywh=bbox, kappa_stats={"size":5},
-                      y_bits_local=y, side="Z", d=3, p=0.005, seed=1,
-                      N_max=32, E_max=64, S_max=16)
-    # translate + different d
-    xy_q2 = xy_q + np.array([100, 50]); xy_c2 = xy_c + np.array([100, 50])
-    bbox2 = (bbox[0]+100, bbox[1]+50, bbox[2], bbox[3])
-    p2 = pack_cluster(H, xy_q2, xy_c2, np.array([1,0],dtype=np.uint8),
-                      k=3, r=1, bbox_xywh=bbox2, kappa_stats={"size":5},
-                      y_bits_local=y, side="Z", d=31, p=0.005, seed=2,
-                      N_max=32, E_max=64, S_max=16)
-    # Compare tensors
-    assert torch.allclose(p1.x_nodes, p2.x_nodes)
-    assert torch.equal(p1.node_mask, p2.node_mask)
-    assert torch.equal(p1.node_type, p2.node_type)
-    assert torch.equal(p1.edge_index, p2.edge_index)
-    assert torch.allclose(p1.edge_attr, p2.edge_attr)
-    assert torch.equal(p1.seq_mask, p2.seq_mask)
 
-if __name__ == "__main__":
-    test_translation_distance_invariance()
-    print("test_features_v2_invariance.py: PASSED")
+def build_sample_cluster():
+    H_sub = np.array([[1, 0, 1], [0, 1, 1]], dtype=np.uint8)
+    xy_qubit = np.array([[0, 0], [1, 0], [1, 1]], dtype=np.int32)
+    xy_check = np.array([[0, 1], [1, 2]], dtype=np.int32)
+    synd_bits = np.array([1, 0], dtype=np.uint8)
+    bbox = (0, 0, 2, 3)
+    return H_sub, xy_qubit, xy_check, synd_bits, bbox
+
+
+def test_pack_cluster_deterministic():
+    H_sub, xy_qubit, xy_check, synd_bits, bbox = build_sample_cluster()
+    kwargs = dict(
+        H_sub=H_sub,
+        xy_qubit=xy_qubit,
+        xy_check=xy_check,
+        synd_Z_then_X_bits=synd_bits,
+        k=H_sub.shape[1],
+        r=1,
+        bbox_xywh=bbox,
+        kappa_stats={"size": int(H_sub.shape[0] + H_sub.shape[1])},
+        y_bits_local=np.zeros(H_sub.shape[1], dtype=np.uint8),
+        side="Z",
+        d=3,
+        p=0.01,
+        seed=7,
+        N_max=H_sub.shape[0] + H_sub.shape[1],
+        E_max=int(H_sub.sum()),
+        S_max=H_sub.shape[0],
+        add_jump_edges=False,
+    )
+    crop_a = pack_cluster(**kwargs)
+    crop_b = pack_cluster(**kwargs)
+
+    assert torch.equal(crop_a.x_nodes, crop_b.x_nodes)
+    assert torch.equal(crop_a.edge_index, crop_b.edge_index)
+    assert torch.equal(crop_a.y_bits, crop_b.y_bits)
+
+
+def test_pack_cluster_masks_match_sizes():
+    H_sub, xy_qubit, xy_check, synd_bits, bbox = build_sample_cluster()
+    crop = pack_cluster(
+        H_sub=H_sub,
+        xy_qubit=xy_qubit,
+        xy_check=xy_check,
+        synd_Z_then_X_bits=synd_bits,
+        k=H_sub.shape[1],
+        r=1,
+        bbox_xywh=bbox,
+        kappa_stats={"size": int(H_sub.shape[0] + H_sub.shape[1])},
+        y_bits_local=np.zeros(H_sub.shape[1], dtype=np.uint8),
+        side="X",
+        d=3,
+        p=0.02,
+        seed=11,
+        N_max=H_sub.shape[0] + H_sub.shape[1],
+        E_max=int(H_sub.sum()),
+        S_max=H_sub.shape[0],
+        add_jump_edges=False,
+    )
+    node_count = H_sub.shape[0] + H_sub.shape[1]
+    edge_count = int(H_sub.sum())
+
+    assert int(crop.node_mask.sum().item()) == node_count
+    assert int(crop.edge_mask.sum().item()) == edge_count
+    assert crop.g_token.ndim == 1

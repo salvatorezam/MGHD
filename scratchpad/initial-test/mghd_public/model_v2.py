@@ -7,8 +7,8 @@ from typing import Optional, Sequence, Dict, List
 from types import SimpleNamespace
 
 ## ---- REQUIRED building blocks from your stack (fail-fast if missing) ----
-from poc_my_models import ChannelSE as _ChannelSE         # Channel squeeze-excitation
-from poc_my_models import GNNDecoder as _AstraGNN         # Astra message passing
+from .blocks import ChannelSE as _ChannelSE  # Channel squeeze-excitation
+from .blocks import AstraGNN as _AstraGNN  # Astra message passing
 # Your Mamba / SSM sequence encoder; support common aliases in poc_my_models
 try:
     from poc_my_models import MambaEncoder as _AstraMamba
@@ -18,8 +18,11 @@ except Exception:
     except Exception:
         try:
             from poc_my_models import Mamba as _AstraMamba
-        except Exception as _e:
-            raise ImportError("poc_my_models must export a Mamba encoder (MambaEncoder/MambaStack/Mamba).") from _e
+        except Exception:
+            try:
+                from mamba_ssm import Mamba as _AstraMamba
+            except Exception as _e:
+                raise ImportError("A Mamba encoder is required (MambaEncoder/MambaStack/Mamba).") from _e
 
 class AstraMambaWrapper(nn.Module):
     """
@@ -89,6 +92,7 @@ class AstraGNNWrapper(nn.Module):
             n_edge_features=edge_feat_dim,
             msg_net_size=max(96, hidden_dim),  # Use at least hidden_dim for message net
         )
+        self.iter_override: int | None = None
     
     def forward(self, x_nodes, edge_index, edge_attr, node_mask, edge_mask):
         # Convert edge_index format to src_ids, dst_ids that GNNDecoder expects
@@ -104,7 +108,16 @@ class AstraGNNWrapper(nn.Module):
         # Call the core GNNDecoder with expected interface
         # GNNDecoder returns [n_iters, N, C], we want the final iteration
         output = self.core(x_nodes, src_ids, dst_ids)  # [n_iters, N, C]
-        return output[-1]  # Take final iteration: [N, C]
+        idx = output.shape[0] - 1
+        if self.iter_override is not None:
+            idx = max(0, min(self.iter_override - 1, output.shape[0] - 1))
+        return output[idx]
+
+    def set_iteration_override(self, n_iters: int | None) -> None:
+        if n_iters is None or n_iters <= 0:
+            self.iter_override = None
+        else:
+            self.iter_override = int(n_iters)
 
 class MGHDv2(nn.Module):
     """Distance-agnostic MGHD v2 with your proven Mamba + Channel-SE + Astra GNN."""
@@ -150,13 +163,13 @@ class MGHDv2(nn.Module):
         if gtok.dim() == 2:
             g_dim = gtok.size(-1)
             if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.g_proj = nn.Linear(g_dim, self.node_in.out_features).to(gtok.device)
+                self.ensure_g_proj(g_dim, gtok.device)
             g_bias = self.g_proj(gtok)  # [B, d_model]
             g_bias = g_bias.unsqueeze(1).expand(batch_size, nodes_pad, -1).reshape(batch_size * nodes_pad, -1)
         else:
             g_dim = gtok.numel()
             if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.g_proj = nn.Linear(g_dim, self.node_in.out_features).to(gtok.device)
+                self.ensure_g_proj(g_dim, gtok.device)
             g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0)
             g_bias = g_bias.expand(x.shape[0], -1)
 
@@ -237,13 +250,22 @@ class MGHDv2(nn.Module):
             out.append(probs_all.index_select(0, data_idx))
         return out
 
+    def set_message_iters(self, n_iters: int | None) -> None:
+        self.gnn.set_iteration_override(n_iters)
+
+    def ensure_g_proj(self, g_dim: int, device: torch.device) -> None:
+        if self.g_proj is None or self.g_proj.in_features != g_dim:
+            layer = nn.Linear(g_dim, self.node_in.out_features)
+            layer.to(device)
+            self.g_proj = layer
+
     # --- Interface shims for v1 parity with infer/eval pipelines ---
     def set_authoritative_mats(self, Hx=None, Hz=None, device=None):
         """Compatibility shim: v2 does not require these at runtime."""
-        return self
-        
-    def set_rotated_layout(self, flag: bool=True):
+        return None
+
+    def set_rotated_layout(self, flag: bool = True):
         """Compatibility shim: v2 handles layout internally."""
-        return self
+        return None
 
 __all__ = ["MGHDv2"]
