@@ -1,0 +1,22 @@
+{
+  "files.exclude": {
+    "**/archive/**": true,
+    "**/.git/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true,
+    "results/**": true,
+    "Plots and Data/**": true,
+    "experiments/**": true,
+    "fastpath/**": true,
+    "reports/**": true
+  },
+  "search.exclude": {
+    "**/archive/**": true,
+    "results/**": true,
+    "Plots and Data/**": true,
+    "experiments/**": true,
+    "fastpath/**": true,
+    "reports/**": true
+  },
+  "explorer.compactFolders": true
+}
