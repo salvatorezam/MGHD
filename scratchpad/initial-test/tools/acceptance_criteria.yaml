@@ -1,0 +1,50 @@
+# Default Acceptance Criteria for MGHD v2 System
+# YAML configuration file for automated acceptance gate validation
+
+logical_error_rate:
+  max_ler: 0.15              # Maximum acceptable logical error rate
+  ci_coverage: 0.95          # Minimum confidence interval coverage
+  min_shots: 1000            # Minimum shots for statistical validity
+
+inference_latency:
+  max_p95_us: 5000          # Maximum 95th percentile latency (microseconds)
+  max_p99_us: 10000         # Maximum 99th percentile latency (microseconds)  
+  max_mean_us: 2000         # Maximum mean latency (microseconds)
+
+training_convergence:
+  min_final_accuracy: 0.85   # Minimum final training accuracy
+  max_training_time_min: 60  # Maximum training time (minutes)
+  required_metrics:          # Required training metrics to be present
+    - loss
+    - accuracy
+    - projection_loss
+
+system_reliability:
+  min_tier0_fraction: 0.8    # Minimum fraction of successful tier-0 operations
+  max_error_rate: 0.05       # Maximum system error rate
+  required_env_vars:         # Required environment variables
+    - MGHD_SYNTHETIC
+
+performance_regression:
+  max_regression_percent: 10 # Maximum performance regression vs baseline (%)
+  baseline_file: null        # Path to baseline results file (optional)
+
+# Environment-specific overrides
+environments:
+  smoke_test:
+    logical_error_rate:
+      max_ler: 0.20
+    inference_latency:
+      max_p95_us: 8000
+    training_convergence:
+      max_training_time_min: 30
+      
+  production:
+    logical_error_rate:
+      max_ler: 0.12
+    inference_latency:
+      max_p95_us: 3000
+      max_p99_us: 6000
+    training_convergence:
+      min_final_accuracy: 0.90
+      max_training_time_min: 45

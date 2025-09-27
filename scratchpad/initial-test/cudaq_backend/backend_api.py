@@ -32,7 +32,7 @@ def cudaq_sample_surface_wrapper(mode: str, batch_size: int, T: int = 3, d: int 
         mode: "foundation" or "student" - selects noise model calibration
         batch_size: Number of syndrome samples to generate
         T: Number of syndrome extraction rounds (default: 3)
-        d: Code distance (default: 3, only value currently supported)
+        d: Code distance (now supports arbitrary distances)
         layout: Surface code layout dict, auto-generated if None
         rng: Random number generator, auto-created if None
         bitpack: Whether to pack bits into bytes (preserved for compatibility)
@@ -45,12 +45,10 @@ def cudaq_sample_surface_wrapper(mode: str, batch_size: int, T: int = 3, d: int 
     if mode not in ["foundation", "student"]:
         raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
     
-    if d != 3:
-        raise NotImplementedError(f"Distance d={d} not implemented. Only d=3 supported.")
-    
     # Generate default layout if not provided
     if layout is None:
-        layout = make_surface_layout_d3_avoid_bad_edges()
+        from .circuits import make_surface_layout_general
+        layout = make_surface_layout_general(d)
     
     # Create RNG if not provided
     if rng is None:
@@ -228,11 +226,11 @@ def get_backend_info() -> Dict[str, Any]:
         'version': __version__,
         'noise_model': 'IQM Garnet',
         'supported_codes': ['surface', 'bb', 'qldpc', 'repetition'],
-        'supported_distances': [3],  # Only d=3 surface codes currently
+        'supported_distances': 'arbitrary',  # Now supports arbitrary distances
         'modes': ['foundation', 'student'],
         'foundation_defaults': FOUNDATION_DEFAULTS,
         'garnet_couplers': len(GARNET_COUPLER_F2),
-        'max_qubits': 20,
+        'max_qubits': 100,  # Increased limit for larger distances
         'features': [
             'circuit_level_noise',
             'amplitude_damping', 
@@ -240,7 +238,8 @@ def get_backend_info() -> Dict[str, Any]:
             'gate_depolarizing',
             'measurement_assignment_errors',
             'batched_monte_carlo',
-            'idle_noise_timing'
+            'idle_noise_timing',
+            'arbitrary_distance_surface_codes'
         ]
     }
 

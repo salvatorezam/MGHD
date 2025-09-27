@@ -1,0 +1,15 @@
+{
+  "folders": [
+    { "path": "mghd_public" },
+    { "path": "mghd_clustered" },
+    { "path": "teachers" },
+    { "path": "cudaq_backend" },
+    { "path": "training" },
+    { "path": "tools" },
+    { "path": "tests" },
+    { "path": "docs" }
+  ],
+  "settings": {
+    "files.exclude": { "**/archive/**": true, "results/**": true, "Plots and Data/**": true }
+  }
+}

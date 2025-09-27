@@ -58,45 +58,67 @@ class CudaQKernel:
         return None
 
 
-def build_H_rotated_d3() -> Tuple[np.ndarray, np.ndarray]:
+def build_H_rotated_general(d: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Build rotated planar surface code (d=3) parity-check matrices.
+    Build rotated planar surface code parity-check matrices for arbitrary distance d.
 
-    Data-qubit indexing: 3x3 grid, row-major order:
-      q00=0, q01=1, q02=2,
-      q10=3, q11=4, q12=5,
-      q20=6, q21=7, q22=8
+    Data-qubit indexing: d×d grid, row-major order:
+      For d=3: q00=0, q01=1, q02=2, q10=3, q11=4, q12=5, q20=6, q21=7, q22=8
+      For d=5: q00=0, q01=1, ..., q04=4, q10=5, ..., q44=24
 
     Returns:
-      (Hz, Hx) as numpy arrays of shapes (4, 9) each (4 Z checks, 4 X checks)
-      Columns correspond to data-qubit order 0..8 as documented above.
+      (Hz, Hx) as numpy arrays
+      Hz: (d*(d-1), d*d) - Z stabilizers  
+      Hx: ((d-1)*d, d*d) - X stabilizers
+      Columns correspond to data-qubit order 0..(d²-1) in row-major order.
     """
     try:
         from codes_q import create_rotated_surface_codes  # reuse Astra helper
+        css = create_rotated_surface_codes(d, name=f"rotated_d{d}")
+        Hx = css.hx.astype(int)
+        Hz = css.hz.astype(int)
+        return Hz, Hx
     except ImportError:
-        # Fallback: create simple rotated d=3 matrices manually
-        # Z checks (4x9 matrix)
-        Hz = np.array([
-            [0, 1, 0, 1, 1, 0, 0, 0, 0],
-            [0, 0, 1, 0, 1, 1, 0, 0, 0], 
-            [0, 0, 0, 1, 1, 0, 1, 1, 0],
-            [0, 0, 0, 0, 1, 1, 0, 1, 1],
-        ], dtype=int)
+        # Fallback: create rotated surface code matrices manually
+        n_data = d * d
+        n_z_checks = d * (d - 1)  # Z stabilizers
+        n_x_checks = (d - 1) * d  # X stabilizers
         
-        # X checks (4x9 matrix)
-        Hx = np.array([
-            [1, 1, 0, 1, 0, 0, 0, 0, 0],
-            [0, 1, 1, 0, 1, 0, 0, 0, 0],
-            [0, 0, 0, 0, 1, 0, 1, 1, 0],
-            [0, 0, 0, 0, 0, 1, 0, 1, 1],
-        ], dtype=int)
+        # Initialize matrices
+        Hz = np.zeros((n_z_checks, n_data), dtype=int)
+        Hx = np.zeros((n_x_checks, n_data), dtype=int)
+        
+        # Build Z stabilizers (horizontal edges in rotated lattice)
+        z_check_idx = 0
+        for row in range(d):
+            for col in range(d - 1):
+                # Z check connects qubits (row, col) and (row, col+1)
+                q1 = row * d + col
+                q2 = row * d + col + 1
+                Hz[z_check_idx, q1] = 1
+                Hz[z_check_idx, q2] = 1
+                z_check_idx += 1
+        
+        # Build X stabilizers (vertical edges in rotated lattice)  
+        x_check_idx = 0
+        for row in range(d - 1):
+            for col in range(d):
+                # X check connects qubits (row, col) and (row+1, col)
+                q1 = row * d + col
+                q2 = (row + 1) * d + col
+                Hx[x_check_idx, q1] = 1
+                Hx[x_check_idx, q2] = 1
+                x_check_idx += 1
         
         return Hz, Hx
-    css = create_rotated_surface_codes(3, name="rotated_d3")
-    # css.hx and css.hz are (4,9) with row-per-check
-    Hx = css.hx.astype(int)
-    Hz = css.hz.astype(int)
-    return Hz, Hx
+
+
+def build_H_rotated_d3() -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build rotated planar surface code (d=3) parity-check matrices.
+    Backward compatibility wrapper for the general function.
+    """
+    return build_H_rotated_general(3)
 
 
 def _canonicalize_sector_rows(H: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -461,6 +483,70 @@ def make_surface_layout_d3_include_edge(edge: Tuple[int, int] = (10, 11)) -> Dic
     return bad_layout
 
 
+
+
+def make_surface_layout_general(d: int) -> Dict[str, Any]:
+    """
+    Create a general surface code layout for arbitrary distance d.
+    
+    Args:
+        d: Code distance
+        
+    Returns:
+        Layout dictionary with qubit assignments and gate schedules
+    """
+    if d == 3:
+        return make_surface_layout_d3_avoid_bad_edges()
+    
+    n_data = d * d
+    n_z_checks = d * (d - 1)
+    n_x_checks = (d - 1) * d
+    
+    # Data qubits: 0 to d²-1 (row-major order)
+    data_qubits = list(range(n_data))
+    
+    # Ancilla qubits: start after data qubits
+    ancilla_z = list(range(n_data, n_data + n_z_checks))
+    ancilla_x = list(range(n_data + n_z_checks, n_data + n_z_checks + n_x_checks))
+    
+    # Build CZ layers for syndrome extraction
+    # Layer 1: Z stabilizers (horizontal connections)
+    cz_layer_1 = []
+    z_anc_idx = 0
+    for row in range(d):
+        for col in range(d - 1):
+            anc = ancilla_z[z_anc_idx]
+            q1 = row * d + col
+            q2 = row * d + col + 1
+            cz_layer_1.extend([(anc, q1), (anc, q2)])
+            z_anc_idx += 1
+    
+    # Layer 2: X stabilizers (vertical connections)
+    cz_layer_2 = []
+    x_anc_idx = 0
+    for row in range(d - 1):
+        for col in range(d):
+            anc = ancilla_x[x_anc_idx]
+            q1 = row * d + col
+            q2 = (row + 1) * d + col
+            cz_layer_2.extend([(anc, q1), (anc, q2)])
+            x_anc_idx += 1
+    
+    # PRX layers for ancilla reset/measurement
+    prx_layer_z = [(anc, 'z') for anc in ancilla_z]  # Z basis for Z stabilizers
+    prx_layer_x = [(anc, 'x') for anc in ancilla_x]  # X basis for X stabilizers
+    
+    return {
+        'data': data_qubits,
+        'ancilla_z': ancilla_z,
+        'ancilla_x': ancilla_x,
+        'cz_layers': [cz_layer_1, cz_layer_2],
+        'prx_layers': [prx_layer_z, prx_layer_x],
+        'total_qubits': n_data + n_z_checks + n_x_checks,
+        'distance': d,
+        'code_type': 'rotated_surface',
+        'syndrome_schedule': 'alternating'  # Z then X measurements
+    }
 
 
 def make_surface_layout_d3_avoid_bad_edges() -> Dict[str, Any]:

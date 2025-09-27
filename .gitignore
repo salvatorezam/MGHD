@@ -265,3 +265,8 @@ scratchpad/initial-test/PROJECT_SUMMARY.md
 PROJECT_SUMMARY.md
 **/PROJECT_SUMMARY.md
 
+# Exclude development documentation files
+**/Agents.md
+**/IMPLEMENTATION_SUMMARY.md
+**/STEP2_COMPLETE.md
+
