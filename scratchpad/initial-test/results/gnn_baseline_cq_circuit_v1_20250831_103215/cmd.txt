@@ -1,1 +1,0 @@
-tools/baseline_gnn_train.py --outdir results/gnn_baseline_cq_circuit_v1_20250831_103215 --epochs 20 --steps-per-epoch 1200 --batch-size 512 --lr 1e-4 --wd 1e-4 --ema 0.999 --parity-lambda 0.03 --smoothing 0.09 --teacher mwpf
