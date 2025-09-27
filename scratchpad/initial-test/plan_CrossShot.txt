@@ -1,0 +1,15 @@
+1. Finish feature support:
+   - Extend mghd_public/features_v2.pack_cluster to accept bucket_spec and emit pad metadata.
+   - Ensure infer_bucket_id helper exported.
+2. Integrate CrossShotBatcher in inference:
+   - Implement model_v2 helpers allocate/copy/gather/move/scatter.
+   - Update MGHDDecoderPublic priors_from_subgraphs_batched for bucketed capture.
+   - Update clustered_primary to pass microbatch knobs and capture telemetry.
+3. Bench harness & early stop:
+   - Add CLI flags (bucket-spec/microbatch/flush-ms/target-ler-ci) and Wilson early stop.
+   - Wire defaults and pass to decoder creation.
+4. GF(2) projector branch-and-bound:
+   - Replace enumerator with Gray-code BnB with visited/pruned counters.
+5. Tests + smoke:
+   - Add test_microbatcher, test_capture_buckets, test_wilson_early_stop, test_projector_bnb.
+   - Run smoke bench and summarize metrics.
