@@ -8,7 +8,7 @@ Refs:
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Iterable, Optional
 import warnings
 
 import numpy as np
@@ -26,17 +26,46 @@ except Exception as exc:  # pragma: no cover - executed without pymatching
     _PM_IMPORT_ERROR = exc
 
 
+def _coerce_weights_to_float(weights: Optional[Iterable[Any]], ncols: int) -> Optional[np.ndarray]:
+    """Best-effort conversion of MWPF-style weights to float32 for PyMatching."""
+
+    if weights is None:
+        return None
+    try:
+        arr = np.asarray(list(weights), dtype=object)
+    except Exception:
+        # Some iterables (e.g., numpy arrays) support direct np.asarray but not list().
+        try:
+            arr = np.asarray(weights, dtype=object)
+        except Exception:
+            return None
+
+    if arr.size not in (0, ncols):
+        return None
+
+    try:
+        float_arr = arr.astype(np.float64)
+    except Exception:
+        return None
+
+    if not np.all(np.isfinite(float_arr)):
+        return None
+
+    return float_arr.astype(np.float32, copy=False)
+
+
 class MWPMFallback:
     """PyMatching-backed MWPM decoder with a GF(2) fallback."""
 
-    def __init__(self, H: np.ndarray, *, weights: Optional[np.ndarray] = None):
-        self.H = np.asarray(H, dtype=np.uint8)
-        self.weights = None if weights is None else np.asarray(weights, dtype=float)
+    def __init__(self, H: np.ndarray, *, weights: Optional[Iterable[Any]] = None):
+        self.H = np.asarray(H, dtype=np.uint8) & 1
+        self._gf2_cols = self.H.shape[1]
+        self.weights = _coerce_weights_to_float(weights, self._gf2_cols)
         self.m = None
         if _HAVE_PM:
             try:
                 self.m = pm.Matching.from_check_matrix(self.H, weights=self.weights)  # type: ignore[union-attr]
-            except ValueError as exc:  # pragma: no cover - dependent on optional library
+            except Exception as exc:  # pragma: no cover - dependent on optional library
                 warnings.warn(
                     "PyMatching could not load the parity-check matrix; falling back to GF(2) projection.",
                     RuntimeWarning,
@@ -53,23 +82,31 @@ class MWPMFallback:
             )
             self._pm_failure = _PM_IMPORT_ERROR
 
+    def _gf2_decode(self, syndromes: np.ndarray) -> np.ndarray:
+        B = syndromes.shape[0]
+        out = np.zeros((B, self._gf2_cols), dtype=np.uint8)
+        for b in range(B):
+            out[b] = core.ml_parity_project(self.H, syndromes[b])
+        return out
+
     def decode_batch(self, syndromes: np.ndarray) -> np.ndarray:
         """Return corrections in 'fault id' space aligned with columns of H."""
 
-        syndromes = np.asarray(syndromes, dtype=np.uint8)
+        syndromes = np.asarray(syndromes, dtype=np.uint8) & 1
         if syndromes.ndim != 2:
             raise ValueError("syndromes must be rank-2 array [B, #checks]")
 
         if _HAVE_PM and self.m is not None:
-            return self.m.decode_batch(syndromes).astype(np.uint8)  # type: ignore[union-attr]
+            if hasattr(self.m, "decode_batch"):
+                decoded = self.m.decode_batch(syndromes)  # type: ignore[union-attr]
+            else:
+                decoded = np.stack(
+                    [np.asarray(self.m.decode(s), dtype=np.uint8) for s in syndromes],  # type: ignore[union-attr]
+                    axis=0,
+                )
+            return np.asarray(decoded, dtype=np.uint8)
 
-        # Fallback: solve Hx=s exactly via GF(2) projection for each sample.
-        B = syndromes.shape[0]
-        cols = self.H.shape[1]
-        out = np.zeros((B, cols), dtype=np.uint8)
-        for b in range(B):
-            out[b] = core.ml_parity_project(self.H, syndromes[b])
-        return out
+        return self._gf2_decode(syndromes)
 
 
 __all__ = ["MWPMFallback", "_HAVE_PM"]

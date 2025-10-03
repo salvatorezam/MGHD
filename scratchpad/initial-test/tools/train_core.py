@@ -102,21 +102,21 @@ def main() -> None:
 
             # Teacher stack
             mix = TeacherMix(
-            code,
-            Hx,
-            Hz,
-            mix_cfg=MixConfig(
-                p_mwpf=args.p_mwpf,
-                p_lsd=args.p_lsd,
-                p_mwpm=args.p_mwpm,
-            ),
-        )
+                code,
+                Hx,
+                Hz,
+                mix_cfg=MixConfig(
+                    p_mwpf=args.p_mwpf,
+                    p_lsd=args.p_lsd,
+                    p_mwpm=args.p_mwpm,
+                ),
+            )
 
         totals = {"mwpf": 0, "lsd": 0, "mwpm": 0, "mwpm_fallback": 0}
         t0 = time.time()
-        true_accum = None
-        pred_accum = None
-        for _ in range(args.batches):
+        true_chunks = []
+        pred_chunks = []
+        for batch_idx in range(args.batches):
             batch = sampler.sample(
                 code,
                 n_shots=args.shots_per_batch,
@@ -136,15 +136,16 @@ def main() -> None:
                 true_arr = np.asarray(true_obs, dtype=np.uint8)
                 if true_arr.ndim == 1:
                     true_arr = true_arr[np.newaxis, :]
-                true_accum = true_arr if true_accum is None else np.concatenate([true_accum, true_arr], axis=0)
-            else:
-                true_arr = None
+                true_chunks.append(true_arr)
 
             pred_obs = None
-            if out["which"] == "lsd" and hasattr(code, "data_to_observables"):
+            if out["which"] == "lsd":
                 ex = out.get("ex")
                 ez = out.get("ez")
-                pred_obs = code.data_to_observables(ex, ez)
+                if hasattr(code, "data_to_observables") and (
+                    getattr(code, "Lx", None) is not None or getattr(code, "Lz", None) is not None
+                ):
+                    pred_obs = code.data_to_observables(ex, ez)
             elif out["which"] == "mwpf":
                 pred_obs = out.get("pred_obs")
             elif out["which"].startswith("mwpm"):
@@ -154,14 +155,16 @@ def main() -> None:
                 pred_arr = np.asarray(pred_obs, dtype=np.uint8)
                 if pred_arr.ndim == 1:
                     pred_arr = pred_arr[np.newaxis, :]
-                pred_accum = pred_arr if pred_accum is None else np.concatenate([pred_accum, pred_arr], axis=0)
+                pred_chunks.append(pred_arr)
 
         dt = time.time() - t0
+        true_accum = np.concatenate(true_chunks, axis=0) if true_chunks else None
+        pred_accum = np.concatenate(pred_chunks, axis=0) if pred_chunks else None
         if true_accum is not None and pred_accum is not None and true_accum.shape == pred_accum.shape:
             ler = logical_error_rate(true_accum, pred_accum)
         else:
-            ler = LEResult(None, None, true_accum.shape[0] if true_accum is not None else 0,
-                           notes="obs unavailable")
+            samples = int(true_accum.shape[0]) if true_accum is not None else 0
+            ler = LEResult(None, None, samples, notes="obs unavailable")
         print(summary_line(family, d, args.batches, args.shots_per_batch, ler, dt, totals))
 if __name__ == "__main__":
     try:

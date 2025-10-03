@@ -149,6 +149,100 @@ def _gf2_rank(mat: np.ndarray) -> int:
     return rank
 
 
+def _gf2_rref(A: np.ndarray) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+    M = (np.asarray(A, dtype=np.uint8) & 1).copy()
+    m, n = M.shape
+    pivots: List[Tuple[int, int]] = []
+    row = 0
+    for col in range(n):
+        pivot = None
+        for r in range(row, m):
+            if M[r, col]:
+                pivot = r
+                break
+        if pivot is None:
+            continue
+        if pivot != row:
+            M[[row, pivot]] = M[[pivot, row]]
+        for r in range(m):
+            if r != row and M[r, col]:
+                M[r] ^= M[row]
+        pivots.append((row, col))
+        row += 1
+        if row == m:
+            break
+    return M, pivots
+
+
+def _gf2_nullspace_dense(A: np.ndarray) -> np.ndarray:
+    M, pivots = _gf2_rref(A)
+    n = M.shape[1]
+    pivot_cols = {c for _, c in pivots}
+    free_cols = [c for c in range(n) if c not in pivot_cols]
+    basis: List[np.ndarray] = []
+    for free in free_cols:
+        v = np.zeros(n, dtype=np.uint8)
+        v[free] = 1
+        for r, c in pivots:
+            if M[r, free]:
+                v[c] ^= 1
+        basis.append(v)
+    if not basis:
+        return np.zeros((n, 0), dtype=np.uint8)
+    return np.stack(basis, axis=1)
+
+
+def _reduce_mod_rowspace(vec: np.ndarray, R: np.ndarray, pivots: List[Tuple[int, int]]) -> np.ndarray:
+    res = (np.asarray(vec, dtype=np.uint8) & 1).copy()
+    for r, c in pivots:
+        if res[c]:
+            res ^= R[r]
+    return res
+
+
+def _select_css_logicals(stab: np.ndarray, dual: np.ndarray, target: int) -> np.ndarray:
+    if target <= 0:
+        return np.zeros((0, stab.shape[1]), dtype=np.uint8)
+    R, pivots = _gf2_rref(stab)
+    null_dual = _gf2_nullspace_dense(dual)
+    if null_dual.shape[1] == 0:
+        return np.zeros((0, stab.shape[1]), dtype=np.uint8)
+
+    reps: List[np.ndarray] = []
+    seen: set[bytes] = set()
+    for j in range(null_dual.shape[1]):
+        rep = _reduce_mod_rowspace(null_dual[:, j], R, pivots)
+        if not rep.any():
+            continue
+        key = rep.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        reps.append(rep)
+
+    reps.sort(key=lambda v: (int(v.sum()), v.tobytes()))
+    basis: List[np.ndarray] = []
+    for rep in reps:
+        if not basis:
+            basis.append(rep)
+        else:
+            M = np.stack(basis + [rep], axis=0)
+            _, new_pivots = _gf2_rref(M)
+            if len(new_pivots) > len(basis):
+                basis.append(rep)
+        if len(basis) == target:
+            break
+    if not basis:
+        return np.zeros((0, stab.shape[1]), dtype=np.uint8)
+    return np.stack(basis, axis=0)
+
+
+def _compute_css_logicals(Hx: np.ndarray, Hz: np.ndarray, target: int) -> Tuple[np.ndarray, np.ndarray]:
+    Lx_auto = _select_css_logicals(Hx, Hz, target)
+    Lz_auto = _select_css_logicals(Hz, Hx, target)
+    return Lx_auto, Lz_auto
+
+
 def _fault_map(Hx: np.ndarray, Hz: np.ndarray) -> List[List[int]]:
     mx, n = Hx.shape
     mz = Hz.shape[0]
@@ -199,6 +293,13 @@ def _make_css(
     num_detectors = int(Hx.shape[0] + Hz.shape[0])
     if num_observables is None:
         num_observables = k
+    target_logicals = int(num_observables if num_observables is not None else k)
+    if target_logicals > 0 and (Lx is None or Lz is None):
+        auto_Lx, auto_Lz = _compute_css_logicals(Hx, Hz, target_logicals)
+        if Lx is None:
+            Lx = auto_Lx
+        if Lz is None:
+            Lz = auto_Lz
     return CSSCode(
         name=name,
         distance=distance,
