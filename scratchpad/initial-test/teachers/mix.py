@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import numpy as np
+import warnings
 
 from .mwpf_teacher import MWPFConfig, MWPFTeacher
 from .lsd_teacher import LSDConfig, LSDTeacher
@@ -49,17 +50,32 @@ class TeacherMix:
         probs = np.array([self.mix.p_mwpf, self.mix.p_lsd, self.mix.p_mwpm], dtype=float)
         if np.any(probs < 0):  # pragma: no cover - defensive
             raise ValueError("Mix probabilities must be non-negative")
-        total = probs.sum()
-        if not np.isclose(total, 1.0):
-            # Normalise to avoid accidental drift; report via warning? keep simple.
-            probs = probs / total if total > 0 else np.array([1.0, 0.0, 0.0], dtype=float)
-            self.mix = MixConfig(*probs)
 
         self.code_obj = code_obj
-        self.mwpf = MWPFTeacher(code_obj, config=mwpf_cfg or MWPFConfig(cluster_node_limit=50))
+        self.mwpf = None
+        try:
+            self.mwpf = MWPFTeacher(
+                code_obj,
+                config=mwpf_cfg or MWPFConfig(cluster_node_limit=50),
+            )
+        except Exception as exc:  # pragma: no cover - degrade gracefully
+            warnings.warn(
+                f"MWPFTeacher unavailable ({exc}); disabling MWPF in mix.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            probs[0] = 0.0
+
         self.lsd = LSDTeacher(Hx, Hz, cfg=lsd_cfg or LSDConfig())
         self.mwpm_x = MWPMFallback(Hx)
         self.mwpm_z = MWPMFallback(Hz)
+
+        total = probs.sum()
+        if total <= 0:
+            probs = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            probs = probs / total
+        self.mix = MixConfig(*probs.tolist())
 
     def route_batch(
         self,
@@ -71,7 +87,7 @@ class TeacherMix:
         rng = rng or np.random.default_rng()
         r = float(rng.uniform())
         try:
-            if r < self.mix.p_mwpf:
+            if self.mwpf is not None and r < self.mix.p_mwpf:
                 out = self.mwpf.decode_batch(dets)
                 out["which"] = "mwpf"
                 return out

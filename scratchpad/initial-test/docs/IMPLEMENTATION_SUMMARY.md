@@ -736,3 +736,9 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 - Wired teacher stack: `teachers/mwpf_teacher.py` (MWPF with heuristic fallback), `teachers/lsd_teacher.py` (ldpc BP+LSD with GF(2) projection fallback), and `teachers/mwpm_fallback.py` (PyMatching + parity solver fallback) plus the stochastic mixer in `teachers/mix.py`.
 - Added `tests/test_teachers_mix.py` smoke exercising the mixer and updated `pytest.ini` to auto-discover it; suite now covers layout, clustering, and teacher mix flows.
 - Dependencies remain optional; fallbacks keep CI green while emitting warnings to install `mwpf`, `ldpc`, and `pymatching`. Tests: `pytest -q`.
+
+2025-10-03 13:59 UTC
+
+- Added curriculum/code-loading utilities (`tools/curriculum.py`, `tools/code_loader.py`) and rewired `tools/train_core.py` into the CUDA-Q → teacher loop with distance sweep, RNG seeding, and per-batch teacher usage stats.
+- Hardened teacher mix to disable MWPF gracefully when codes lack hypergraph metadata, renormalising probabilities and relying on LSD/MWPM fallbacks.
+- Introduced subprocess regression `tests/test_train_core_smoke.py` (PYTHONPATH isolated) and expanded `pytest.ini` discovery; suite passes under fallback samplers + teachers (`pytest -q`). Sample command: `python -m tools.train_core --family surface --distances 3-7:2 --sampler cudaq --shots-per-batch 32 --batches 3`.
