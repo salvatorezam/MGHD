@@ -55,6 +55,8 @@ class CSSCode:
     num_detectors: Optional[int] = None
     num_observables: Optional[int] = None
     stim_circuit: Optional[object] = None
+    Lx: Optional[np.ndarray] = None
+    Lz: Optional[np.ndarray] = None
 
     def detectors_to_syndromes(self, dets: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Best-effort mapping assuming detectors align with checks (X block then Z)."""
@@ -73,6 +75,53 @@ class CSSCode:
         sx = dets[:, :mx].astype(np.uint8)
         sz = dets[:, mx:mx + mz].astype(np.uint8)
         return sx, sz
+
+    def data_to_observables(self,
+                            ex: Optional[np.ndarray],
+                            ez: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Map data-space corrections to logical observable flips."""
+
+        if self.Lx is None or self.Lz is None or self.num_observables is None:
+            return None
+
+        ex_arr = None if ex is None else np.asarray(ex, dtype=np.uint8)
+        ez_arr = None if ez is None else np.asarray(ez, dtype=np.uint8)
+        if ex_arr is None and ez_arr is None:
+            return None
+
+        if ex_arr is not None and ex_arr.ndim == 1:
+            ex_arr = ex_arr[np.newaxis, :]
+        if ez_arr is not None and ez_arr.ndim == 1:
+            ez_arr = ez_arr[np.newaxis, :]
+
+        B = 0
+        if ex_arr is not None:
+            B = ex_arr.shape[0]
+        if ez_arr is not None:
+            B = max(B, ez_arr.shape[0])
+        if B == 0:
+            return None
+
+        if ex_arr is not None and ex_arr.shape[1] != self.Hx.shape[1]:
+            return None
+        if ez_arr is not None and ez_arr.shape[1] != self.Hz.shape[1]:
+            return None
+
+        z_cols = self.Lz.shape[0] if self.Lz is not None else 0
+        x_cols = self.Lx.shape[0] if self.Lx is not None else 0
+        z_obs = np.zeros((B, z_cols), dtype=np.uint8)
+        x_obs = np.zeros((B, x_cols), dtype=np.uint8)
+
+        if ex_arr is not None and self.Lz is not None and self.Lz.size:
+            if ex_arr.shape[0] != B or ex_arr.shape[1] != self.Lz.shape[1]:
+                return None
+            z_obs = (ex_arr @ (self.Lz.T % 2)) % 2
+        if ez_arr is not None and self.Lx is not None and self.Lx.size:
+            if ez_arr.shape[0] != B or ez_arr.shape[1] != self.Lx.shape[1]:
+                return None
+            x_obs = (ez_arr @ (self.Lx.T % 2)) % 2
+
+        return np.concatenate([z_obs, x_obs], axis=1)
 
 
 def _assert_css(Hx: np.ndarray, Hz: np.ndarray) -> None:
@@ -132,6 +181,8 @@ def _make_css(
     detectors_per_fault: Optional[List[List[int]]] = None,
     fault_weights: Optional[List[float]] = None,
     num_observables: Optional[int] = None,
+    Lx: Optional[np.ndarray] = None,
+    Lz: Optional[np.ndarray] = None,
 ) -> CSSCode:
     Hx = _ensure_binary(Hx)
     Hz = _ensure_binary(Hz)
@@ -160,6 +211,8 @@ def _make_css(
         fault_weights=fault_weights,
         num_detectors=num_detectors,
         num_observables=num_observables,
+        Lx=Lx,
+        Lz=Lz,
     )
 
 
@@ -559,6 +612,8 @@ def build_steane() -> CSSCode:
         [0, 0, 1, 0, 1, 1, 1],
     ], dtype=np.uint8)
     layout = {"family": "steane"}
+    Lz = np.array([[1, 0, 0, 0, 0, 0, 1]], dtype=np.uint8)
+    Lx = Lz.copy()
     return _make_css(
         name="steane",
         distance=3,
@@ -567,6 +622,8 @@ def build_steane() -> CSSCode:
         layout=layout,
         fault_weights=[1.0] * 7,
         num_observables=1,
+        Lx=Lx,
+        Lz=Lz,
     )
 
 
@@ -727,11 +784,15 @@ def build_repetition(distance: int, *, basis: str = "Z") -> CSSCode:
         for i in range(L - 1):
             Hz[i, [i, i + 1]] = 1
         Hx = np.zeros((0, n), dtype=np.uint8)
+        Lz = np.ones((1, n), dtype=np.uint8)
+        Lx = np.zeros((0, n), dtype=np.uint8)
     else:
         Hx = np.zeros((L - 1, n), dtype=np.uint8)
         for i in range(L - 1):
             Hx[i, [i, i + 1]] = 1
         Hz = np.zeros((0, n), dtype=np.uint8)
+        Lx = np.ones((1, n), dtype=np.uint8)
+        Lz = np.zeros((0, n), dtype=np.uint8)
     layout = {"L": L, "basis": basis_upper}
     return _make_css(
         name="repetition",
@@ -740,6 +801,8 @@ def build_repetition(distance: int, *, basis: str = "Z") -> CSSCode:
         Hz=Hz,
         layout=layout,
         fault_weights=[1.0] * n,
+        Lx=Lx,
+        Lz=Lz,
     )
 
 

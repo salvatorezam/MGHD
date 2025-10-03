@@ -29,6 +29,7 @@ from teachers.mix import MixConfig, TeacherMix
 
 from .code_loader import load_code
 from .curriculum import parse_distances
+from tools.metrics import LEResult, logical_error_rate, summary_line
 
 
 def _resolve_syndromes(code_obj, dets):
@@ -96,11 +97,11 @@ def main() -> None:
             print(f"\n=== Family={family}  d={d}  sampler={args.sampler} ===")
             # Load code object (Hx/Hz, detector metadata, hypergraph mapping if available)
             code = load_code(family, d)
-        Hx = getattr(code, "Hx", None)
-        Hz = getattr(code, "Hz", None)
+            Hx = getattr(code, "Hx", None)
+            Hz = getattr(code, "Hz", None)
 
-        # Teacher stack
-        mix = TeacherMix(
+            # Teacher stack
+            mix = TeacherMix(
             code,
             Hx,
             Hz,
@@ -113,6 +114,8 @@ def main() -> None:
 
         totals = {"mwpf": 0, "lsd": 0, "mwpm": 0, "mwpm_fallback": 0}
         t0 = time.time()
+        true_accum = None
+        pred_accum = None
         for _ in range(args.batches):
             batch = sampler.sample(
                 code,
@@ -128,11 +131,38 @@ def main() -> None:
             )
             totals[out["which"]] = totals.get(out["which"], 0) + 1
 
+            true_obs = getattr(batch, "obs", None)
+            if true_obs is not None:
+                true_arr = np.asarray(true_obs, dtype=np.uint8)
+                if true_arr.ndim == 1:
+                    true_arr = true_arr[np.newaxis, :]
+                true_accum = true_arr if true_accum is None else np.concatenate([true_accum, true_arr], axis=0)
+            else:
+                true_arr = None
+
+            pred_obs = None
+            if out["which"] == "lsd" and hasattr(code, "data_to_observables"):
+                ex = out.get("ex")
+                ez = out.get("ez")
+                pred_obs = code.data_to_observables(ex, ez)
+            elif out["which"] == "mwpf":
+                pred_obs = out.get("pred_obs")
+            elif out["which"].startswith("mwpm"):
+                pred_obs = out.get("pred_obs")
+
+            if pred_obs is not None:
+                pred_arr = np.asarray(pred_obs, dtype=np.uint8)
+                if pred_arr.ndim == 1:
+                    pred_arr = pred_arr[np.newaxis, :]
+                pred_accum = pred_arr if pred_accum is None else np.concatenate([pred_accum, pred_arr], axis=0)
+
         dt = time.time() - t0
-        print(
-            f"[done] family={family} d={d} batches={args.batches} shots/batch={args.shots_per_batch} "
-            f"teacher-usage={totals} elapsed={dt:.2f}s"
-        )
+        if true_accum is not None and pred_accum is not None and true_accum.shape == pred_accum.shape:
+            ler = logical_error_rate(true_accum, pred_accum)
+        else:
+            ler = LEResult(None, None, true_accum.shape[0] if true_accum is not None else 0,
+                           notes="obs unavailable")
+        print(summary_line(family, d, args.batches, args.shots_per_batch, ler, dt, totals))
 if __name__ == "__main__":
     try:
         main()
