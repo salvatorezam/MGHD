@@ -32,12 +32,7 @@ def build_color_666_qecsim(distance: int) -> Tuple[np.ndarray, np.ndarray, int, 
 
 
 def build_color_488_qecsim(distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, object]]:
-    """Placeholder for triangular 4.8.8 color code generation.
-
-    At the moment there is no lightweight open-source generator bundled with
-    this repository. Users should precompute cached matrices (see
-    `tools.precompute_color_codes.py`).
-    """
+    """Placeholder for triangular 4.8.8 color code generation."""
 
     raise RuntimeError(
         "color_488 generation requires cached matrices. Run `python -m tools.precompute_color_codes` "

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -37,25 +36,46 @@ def main(argv: List[str] | None = None) -> int:
                         help="Which tilings to precompute.")
     args = parser.parse_args(argv)
 
-    try:
-        from mghd_main import codes_external as cx
-    except ImportError:
-        import importlib
-        cx = importlib.import_module("codes_external")
-
     wanted = {"666", "488"} if args.which == "both" else {args.which}
     _ensure_data_dir()
     failures: List[Tuple[str, int, str]] = []
+    warned_488 = False
 
     for d in range(3, args.max_d + 1, 2):
         for kind in sorted(wanted):
-            builder_name = f"build_color_{kind}_qecsim"
-            if not hasattr(cx, builder_name):
-                failures.append((kind, d, f"codes_external missing {builder_name}"))
+            if kind == "666":
+                try:
+                    from mghd_main import codes_external as cx
+                except ImportError:
+                    import importlib
+                    cx = importlib.import_module("codes_external")
+                builder = getattr(cx, "build_color_666_qecsim", None)
+            else:
+                try:
+                    from mghd_main import codes_external_488 as cx488
+                except ImportError:
+                    cx488 = None
+                builder = getattr(cx488, "build_color_488", None) if cx488 else None
+            if builder is None:
+                if kind == "488":
+                    if not warned_488:
+                        print("[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation.")
+                        failures.append((kind, d, "provider unavailable"))
+                        warned_488 = True
+                else:
+                    failures.append((kind, d, "codes_external missing builder"))
                 continue
-            builder = getattr(cx, builder_name)
             try:
                 Hx, Hz, n, layout = builder(d)
+            except ImportError as exc:  # pragma: no cover - informative logging
+                if kind == "488":
+                    if not warned_488:
+                        print("[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation.")
+                        failures.append((kind, d, str(exc)))
+                        warned_488 = True
+                else:
+                    failures.append((kind, d, str(exc)))
+                continue
             except Exception as exc:  # pragma: no cover - informative logging
                 failures.append((kind, d, str(exc)))
                 continue
@@ -68,10 +88,4 @@ def main(argv: List[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    try:
-        import qecsim  # noqa: F401
-    except Exception as exc:  # pragma: no cover - optional dependency
-        print("qecsim is not installed; install it (e.g. `pip install qecsim`) before running this script.",
-              file=sys.stderr)
-        sys.exit(2)
     sys.exit(main())

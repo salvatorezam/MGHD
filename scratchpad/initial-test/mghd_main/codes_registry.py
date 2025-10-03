@@ -773,18 +773,37 @@ def _load_cached_color(kind: str, distance: int) -> Optional[Tuple[np.ndarray, n
     return Hx, Hz, n, layout
 
 
-def _build_color_via_external(kind: str, distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
-    try:
-        from mghd_main import codes_external as cx
-    except ImportError:
-        import importlib
-        cx = importlib.import_module("codes_external")
+def _write_color_cache(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: Dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / f"color_{kind}_d{distance}.npz"
+    payload = dict(layout)
+    np.savez_compressed(
+        path,
+        Hx=Hx.astype(np.uint8),
+        Hz=Hz.astype(np.uint8),
+        n=int(n),
+        meta=json.dumps(payload),
+    )
 
-    builder_name = f"build_color_{kind}_qecsim"
-    if not hasattr(cx, builder_name):
-        raise RuntimeError(f"codes_external missing '{builder_name}'. Install optional deps or update cache.")
-    builder = getattr(cx, builder_name)
-    return builder(distance)
+
+def _build_color_via_external(kind: str, distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+    if kind == "666":
+        try:
+            from mghd_main import codes_external as cx
+        except ImportError:
+            import importlib
+            cx = importlib.import_module("codes_external")
+        builder = getattr(cx, "build_color_666_qecsim", None)
+        if builder is None:
+            raise RuntimeError("codes_external missing 'build_color_666_qecsim'. Install optional deps or update cache.")
+        return builder(distance)
+    if kind == "488":
+        try:
+            from mghd_main import codes_external_488 as cx488
+        except ImportError as exc:
+            raise RuntimeError("codes_external_488 unavailable; install panqec or quantum-pecos.") from exc
+        return cx488.build_color_488(distance)
+    raise ValueError(f"Unsupported color code kind '{kind}'")
 
 
 def _build_color(kind: str, distance: int) -> CSSCode:
@@ -799,6 +818,8 @@ def _build_color(kind: str, distance: int) -> CSSCode:
                 f"color_{kind} d={distance} requires cached matrices. "
                 "Run `python -m tools.precompute_color_codes` after installing optional deps."
             ) from exc
+        else:
+            _write_color_cache(kind, distance, Hx, Hz, n, layout)
     layout = dict(layout)
     layout.setdefault("tiling", "6.6.6" if kind == "666" else "4.8.8")
     layout.setdefault("distance", distance)
