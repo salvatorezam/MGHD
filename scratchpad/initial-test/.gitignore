@@ -258,6 +258,8 @@ docs/Agents.md
 !tools/**
 !tests/
 !tests/**
+!color_cache/
+!color_cache/*.npz
 !training/
 !training/**
 

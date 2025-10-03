@@ -32,15 +32,26 @@ class MWPMFallback:
     def __init__(self, H: np.ndarray, *, weights: Optional[np.ndarray] = None):
         self.H = np.asarray(H, dtype=np.uint8)
         self.weights = None if weights is None else np.asarray(weights, dtype=float)
+        self.m = None
         if _HAVE_PM:
-            self.m = pm.Matching.from_check_matrix(self.H, weights=self.weights)  # type: ignore[union-attr]
+            try:
+                self.m = pm.Matching.from_check_matrix(self.H, weights=self.weights)  # type: ignore[union-attr]
+            except ValueError as exc:  # pragma: no cover - dependent on optional library
+                warnings.warn(
+                    "PyMatching could not load the parity-check matrix; falling back to GF(2) projection.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._pm_failure = exc
+            else:
+                self._pm_failure = None
         else:
-            self.m = None
             warnings.warn(
                 "PyMatching not available – MWPMFallback will use GF(2) projection fallback.",
                 RuntimeWarning,
                 stacklevel=2,
             )
+            self._pm_failure = _PM_IMPORT_ERROR
 
     def decode_batch(self, syndromes: np.ndarray) -> np.ndarray:
         """Return corrections in 'fault id' space aligned with columns of H."""
@@ -49,7 +60,7 @@ class MWPMFallback:
         if syndromes.ndim != 2:
             raise ValueError("syndromes must be rank-2 array [B, #checks]")
 
-        if _HAVE_PM:
+        if _HAVE_PM and self.m is not None:
             return self.m.decode_batch(syndromes).astype(np.uint8)  # type: ignore[union-attr]
 
         # Fallback: solve Hx=s exactly via GF(2) projection for each sample.

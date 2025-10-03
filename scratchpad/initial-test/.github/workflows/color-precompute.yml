@@ -1,0 +1,26 @@
+name: nightly-color-precompute
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  build-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install qecsim numpy
+      - name: Precompute color codes (d<=31)
+        run: python -m tools.precompute_color_codes --max-d 31 --which both
+      - name: Upload cache artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: color-code-cache
+          path: data/*.npz

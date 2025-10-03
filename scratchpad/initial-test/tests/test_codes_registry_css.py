@@ -39,10 +39,3 @@ def test_hgp_builder_css():
     code = cr.get_code("hgp", H1=H1, H2=H2)
     _css_ok(code)
     assert code.Hx.shape[1] == code.Hz.shape[1]
-
-
-def test_color_toy_commutes():
-    cr = importlib.import_module("codes_registry")
-    code = cr.get_code("color", distance=3)
-    _css_ok(code)
-    assert code.n >= 3

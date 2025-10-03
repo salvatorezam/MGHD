@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Any, Optional, Iterable, List, Tuple
 import json
 import numpy as np
@@ -113,6 +114,14 @@ def _fault_map(Hx: np.ndarray, Hz: np.ndarray) -> List[List[int]]:
     return mapping
 
 
+def _commutes_mod2(A: np.ndarray, B: np.ndarray) -> bool:
+    """Return True if AB == BA over GF(2)."""
+
+    A = _ensure_binary(A)
+    B = _ensure_binary(B)
+    return np.array_equal((A @ B) % 2, (B @ A) % 2)
+
+
 def _make_css(
     *,
     name: str,
@@ -153,6 +162,41 @@ def _make_css(
         num_observables=num_observables,
     )
 
+
+# ---------------------------------------------------------------------------
+# Circulant helpers for generalized/bivariate bicycle codes
+# ---------------------------------------------------------------------------
+
+
+def circulant_from_taps(n: int, taps: Iterable[int]) -> np.ndarray:
+    """n x n binary circulant with ones at "taps" in the first row."""
+
+    row0 = np.zeros(n, dtype=np.uint8)
+    for t in taps:
+        row0[int(t) % n] ^= 1
+    mat = np.zeros((n, n), dtype=np.uint8)
+    for i in range(n):
+        mat[i] = np.roll(row0, i)
+    return mat
+
+
+def _perm_matrix(n: int) -> np.ndarray:
+    P = np.zeros((n, n), dtype=np.uint8)
+    P[np.arange(n), (np.arange(n) + 1) % n] = 1
+    return P
+
+
+def bccb_from_taps(n1: int, n2: int, taps_2d: Iterable[Tuple[int, int]]) -> np.ndarray:
+    """Block-circulant-with-circulant-blocks (BCCB) matrix over GF(2)."""
+
+    Px = _perm_matrix(n1)
+    Py = _perm_matrix(n2)
+    mat = np.zeros((n1 * n2, n1 * n2), dtype=np.uint8)
+    for ax, ay in taps_2d:
+        Ax = np.linalg.matrix_power(Px, int(ax) % n1)
+        Ay = np.linalg.matrix_power(Py, int(ay) % n2)
+        mat ^= np.kron(Ax, Ay).astype(np.uint8)
+    return mat
 
 def save_npz(hx: np.ndarray, hz: np.ndarray, path: str | np.ndarray, meta: Dict[str, Any], **extras: Any) -> None:
     data: Dict[str, Any] = {
@@ -369,23 +413,91 @@ def bb_gross() -> CodeSpec:
     return bb_from_shifts(l=12, m=6, a=(3, -1), b=(-1, -3))
 
 
-def build_bb(n1: int = 31, n2: int = 31, *, w1: int = 3, w2: int = 3) -> CSSCode:
-    rng = np.random.default_rng(123)
+def build_gb_two_block(
+    n: int,
+    taps_a: Iterable[int],
+    taps_b: Iterable[int],
+    *,
+    name: str = "gb",
+) -> CSSCode:
+    """Two-block generalized-bicycle code: Hx=[A|B], Hz=[B^T|A^T]."""
 
-    def circ_H(n: int, w: int) -> np.ndarray:
-        H = np.zeros((n, n), dtype=np.uint8)
-        base = rng.choice(n, size=w, replace=False)
-        for r in range(n):
-            idx = (base + r) % n
-            H[r, idx] = 1
-        return H
+    A = circulant_from_taps(n, taps_a)
+    B = circulant_from_taps(n, taps_b)
+    if not _commutes_mod2(A, B):
+        raise ValueError("Two-block GB construction requires commuting circulant matrices A and B")
+    Hx = np.concatenate([A, B], axis=1)
+    Hz = np.concatenate([B.T, A.T], axis=1)
+    _assert_css(Hx, Hz)
+    N = Hx.shape[1]
+    dets_per_fault = []
+    mx, mz = Hx.shape[0], Hz.shape[0]
+    for j in range(N):
+        dets = []
+        dets.extend(np.flatnonzero(Hx[:, j]).tolist())
+        dets.extend((mx + np.flatnonzero(Hz[:, j])).tolist())
+        dets_per_fault.append(dets)
+    return CSSCode(
+        name=name,
+        distance=-1,
+        n=N,
+        k=-1,
+        Hx=Hx,
+        Hz=Hz,
+        layout={"n": n, "two_block": True},
+        detectors_per_fault=dets_per_fault,
+        fault_weights=[1.0] * N,
+        num_detectors=mx + mz,
+        num_observables=1,
+    )
 
-    H1 = circ_H(n1, w1)
-    H2 = circ_H(n2, w2)
-    code = build_hgp(H1, H2, name="bb")
-    code.layout.update({"n1": n1, "n2": n2, "w1": w1, "w2": w2})
-    code.distance = -1
-    return code
+
+def build_bb_bivariate(
+    n1: int,
+    n2: int,
+    taps_a_2d: Iterable[Tuple[int, int]],
+    taps_b_2d: Iterable[Tuple[int, int]],
+) -> CSSCode:
+    """Bivariate bicycle via block-circulant matrices."""
+
+    A = bccb_from_taps(n1, n2, taps_a_2d)
+    B = bccb_from_taps(n1, n2, taps_b_2d)
+    if not _commutes_mod2(A, B):
+        raise ValueError("BCCB matrices for BB code must commute over GF(2)")
+    Hx = np.concatenate([A, B], axis=1)
+    Hz = np.concatenate([B.T, A.T], axis=1)
+    _assert_css(Hx, Hz)
+    N = Hx.shape[1]
+    dets_per_fault = []
+    mx, mz = Hx.shape[0], Hz.shape[0]
+    for j in range(N):
+        dets = []
+        dets.extend(np.flatnonzero(Hx[:, j]).tolist())
+        dets.extend((mx + np.flatnonzero(Hz[:, j])).tolist())
+        dets_per_fault.append(dets)
+    return CSSCode(
+        name="bb",
+        distance=-1,
+        n=N,
+        k=-1,
+        Hx=Hx,
+        Hz=Hz,
+        layout={"n1": n1, "n2": n2, "two_block": True, "bivariate": True},
+        detectors_per_fault=dets_per_fault,
+        fault_weights=[1.0] * N,
+        num_detectors=mx + mz,
+        num_observables=1,
+    )
+
+
+def build_bb(
+    n1: int = 17,
+    n2: int = 17,
+    *,
+    taps_a_2d: Iterable[Tuple[int, int]] = ((0, 0), (1, 0), (0, 1)),
+    taps_b_2d: Iterable[Tuple[int, int]] = ((0, 0), (2, 0), (0, 2)),
+) -> CSSCode:
+    return build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d)
 
 
 # ---------------------------------------------------------------------------
@@ -413,20 +525,9 @@ def build_hgp(H1: np.ndarray, H2: np.ndarray, *, name: str = "hgp") -> CSSCode:
         raise ValueError("H1 and H2 must be provided for the HGP builder")
     H1 = _ensure_binary(np.asarray(H1, dtype=np.uint8))
     H2 = _ensure_binary(np.asarray(H2, dtype=np.uint8))
-    m1, n1 = H1.shape
-    m2, n2 = H2.shape
-    I_n1 = np.eye(n1, dtype=np.uint8)
-    I_m1 = np.eye(m1, dtype=np.uint8)
-    I_n2 = np.eye(n2, dtype=np.uint8)
-    I_m2 = np.eye(m2, dtype=np.uint8)
-
-    Hx_left = np.kron(H1, I_n2).astype(np.uint8)
-    Hx_right = np.kron(I_m1, H2.T).astype(np.uint8)
-    Hx = np.concatenate([Hx_left, Hx_right], axis=1)
-
-    Hz_left = np.kron(I_n1, H2).astype(np.uint8)
-    Hz_right = np.kron(H1.T, I_m2).astype(np.uint8)
-    Hz = np.concatenate([Hz_left, Hz_right], axis=1)
+    spec = hgp_from_classical(H1, H2)
+    Hx = spec.hx
+    Hz = spec.hz
     layout = {"H1_shape": H1.shape, "H2_shape": H2.shape}
     return _make_css(
         name=name,
@@ -488,37 +589,103 @@ def qrm_hamming(m: int) -> CodeSpec:
                     meta={"m": m, "syndrome_order": "Z_first_then_X"})
 
 
-def build_color(distance: int) -> CSSCode:
-    d = int(distance)
-    if d != 3:
-        raise ValueError("Only distance=3 triangular color code is provided")
-    H = np.array([
-        [1, 0, 0, 1, 0, 1, 1],
-        [0, 1, 0, 1, 1, 0, 1],
-        [0, 0, 1, 0, 1, 1, 1],
-    ], dtype=np.uint8)
-    layout = {"triangular": True, "distance": d}
+DATA_DIR = Path(__file__).resolve().parent.parent / "color_cache"
+
+
+def _load_cached_color(kind: str, distance: int) -> Optional[Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]]:
+    path = DATA_DIR / f"color_{kind}_d{distance}.npz"
+    if not path.exists():
+        return None
+    data = np.load(path, allow_pickle=False)
+    Hx = data["Hx"].astype(np.uint8)
+    Hz = data["Hz"].astype(np.uint8)
+    n = int(data["n"])
+    meta_raw = data.get("meta")
+    if meta_raw is not None:
+        if isinstance(meta_raw, np.ndarray):
+            meta_raw = meta_raw.item()
+        if isinstance(meta_raw, bytes):
+            meta_raw = meta_raw.decode("utf-8")
+        try:
+            layout = json.loads(meta_raw)
+        except Exception:
+            layout = {"meta": meta_raw}
+    else:
+        layout = {}
+    return Hx, Hz, n, layout
+
+
+def _build_color_via_external(kind: str, distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+    try:
+        from mghd_main import codes_external as cx
+    except ImportError:
+        import importlib
+        cx = importlib.import_module("codes_external")
+
+    builder_name = f"build_color_{kind}_qecsim"
+    if not hasattr(cx, builder_name):
+        raise RuntimeError(f"codes_external missing '{builder_name}'. Install optional deps or update cache.")
+    builder = getattr(cx, builder_name)
+    return builder(distance)
+
+
+def _build_color(kind: str, distance: int) -> CSSCode:
+    cached = _load_cached_color(kind, distance)
+    if cached is not None:
+        Hx, Hz, n, layout = cached
+    else:
+        try:
+            Hx, Hz, n, layout = _build_color_via_external(kind, distance)
+        except Exception as exc:
+            raise RuntimeError(
+                f"color_{kind} d={distance} requires cached matrices. "
+                "Run `python -m tools.precompute_color_codes` after installing optional deps."
+            ) from exc
+    layout = dict(layout)
+    layout.setdefault("tiling", "6.6.6" if kind == "666" else "4.8.8")
+    layout.setdefault("distance", distance)
     return _make_css(
-        name="color",
-        distance=d,
-        Hx=H,
-        Hz=H,
+        name=f"color_{kind}",
+        distance=distance,
+        Hx=Hx,
+        Hz=Hz,
         layout=layout,
-        fault_weights=[1.0] * 7,
+        fault_weights=[1.0] * Hx.shape[1],
         num_observables=1,
     )
+
+
+def build_color_666_triangle(distance: int) -> CSSCode:
+    return _build_color("666", distance)
+
+
+def build_color_488_triangle(distance: int) -> CSSCode:
+    return _build_color("488", distance)
+
+
+def build_color(distance: int, *, tiling: str = "6.6.6") -> CSSCode:
+    tiling = tiling.strip().lower()
+    if tiling in {"6.6.6", "666", "honeycomb"}:
+        return build_color_666_triangle(distance)
+    if tiling in {"4.8.8", "488", "square-octagon"}:
+        return build_color_488_triangle(distance)
+    raise ValueError("tiling must be '6.6.6' or '4.8.8'")
 
 
 REGISTRY = {
     "surface": lambda distance, **kw: build_surface(distance, **kw),
     "repetition": lambda distance, **kw: build_repetition(distance, **kw),
     "steane": lambda distance=None, **kw: build_steane(),
-    "color": lambda distance, **kw: build_color(distance, **kw),
-    "bb": lambda distance=None, n1=31, n2=31, w1=3, w2=3, **kw: build_bb(n1=n1, n2=n2, w1=w1, w2=w2),
+    "color": lambda distance, tiling="6.6.6", **kw: build_color(distance, tiling=tiling, **kw),
+    "color_666": lambda distance, **kw: build_color_666_triangle(distance),
+    "color_488": lambda distance, **kw: build_color_488_triangle(distance),
+    "gb": lambda distance=None, n=47, taps_a=(0, 1, 3), taps_b=(0, 2, 5), **kw: build_gb_two_block(n, taps_a, taps_b, name="gb"),
+    "bb": lambda distance=None, n1=17, n2=17, taps_a_2d=((0, 0), (1, 0), (0, 1)),
+           taps_b_2d=((0, 0), (2, 0), (0, 2)), **kw: build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d),
     "hgp": lambda distance=None, H1=None, H2=None, name="hgp", **kw: build_hgp(H1, H2, name=name),
 }
 
-_OPTIONAL_DISTANCE = {"steane", "bb", "hgp"}
+_OPTIONAL_DISTANCE = {"steane", "gb", "bb", "hgp"}
 
 
 def get_code(family: str, distance: Optional[int] = None, **kw) -> CSSCode:

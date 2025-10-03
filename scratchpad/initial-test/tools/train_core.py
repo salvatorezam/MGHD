@@ -61,6 +61,14 @@ def main() -> None:
         default="surface",
         help="code family id in codes_registry (e.g., surface, bb, rm, steane, repetition, color)",
     )
+    p.add_argument(
+        "--families",
+        default=None,
+        help=(
+            "Comma-separated list of families to sweep (overrides --family). "
+            "Example: 'surface,color_666,color_488,steane,repetition,gb,bb,hgp'."
+        ),
+    )
     p.add_argument("--distances", default="3-31:2", help="e.g., '3,5,7' or '3-31:2'")
     p.add_argument("--sampler", default="cudaq", choices=["cudaq", "stim"])
     p.add_argument("--shots-per-batch", type=int, default=128)
@@ -72,15 +80,22 @@ def main() -> None:
     args = p.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    distances = parse_distances(args.distances)
+    if args.families:
+        families = [f.strip() for f in args.families.split(",") if f.strip()]
+        if not families:
+            raise ValueError("--families specified but no valid entries parsed")
+    else:
+        families = [args.family]
 
     # Sampler (CUDA-Q is the default; actual CLN via trajectories)  [Ref CUDA-Q]
     sampler = get_sampler(args.sampler)
 
-    for d in distances:
-        print(f"\n=== Family={args.family}  d={d}  sampler={args.sampler} ===")
-        # Load code object (Hx/Hz, detector metadata, hypergraph mapping if available)
-        code = load_code(args.family, d)
+    for family in families:
+        distances = parse_distances(args.distances)
+        for d in distances:
+            print(f"\n=== Family={family}  d={d}  sampler={args.sampler} ===")
+            # Load code object (Hx/Hz, detector metadata, hypergraph mapping if available)
+            code = load_code(family, d)
         Hx = getattr(code, "Hx", None)
         Hz = getattr(code, "Hz", None)
 
@@ -115,7 +130,7 @@ def main() -> None:
 
         dt = time.time() - t0
         print(
-            f"[done] batches={args.batches} shots/batch={args.shots_per_batch} "
+            f"[done] family={family} d={d} batches={args.batches} shots/batch={args.shots_per_batch} "
             f"teacher-usage={totals} elapsed={dt:.2f}s"
         )
 if __name__ == "__main__":

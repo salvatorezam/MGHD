@@ -748,3 +748,7 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 - Expanded `mghd_main/codes_registry.py` with `CSSCode` carrier, GF(2) helpers, and builder wrappers: rotated surface → CSSCode, repetition (X/Z bases), Steane, HGP/BB via circulants, and a toy triangular color code. All expose `detectors_per_fault`, `num_detectors`, and `detectors_to_syndromes` fallbacks.
 - Registered families via `REGISTRY`/`get_code` so the training CLI can sweep surface d≤31, repetition, steane, color, BB, and HGP; updated loader + mixer to consume the richer metadata.
 - Added `tests/test_codes_registry_css.py` to verify CSS commutation and shape sanity across the new families; wired into pytest discovery. Full suite (`pytest -q`) now yields 12 passes.
+
+- Added `tools/precompute_color_codes.py` to cache triangular color-code CSS matrices (6.6.6 / 4.8.8) for odd `d ≤ 31` under `color_cache/`, plus nightly GitHub workflow `color-precompute.yml` that uploads artifacts.
+- `tools/train_core.py` now accepts `--families` to sweep multiple registry entries in one run (surface/color/repetition/steane/gb/bb/hgp), with teacher usage summaries per family-distance pair.
+- `codes_registry` gains optional cache loaders + qecsim adapters for `color_666`/`color_488`, algebraic GB/BB (two-block) and block-form HGP; new tests (`tests/test_color_and_bb_full.py`, `tests/test_precompute_and_cli.py`) skip gracefully when optional deps are absent.
