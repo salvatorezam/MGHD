@@ -730,3 +730,9 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 - Layered distance-agnostic clustering + GF(2) ML projection into `core.py` while preserving lazy load of `mghd_main.core`; exports now include `Cluster`, `Subproblem`, `active_components`, `ml_parity_project`, and batch helpers.
 - Added `tests/test_cluster_logic.py` with brute-force cross-checks and updated `pytest.ini` (`python_files`) so Step-B smoke + layout tests run in CI (`pytest -q`).
 - Verified CSS batch path via `infer_clusters_batched` plus single-check handling; tests: `pytest -q`.
+
+2025-10-03 13:35 UTC
+
+- Wired teacher stack: `teachers/mwpf_teacher.py` (MWPF with heuristic fallback), `teachers/lsd_teacher.py` (ldpc BP+LSD with GF(2) projection fallback), and `teachers/mwpm_fallback.py` (PyMatching + parity solver fallback) plus the stochastic mixer in `teachers/mix.py`.
+- Added `tests/test_teachers_mix.py` smoke exercising the mixer and updated `pytest.ini` to auto-discover it; suite now covers layout, clustering, and teacher mix flows.
+- Dependencies remain optional; fallbacks keep CI green while emitting warnings to install `mwpf`, `ldpc`, and `pymatching`. Tests: `pytest -q`.

@@ -1,8 +1,16 @@
-"""
-Teachers will land in Step C:
-  - mwpf_teacher.py (primary)
-  - lsd_teacher.py   (primary)
-  - mwpm_fallback.py (fallback)
-They will consume detection streams + code structure directly,
-without requiring a Stim DEM for training.
-"""
+"""Teacher package exposing MWPF/LSD/MWPM helpers and mixers."""
+
+from .lsd_teacher import LSDConfig, LSDTeacher
+from .mix import MixConfig, TeacherMix
+from .mwpf_teacher import MWPFConfig, MWPFTeacher
+from .mwpm_fallback import MWPMFallback
+
+__all__ = [
+    "LSDConfig",
+    "LSDTeacher",
+    "MixConfig",
+    "TeacherMix",
+    "MWPFConfig",
+    "MWPFTeacher",
+    "MWPMFallback",
+]
