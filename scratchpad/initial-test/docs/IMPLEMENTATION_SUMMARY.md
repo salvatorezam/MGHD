@@ -724,3 +724,9 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 - Added lazy wrappers `core.py`/`codes_registry.py` to defer heavy torch import until attribute access, keeping legacy flat imports alive for smoke tests.
 - Dropped CUDA-Q-first scaffolding: new `samplers/` package with registry and CUDA-Q/Stim stubs, `teachers/__init__.py`, and minimal `tools/` entrypoints (`train_core`, `bench_decode`).
 - Locked CI baseline via `tests/test_repo_layout.py` + `pytest.ini` to only run repo-layout smoke checks; verified with `pytest -q` and `python -m tools.train_core --sampler cudaq --shots 32`.
+
+2025-10-03 13:15 UTC
+
+- Layered distance-agnostic clustering + GF(2) ML projection into `core.py` while preserving lazy load of `mghd_main.core`; exports now include `Cluster`, `Subproblem`, `active_components`, `ml_parity_project`, and batch helpers.
+- Added `tests/test_cluster_logic.py` with brute-force cross-checks and updated `pytest.ini` (`python_files`) so Step-B smoke + layout tests run in CI (`pytest -q`).
+- Verified CSS batch path via `infer_clusters_batched` plus single-check handling; tests: `pytest -q`.
