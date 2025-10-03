@@ -742,3 +742,9 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 - Added curriculum/code-loading utilities (`tools/curriculum.py`, `tools/code_loader.py`) and rewired `tools/train_core.py` into the CUDA-Q → teacher loop with distance sweep, RNG seeding, and per-batch teacher usage stats.
 - Hardened teacher mix to disable MWPF gracefully when codes lack hypergraph metadata, renormalising probabilities and relying on LSD/MWPM fallbacks.
 - Introduced subprocess regression `tests/test_train_core_smoke.py` (PYTHONPATH isolated) and expanded `pytest.ini` discovery; suite passes under fallback samplers + teachers (`pytest -q`). Sample command: `python -m tools.train_core --family surface --distances 3-7:2 --sampler cudaq --shots-per-batch 32 --batches 3`.
+
+2025-10-03 15:13 UTC
+
+- Expanded `mghd_main/codes_registry.py` with `CSSCode` carrier, GF(2) helpers, and builder wrappers: rotated surface → CSSCode, repetition (X/Z bases), Steane, HGP/BB via circulants, and a toy triangular color code. All expose `detectors_per_fault`, `num_detectors`, and `detectors_to_syndromes` fallbacks.
+- Registered families via `REGISTRY`/`get_code` so the training CLI can sweep surface d≤31, repetition, steane, color, BB, and HGP; updated loader + mixer to consume the richer metadata.
+- Added `tests/test_codes_registry_css.py` to verify CSS commutation and shape sanity across the new families; wired into pytest discovery. Full suite (`pytest -q`) now yields 12 passes.
