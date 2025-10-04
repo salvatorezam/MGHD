@@ -16,6 +16,7 @@ import warnings
 from .mwpf_teacher import MWPFConfig, MWPFTeacher
 from .lsd_teacher import LSDConfig, LSDTeacher
 from .mwpm_fallback import MWPMFallback
+from .erasure_surface_ml import ErasureSurfaceMLTeacher
 
 
 @dataclass
@@ -69,6 +70,16 @@ class TeacherMix:
         self.lsd = LSDTeacher(Hx, Hz, cfg=lsd_cfg or LSDConfig())
         self.mwpm_x = MWPMFallback(Hx)
         self.mwpm_z = MWPMFallback(Hz)
+        self.erasure_surface = None
+        if getattr(code_obj, "name", None) == "surface":
+            try:
+                self.erasure_surface = ErasureSurfaceMLTeacher(code_obj)
+            except Exception as exc:  # pragma: no cover - degrade gracefully
+                warnings.warn(
+                    f"ErasureSurfaceMLTeacher unavailable ({exc}); continuing without erasure teacher.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         total = probs.sum()
         if total <= 0:
@@ -83,9 +94,27 @@ class TeacherMix:
         syndromes_x: np.ndarray,
         syndromes_z: np.ndarray,
         rng: Optional[np.random.Generator] = None,
+        *,
+        erase_data_mask: Optional[np.ndarray] = None,
+        erase_det_mask: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         rng = rng or np.random.default_rng()
         r = float(rng.uniform())
+        has_erasure = erase_data_mask is not None and np.any(erase_data_mask)
+        if has_erasure and self.erasure_surface is not None:
+            try:
+                return self.erasure_surface.decode_batch(
+                    syndromes_x,
+                    syndromes_z,
+                    erase_data_mask,
+                    erase_det_mask,
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"Erasure surface teacher failed ({exc}); falling back to stochastic mix.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         try:
             if self.mwpf is not None and r < self.mix.p_mwpf:
                 out = self.mwpf.decode_batch(dets)
