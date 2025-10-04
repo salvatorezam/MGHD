@@ -17,6 +17,7 @@ from .mwpf_teacher import MWPFConfig, MWPFTeacher
 from .lsd_teacher import LSDConfig, LSDTeacher
 from .mwpm_fallback import MWPMFallback
 from .erasure_surface_ml import ErasureSurfaceMLTeacher
+from .erasure_peeling import ErasureQLDPCPeelingTeacher
 
 
 @dataclass
@@ -24,6 +25,7 @@ class MixConfig:
     p_mwpf: float = 0.5
     p_lsd: float = 0.4
     p_mwpm: float = 0.1
+    max_cluster: int = 256
 
 
 class TeacherMix:
@@ -71,6 +73,7 @@ class TeacherMix:
         self.mwpm_x = MWPMFallback(Hx)
         self.mwpm_z = MWPMFallback(Hz)
         self.erasure_surface = None
+        self.erasure_qldpc = None
         if getattr(code_obj, "name", None) == "surface":
             try:
                 self.erasure_surface = ErasureSurfaceMLTeacher(code_obj)
@@ -80,13 +83,26 @@ class TeacherMix:
                     RuntimeWarning,
                     stacklevel=2,
                 )
+        else:
+            try:
+                self.erasure_qldpc = ErasureQLDPCPeelingTeacher(
+                    Hx,
+                    Hz,
+                    max_cluster=self.mix.max_cluster,
+                )
+            except Exception as exc:  # pragma: no cover - degrade gracefully
+                warnings.warn(
+                    f"ErasureQLDPCPeelingTeacher unavailable ({exc}); continuing without erasure teacher.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         total = probs.sum()
         if total <= 0:
             probs = np.array([0.0, 0.0, 1.0], dtype=float)
         else:
             probs = probs / total
-        self.mix = MixConfig(*probs.tolist())
+        self.mix = MixConfig(probs[0], probs[1], probs[2], self.mix.max_cluster)
 
     def route_batch(
         self,
@@ -112,6 +128,20 @@ class TeacherMix:
             except Exception as exc:
                 warnings.warn(
                     f"Erasure surface teacher failed ({exc}); falling back to stochastic mix.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if has_erasure and self.erasure_qldpc is not None:
+            try:
+                return self.erasure_qldpc.decode_batch(
+                    syndromes_x,
+                    syndromes_z,
+                    erase_data_mask,
+                    erase_det_mask,
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"Erasure qLDPC teacher failed ({exc}); falling back to stochastic mix.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
