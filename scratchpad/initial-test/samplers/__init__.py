@@ -9,6 +9,24 @@ Note:
   CUDA-Q trajectories simulate general (Kraus/coherent) noise at circuit level.
   Stim's fast path assumes Pauli channels + stabilizer ops; use only for A/B checks.
 """
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+import numpy as np
+
+
+@dataclass
+class SampleBatch:
+    """Container returned by samplers."""
+
+    dets: np.ndarray     # uint8 [B, D]
+    obs: np.ndarray      # uint8 [B, K]
+    meta: Dict[str, Any]
+    erase_data_mask: Optional[np.ndarray] = None  # uint8/bool [B, n]
+    erase_det_mask: Optional[np.ndarray] = None   # uint8/bool [B, D]
+    p_erase_data: Optional[np.ndarray] = None     # float [B, n]
+
+
 from .registry import get_sampler, register_sampler
 from .cudaq_sampler import CudaQSampler  # ensures availability
 try:
@@ -16,4 +34,11 @@ try:
 except Exception:
     StimSampler = None  # noqa: N816
 
-__all__ = ["get_sampler", "register_sampler", "CudaQSampler", "StimSampler"]
+
+__all__ = [
+    "get_sampler",
+    "register_sampler",
+    "CudaQSampler",
+    "StimSampler",
+    "SampleBatch",
+]

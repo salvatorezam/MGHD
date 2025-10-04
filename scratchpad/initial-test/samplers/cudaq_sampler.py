@@ -9,19 +9,13 @@ Expected to find your files on PYTHONPATH:
 If those live outside the repo, ensure PYTHONPATH includes their parent dirs.
 """
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 import importlib
 import os
 
 import numpy as np
 
-
-@dataclass
-class SampleBatch:
-    dets: np.ndarray     # uint8 [B, D]
-    obs: np.ndarray      # uint8 [B, K]
-    meta: Dict[str, Any] # e.g., {"code": name, "d": distance, ...}
+from . import SampleBatch
 
 
 class CudaQSampler:
@@ -40,6 +34,7 @@ class CudaQSampler:
         if self.mode not in {"foundation", "student"}:
             self.mode = "foundation"
         self.rounds = int(self.profile_kwargs.get("rounds", 3))
+        self.inject_erasure_frac = float(self.profile_kwargs.pop("inject_erasure_frac", 0.0))
         # Lazy import of user's modules (keeps repo portable)
         self._gpu_noise = self._maybe_import("cudaq_backend.garnet_noise", "make_garnet_noise")
         # Optional adapter if user provides it (not required here)
@@ -101,7 +96,40 @@ class CudaQSampler:
             meta["cudaq_error"] = str(exc)
 
         obs = self._logical_observables(code_obj, x_err, z_err)
-        return SampleBatch(dets=dets.astype(np.uint8), obs=obs, meta=meta)
+        erase_data_mask, erase_det_mask, p_erase_data = self._build_erasure_masks(
+            n_shots,
+            dets.shape[1],
+            Hx.shape[1],
+            rng,
+        )
+        if self.inject_erasure_frac > 0:
+            meta.setdefault("erasure_frac", self.inject_erasure_frac)
+        return SampleBatch(
+            dets=dets.astype(np.uint8),
+            obs=obs,
+            meta=meta,
+            erase_data_mask=erase_data_mask,
+            erase_det_mask=erase_det_mask,
+            p_erase_data=p_erase_data,
+        )
+
+    def _build_erasure_masks(
+        self,
+        n_shots: int,
+        num_detectors: int,
+        num_data: int,
+        rng: np.random.Generator,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """Construct erasure masks (data/detector) and optional probabilities."""
+
+        erase_data_mask = np.zeros((n_shots, num_data), dtype=np.uint8)
+        erase_det_mask = np.zeros((n_shots, num_detectors), dtype=np.uint8)
+        p_erase_data = None
+        if self.inject_erasure_frac > 0:
+            mask = rng.random((n_shots, num_data)) < self.inject_erasure_frac
+            erase_data_mask = mask.astype(np.uint8)
+            p_erase_data = np.full((n_shots, num_data), self.inject_erasure_frac, dtype=np.float32)
+        return erase_data_mask, erase_det_mask, p_erase_data
 
     # ------------------------------------------------------------------
     # CUDA-Q backed sampling helpers

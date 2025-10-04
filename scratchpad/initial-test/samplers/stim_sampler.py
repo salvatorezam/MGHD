@@ -7,16 +7,11 @@ WARNING:
   into Stim/Sinter-centric tooling, not for 'actual circuit-level' training.
 """
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import numpy as np
 
 
-@dataclass
-class SampleBatch:
-    dets: np.ndarray
-    obs: np.ndarray
-    meta: Dict[str, Any]
+from . import SampleBatch
 
 
 class StimSampler:

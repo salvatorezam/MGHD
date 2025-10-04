@@ -260,6 +260,52 @@ def _enumerate_min_weight_solution(
     return x0
 
 
+def solve_on_erasure(
+    H: np.ndarray,
+    s: np.ndarray,
+    mask_cols: np.ndarray,
+    mask_rows: Optional[np.ndarray] = None,
+    *,
+    r_cap: int = 18,
+) -> np.ndarray:
+    """Solve ``H_E x = s'`` over GF(2) restricted to erased columns/rows."""
+
+    H = (np.asarray(H, dtype=np.uint8) & 1)
+    s = (np.asarray(s, dtype=np.uint8) & 1).reshape(-1)
+    if H.shape[0] != s.shape[0]:
+        raise ValueError("Row count of H must match length of syndrome")
+
+    mask_cols = np.asarray(mask_cols, dtype=np.uint8).reshape(-1)
+    if mask_cols.shape[0] != H.shape[1]:
+        raise ValueError("mask_cols must match number of columns in H")
+    erased_cols = mask_cols.astype(bool)
+    if not erased_cols.any():
+        return np.zeros(H.shape[1], dtype=np.uint8)
+
+    if mask_rows is not None:
+        mask_rows = np.asarray(mask_rows, dtype=np.uint8).reshape(-1)
+        if mask_rows.shape[0] != H.shape[0]:
+            raise ValueError("mask_rows must match number of rows in H")
+        rows_keep = ~mask_rows.astype(bool)
+    else:
+        rows_keep = np.ones(H.shape[0], dtype=bool)
+
+    if not rows_keep.any():
+        x = np.zeros(H.shape[1], dtype=np.uint8)
+        return x
+
+    H_E = H[rows_keep][:, erased_cols]
+    s_E = s[rows_keep]
+    if H_E.size == 0:
+        x = np.zeros(H.shape[1], dtype=np.uint8)
+        return x
+
+    y = _enumerate_min_weight_solution(H_E, s_E, None, r_cap=r_cap)
+    x = np.zeros(H.shape[1], dtype=np.uint8)
+    x[erased_cols] = y
+    return x
+
+
 def ml_parity_project(
     H_local: np.ndarray,
     s_local: np.ndarray,
@@ -371,6 +417,7 @@ __all__ = [
     "Subproblem",
     "active_components",
     "extract_subproblem",
+    "solve_on_erasure",
     "ml_parity_project",
     "infer_clusters_once",
     "infer_clusters_batched",
