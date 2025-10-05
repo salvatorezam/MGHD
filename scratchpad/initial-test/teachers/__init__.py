@@ -1,11 +1,31 @@
 """Teacher package exposing MWPF/LSD/MWPM helpers and mixers."""
 
+import warnings
+
 from .lsd_teacher import LSDConfig, LSDTeacher
 from .mix import MixConfig, TeacherMix
 from .mwpf_teacher import MWPFConfig, MWPFTeacher
 from .mwpm_fallback import MWPMFallback
-from .erasure_surface_ml import ErasureSurfaceMLTeacher
-from .erasure_peeling import ErasureQLDPCPeelingTeacher
+
+try:
+    from .erasure_surface_ml import ErasureSurfaceMLTeacher
+except Exception as exc:  # pragma: no cover - optional dependency stack
+    ErasureSurfaceMLTeacher = None
+    warnings.warn(
+        f"ErasureSurfaceMLTeacher unavailable ({exc}); import will skip erasure teacher.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+try:
+    from .erasure_peeling import ErasureQLDPCPeelingTeacher
+except Exception as exc:  # pragma: no cover - optional dependency stack
+    ErasureQLDPCPeelingTeacher = None
+    warnings.warn(
+        f"ErasureQLDPCPeelingTeacher unavailable ({exc}); import will skip erasure teacher.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 __all__ = [
     "LSDConfig",
@@ -15,6 +35,9 @@ __all__ = [
     "MWPFConfig",
     "MWPFTeacher",
     "MWPMFallback",
-    "ErasureSurfaceMLTeacher",
-    "ErasureQLDPCPeelingTeacher",
 ]
+
+if ErasureSurfaceMLTeacher is not None:
+    __all__.append("ErasureSurfaceMLTeacher")
+if ErasureQLDPCPeelingTeacher is not None:
+    __all__.append("ErasureQLDPCPeelingTeacher")
