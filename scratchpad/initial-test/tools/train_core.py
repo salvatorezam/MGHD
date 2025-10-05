@@ -24,6 +24,7 @@ import pathlib
 import sys
 import time
 import warnings
+from dataclasses import asdict
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -205,6 +206,12 @@ def main() -> None:
     p.add_argument("--p-mwpf", type=float, default=0.5)
     p.add_argument("--p-lsd", type=float, default=0.4)
     p.add_argument("--p-mwpm", type=float, default=0.1)
+    p.add_argument("--dem-enable", action="store_true")
+    p.add_argument("--dem-family", type=str, default=None)
+    p.add_argument("--dem-rounds", type=int, default=5)
+    p.add_argument("--dem-correlated", action="store_true")
+    p.add_argument("--dem-cache-dir", type=str, default="dem_cache")
+    p.add_argument("--dem-force-build", action="store_true")
     p.add_argument("--qpu-profile", type=str, default=None)
     p.add_argument(
         "--context-source",
@@ -252,6 +259,7 @@ def main() -> None:
             base_overrides: Dict[str, Any] = {}
             ctx_vec = None
             profile = None
+            profile_dict: Dict[str, Any] = {}
             if args.qpu_profile and args.context_source != "none":
                 try:
                     from mghd_main.qpu_profile import load_qpu_profile
@@ -279,6 +287,7 @@ def main() -> None:
                         tad_context = None
                     else:
                         n_qubits = _infer_data_qubits(code) or int(getattr(profile, "n_qubits", 0))
+                        profile_dict = asdict(profile)
                         weight_maps = tad_weighting.schedule_to_weight_maps(
                             schedule_ir,
                             profile,
@@ -295,10 +304,76 @@ def main() -> None:
                             "profile": getattr(profile, "name", "unknown"),
                         }
 
+            dem_teacher = None
+            if args.dem_enable:
+                target_family = args.dem_family or family
+                if target_family not in {"surface"}:
+                    warnings.warn(
+                        f"DEM build currently supported for {{'surface'}}; skipping for family='{target_family}'.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                else:
+                    try:
+                        import stim  # type: ignore
+                    except Exception as exc:
+                        warnings.warn(
+                            f"Stim not available for DEM construction: {exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    else:
+                        from teachers.dem_utils import dem_cache_path, build_surface_memory_dem
+                        try:
+                            from teachers.dem_matching import DEMMatchingTeacher
+                        except Exception as exc:
+                            warnings.warn(
+                                f"DEM matching unavailable: {exc}",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                        else:
+                            profile_payload = profile_dict if profile_dict else {}
+                            cache_path = pathlib.Path(
+                                dem_cache_path(
+                                    args.dem_cache_dir,
+                                    target_family,
+                                    d,
+                                    args.dem_rounds,
+                                    profile_payload,
+                                )
+                            )
+                            dem_obj = None
+                            try:
+                                if not args.dem_force_build and cache_path.exists():
+                                    dem_obj = stim.DetectorErrorModel(cache_path.read_text())
+                                else:
+                                    dem_obj = build_surface_memory_dem(
+                                        distance=d,
+                                        rounds=args.dem_rounds,
+                                        profile=profile_payload,
+                                        decompose=not args.dem_correlated,
+                                    )
+                                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                                    cache_path.write_text(str(dem_obj))
+                                dem_teacher = DEMMatchingTeacher(
+                                    dem_obj,
+                                    correlated=args.dem_correlated,
+                                )
+                            except Exception as exc:
+                                warnings.warn(
+                                    f"Failed to prepare DEM teacher: {exc}",
+                                    RuntimeWarning,
+                                    stacklevel=2,
+                                )
+
             totals = {"mwpf": 0, "lsd": 0, "mwpm": 0, "mwpm_fallback": 0}
+            if dem_teacher is not None:
+                totals["dem_matching"] = 0
             t0 = time.time()
             true_chunks = []
             pred_chunks = []
+            dem_pred_chunks = []
 
             bandit = None
             bandit_ctx = None
@@ -353,8 +428,12 @@ def main() -> None:
                     rng=rng,
                     context=context_payload,
                     weight_overrides=overrides,
+                    dem_teacher=dem_teacher,
                 )
                 totals[out["which"]] = totals.get(out["which"], 0) + 1
+                dem_key = out.get("dem_teacher")
+                if dem_key:
+                    totals[dem_key] = totals.get(dem_key, 0) + 1
 
                 true_obs = getattr(batch, "obs", None)
                 true_arr = None
@@ -385,6 +464,13 @@ def main() -> None:
                         pred_arr = pred_arr[np.newaxis, :]
                     pred_chunks.append(pred_arr)
 
+                dem_pred = out.get("dem_pred_obs")
+                if dem_pred is not None:
+                    dem_arr = np.asarray(dem_pred, dtype=np.uint8)
+                    if dem_arr.ndim == 1:
+                        dem_arr = dem_arr[np.newaxis, :]
+                    dem_pred_chunks.append(dem_arr)
+
                 if bandit is not None and bandit_ctx is not None and true_arr is not None and pred_arr is not None:
                     if true_arr.shape == pred_arr.shape:
                         reward = 1.0 if np.all(true_arr == pred_arr) else 0.0
@@ -398,7 +484,24 @@ def main() -> None:
             else:
                 samples = int(true_accum.shape[0]) if true_accum is not None else 0
                 ler = LEResult(None, None, samples, notes="obs unavailable")
-            print(summary_line(family, d, args.batches, args.shots_per_batch, ler, dt, totals))
+            line = summary_line(family, d, args.batches, args.shots_per_batch, ler, dt, totals)
+
+            if dem_teacher is not None:
+                dem_accum = np.concatenate(dem_pred_chunks, axis=0) if dem_pred_chunks else None
+                if (
+                    true_accum is not None
+                    and dem_accum is not None
+                    and true_accum.shape == dem_accum.shape
+                ):
+                    dem_ler = logical_error_rate(true_accum, dem_accum)
+                    if dem_ler.ler_mean is not None:
+                        line += f" | LER_dem={dem_ler.ler_mean:.3e}"
+                    else:
+                        line += " | LER_dem=NA"
+                else:
+                    line += " | LER_dem=NA"
+
+            print(line)
 
             if bandit is not None and args.rl_state:
                 state = {"A": bandit.A.tolist(), "b": bandit.b.tolist()}

@@ -135,6 +135,7 @@ class TeacherMix:
         erase_det_mask: Optional[np.ndarray] = None,
         context: Optional[Dict[str, Any]] = None,
         weight_overrides: Optional[Dict[str, Any]] = None,
+        dem_teacher: Optional[Any] = None,
     ) -> Dict[str, Any]:
         rng = rng or np.random.default_rng()
         r = float(rng.uniform())
@@ -177,11 +178,36 @@ class TeacherMix:
 
         col_w_x, col_w_z = _resolve_mwpm_weights(mwpm_weights)
 
+        dem_pred_obs: Optional[np.ndarray] = None
+        dem_key = None
+        if dem_teacher is not None:
+            try:
+                dem_out = dem_teacher.decode_batch(dets)
+            except Exception as exc:  # pragma: no cover - degrade gracefully
+                warnings.warn(
+                    f"DEM teacher failed ({exc}); continuing without DEM guidance.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                raw_pred = dem_out.get("pred_obs")
+                if raw_pred is not None:
+                    dem_pred_obs = np.asarray(raw_pred, dtype=np.uint8)
+                dem_key = dem_out.get("which", "dem_matching")
+
+        def _augment(payload: Dict[str, Any]) -> Dict[str, Any]:
+            if dem_teacher is not None:
+                if dem_pred_obs is not None:
+                    payload["dem_pred_obs"] = dem_pred_obs
+                if dem_key:
+                    payload["dem_teacher"] = dem_key
+            return payload
+
         try:
             if self.mwpf is not None and r < self.mix.p_mwpf:
                 out = self.mwpf.decode_batch(dets, mwpf_scale=mwpf_scale)
                 out["which"] = "mwpf"
-                return out
+                return _augment(out)
             if r < self.mix.p_mwpf + self.mix.p_lsd:
                 ex, ez = self.lsd.decode_batch_xz(
                     syndromes_x,
@@ -189,19 +215,34 @@ class TeacherMix:
                     llr_overrides=llr_override,
                     erase_mask=erase_data_mask,
                 )
-                return {"which": "lsd", "ex": ex, "ez": ez}
+                return _augment({"which": "lsd", "ex": ex, "ez": ez})
             cx = self.mwpm_x.decode_batch(syndromes_x, column_weights=col_w_x)
             cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
-            return {"which": "mwpm", "cx": cx, "cz": cz}
+            return _augment({"which": "mwpm", "cx": cx, "cz": cz})
         except Exception as exc:  # pragma: no cover - protective fallback
             cx = self.mwpm_x.decode_batch(syndromes_x, column_weights=col_w_x)
             cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
-            return {
+            return _augment(
+                {
                 "which": "mwpm_fallback",
                 "cx": cx,
                 "cz": cz,
                 "error": str(exc),
-            }
+                }
+            )
+        finally:
+            result = locals().get("out")
+            if isinstance(result, dict):
+                if dem_pred_obs is not None:
+                    result["dem_pred_obs"] = dem_pred_obs
+                if dem_teacher is not None and dem_key:
+                    result["dem_teacher"] = dem_key
+            elif dem_teacher is not None and dem_pred_obs is not None:
+                locals()["out"] = {
+                    "which": "dem_only",
+                    "dem_pred_obs": dem_pred_obs,
+                    "dem_teacher": dem_key,
+                }
 
 
 def _resolve_mwpm_weights(

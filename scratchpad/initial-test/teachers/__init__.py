@@ -27,6 +27,16 @@ except Exception as exc:  # pragma: no cover - optional dependency stack
         stacklevel=2,
     )
 
+try:
+    from .dem_matching import DEMMatchingTeacher
+except Exception as exc:  # pragma: no cover - optional dependency stack
+    DEMMatchingTeacher = None
+    warnings.warn(
+        f"DEMMatchingTeacher unavailable ({exc}); install pymatching for DEM decoding.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
 __all__ = [
     "LSDConfig",
     "LSDTeacher",
@@ -41,3 +51,5 @@ if ErasureSurfaceMLTeacher is not None:
     __all__.append("ErasureSurfaceMLTeacher")
 if ErasureQLDPCPeelingTeacher is not None:
     __all__.append("ErasureQLDPCPeelingTeacher")
+if "DEMMatchingTeacher" in globals() and DEMMatchingTeacher is not None:
+    __all__.append("DEMMatchingTeacher")
