@@ -89,22 +89,34 @@ class MWPMFallback:
             out[b] = core.ml_parity_project(self.H, syndromes[b])
         return out
 
-    def decode_batch(self, syndromes: np.ndarray) -> np.ndarray:
+    def decode_batch(
+        self,
+        syndromes: np.ndarray,
+        *,
+        column_weights: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Return corrections in 'fault id' space aligned with columns of H."""
 
         syndromes = np.asarray(syndromes, dtype=np.uint8) & 1
         if syndromes.ndim != 2:
             raise ValueError("syndromes must be rank-2 array [B, #checks]")
 
-        if _HAVE_PM and self.m is not None:
-            if hasattr(self.m, "decode_batch"):
-                decoded = self.m.decode_batch(syndromes)  # type: ignore[union-attr]
-            else:
-                decoded = np.stack(
-                    [np.asarray(self.m.decode(s), dtype=np.uint8) for s in syndromes],  # type: ignore[union-attr]
-                    axis=0,
-                )
-            return np.asarray(decoded, dtype=np.uint8)
+        if _HAVE_PM:
+            matcher = self.m
+            if column_weights is not None:
+                weights_arr = np.asarray(column_weights, dtype=np.float32)
+                if weights_arr.shape[0] != self._gf2_cols:
+                    raise ValueError("column_weights must match number of columns in H")
+                matcher = pm.Matching.from_check_matrix(self.H, weights=weights_arr)
+            if matcher is not None:
+                if hasattr(matcher, "decode_batch"):
+                    decoded = matcher.decode_batch(syndromes)  # type: ignore[union-attr]
+                else:
+                    decoded = np.stack(
+                        [np.asarray(matcher.decode(s), dtype=np.uint8) for s in syndromes],  # type: ignore[union-attr]
+                        axis=0,
+                    )
+                return np.asarray(decoded, dtype=np.uint8)
 
         return self._gf2_decode(syndromes)
 

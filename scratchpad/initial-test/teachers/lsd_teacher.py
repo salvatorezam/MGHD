@@ -76,6 +76,9 @@ class LSDTeacher:
         self,
         syndromes_x: np.ndarray,
         syndromes_z: np.ndarray,
+        *,
+        llr_overrides: Optional[np.ndarray] = None,
+        erase_mask: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Returns (ex, ez) corrections in data-qubit space: uint8 [B, n]."""
 
@@ -86,7 +89,23 @@ class LSDTeacher:
         if syndromes_x.shape[0] != syndromes_z.shape[0]:
             raise ValueError("Batch sizes of X and Z syndromes must match")
 
-        if _HAVE_LDPC:
+        llr_arr = None
+        if llr_overrides is not None:
+            llr_arr = np.asarray(llr_overrides, dtype=np.float64)
+            if llr_arr.ndim == 1:
+                llr_arr = np.broadcast_to(llr_arr, (syndromes_x.shape[0], llr_arr.shape[0]))
+            if llr_arr.shape != (syndromes_x.shape[0], self.Hx.shape[1]):
+                raise ValueError("llr_overrides must broadcast to (B, n)")
+
+        erase_arr = None
+        if erase_mask is not None:
+            erase_arr = np.asarray(erase_mask, dtype=np.uint8)
+            if erase_arr.ndim == 1:
+                erase_arr = np.broadcast_to(erase_arr, (syndromes_x.shape[0], erase_arr.shape[0]))
+            if erase_arr.shape != (syndromes_x.shape[0], self.Hx.shape[1]):
+                raise ValueError("erase_mask must broadcast to (B, n)")
+
+        if llr_arr is None and erase_arr is None and _HAVE_LDPC:
             ex_list = [
                 self.dec_x.decode(syndromes_x[b].astype(np.uint8)).astype(np.uint8)  # type: ignore[union-attr]
                 for b in range(syndromes_x.shape[0])
@@ -97,13 +116,29 @@ class LSDTeacher:
             ]
             return np.stack(ex_list, axis=0), np.stack(ez_list, axis=0)
 
-        # Fallback: exact ML projection using the GF(2) helper from `core`.
+        # Weighted GF(2) projection for overrides / erasure-aware path
         B = syndromes_x.shape[0]
         ex = np.zeros((B, self.Hx.shape[1]), dtype=np.uint8)
         ez = np.zeros((B, self.Hz.shape[1]), dtype=np.uint8)
         for b in range(B):
-            ex[b] = core.ml_parity_project(self.Hx, syndromes_x[b])
-            ez[b] = core.ml_parity_project(self.Hz, syndromes_z[b])
+            probs_x = None
+            probs_z = None
+            if llr_arr is not None:
+                llr = llr_arr[b]
+                probs = 1.0 / (1.0 + np.exp(llr))
+                probs_x = probs.copy()
+                probs_z = probs.copy()
+            if erase_arr is not None:
+                mask = erase_arr[b].astype(bool)
+                if probs_x is None:
+                    probs_x = np.full(self.Hx.shape[1], 0.5, dtype=np.float64)
+                if probs_z is None:
+                    probs_z = np.full(self.Hz.shape[1], 0.5, dtype=np.float64)
+                probs_x[mask] = 0.5
+                probs_z[mask] = 0.5
+
+            ex[b] = core.ml_parity_project(self.Hx, syndromes_x[b], probs_x)
+            ez[b] = core.ml_parity_project(self.Hz, syndromes_z[b], probs_z)
         return ex, ez
 
 

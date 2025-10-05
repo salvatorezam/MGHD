@@ -51,8 +51,7 @@ class MWPFTeacher:
         self.config = config or MWPFConfig()
         self._vertex_num: Optional[int] = None
         self._fault_map: Optional[List[int]] = None
-        self._init = None
-        self._solver = None
+        self._solver_cfg: Optional[Dict[str, object]] = None
         self._fault_edges: List[np.ndarray] = []
         self._edge_sets: List[set[int]] = []
         self._weights: List[float] = []
@@ -111,13 +110,7 @@ class MWPFTeacher:
                 cfg["cluster_node_limit"] = int(self.config.cluster_node_limit)
             if self.config.timeout is not None:
                 cfg["timeout"] = float(self.config.timeout)
-
-            weighted_edges = [
-                HyperEdge(list(edge.tolist()), float(weight))  # type: ignore[arg-type]
-                for edge, weight in zip(self._fault_edges, self._weights)
-            ]
-            self._init = SolverInitializer(self._vertex_num, weighted_edges)  # type: ignore[arg-type]
-            self._solver = SolverSerialJointSingleHair(self._init, cfg or None)
+            self._solver_cfg = cfg or None
         else:
             warnings.warn(
                 "mwpf not available – using heuristic fallback decoder."
@@ -129,7 +122,12 @@ class MWPFTeacher:
     # ------------------------------------------------------------------
     # Decoding
     # ------------------------------------------------------------------
-    def decode_batch(self, dets: np.ndarray) -> Dict[str, np.ndarray]:
+    def decode_batch(
+        self,
+        dets: np.ndarray,
+        *,
+        mwpf_scale: Optional[Dict[int, float]] = None,
+    ) -> Dict[str, np.ndarray]:
         """
         dets: uint8 [B, D] detection events (1 where detector fired)
         returns:
@@ -150,23 +148,44 @@ class MWPFTeacher:
             )
 
         if _HAVE_MWPF:
-            return self._decode_batch_mwpf(dets)
+            return self._decode_batch_mwpf(dets, mwpf_scale=mwpf_scale)
         return self._decode_batch_fallback(dets)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _decode_batch_mwpf(self, dets: np.ndarray) -> Dict[str, np.ndarray]:
-        assert self._solver is not None and self._init is not None
+    def _build_solver_with_weights(self, weights: List[float]):
+        weighted_edges = [
+            HyperEdge(list(edge.tolist()), float(weight))  # type: ignore[arg-type]
+            for edge, weight in zip(self._fault_edges, weights)
+        ]
+        initializer = SolverInitializer(self._vertex_num, weighted_edges)  # type: ignore[arg-type]
+        solver = SolverSerialJointSingleHair(initializer, self._solver_cfg)
+        return initializer, solver
 
+    def _decode_batch_mwpf(
+        self,
+        dets: np.ndarray,
+        *,
+        mwpf_scale: Optional[Dict[int, float]] = None,
+    ) -> Dict[str, np.ndarray]:
         sols: List[List[int]] = []
         weights: List[float] = []
         max_sel = 0
+        base_weights = self._weights
         for sample in dets:
+            if mwpf_scale:
+                scaled = []
+                for idx, base in enumerate(base_weights):
+                    fault_idx = int(self._fault_map[idx]) if self._fault_map is not None else idx
+                    scaled.append(base * float(mwpf_scale.get(fault_idx, 1.0)))
+            else:
+                scaled = base_weights
+            _, solver = self._build_solver_with_weights(scaled)
             syn = np.flatnonzero(sample != 0).tolist()
-            self._solver.solve(SyndromePattern(syn))  # type: ignore[call-arg]
+            solver.solve(SyndromePattern(syn))  # type: ignore[call-arg]
             idxs: List[int] = []
-            subgraph = getattr(self._solver, "subgraph", None)
+            subgraph = getattr(solver, "subgraph", None)
             if callable(subgraph):
                 result = subgraph()
                 for edge_idx in result:
@@ -179,7 +198,7 @@ class MWPFTeacher:
             max_sel = max(max_sel, len(idxs))
 
             total_w = None
-            bound = getattr(self._solver, "subgraph_range", None)
+            bound = getattr(solver, "subgraph_range", None)
             if callable(bound):
                 try:
                     _, rng = bound()
