@@ -777,3 +777,7 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 2025-10-06 15:42 UTC
 
 - [2025-10-06 15:42 UTC] SHA b16311a — Added MGHD preflight harness (`tools/preflight_mghd.py`, `tests/test_dep_versions.py`, `.github/workflows/mghd-preflight.yml`); commands: `pytest tests/test_dep_versions.py -q`; LER/p50/p99: not run (infrastructure setup only); conclusion: preflight automation ready pending full run.
+
+2025-10-06 17:39 UTC
+
+- [2025-10-06 17:39 UTC] SHA 446100b — Hardened TeacherMix/MWPMFallback against non-graphlike H (skip PyMatching graphs, retain GF2 fallback), updated tests + preflight CUDA-Q guard (`--p-mwpm 0`). Commands: `pytest tests/test_mwpm_graphlike_guard.py tests/test_tad_integration_smoke.py tests/test_mwpm_weights_and_version.py -q`, `conda run -n mlqec-env make preflight`. Metrics: Stim+DEM LER_dem=0.0; CUDA-Q smoke still panics on non-graphlike (logged as skipped failure).
