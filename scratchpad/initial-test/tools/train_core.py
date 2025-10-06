@@ -212,6 +212,13 @@ def main() -> None:
     p.add_argument("--dem-correlated", action="store_true")
     p.add_argument("--dem-cache-dir", type=str, default="dem_cache")
     p.add_argument("--dem-force-build", action="store_true")
+    p.add_argument(
+        "--allow-mwpm-non-graphlike",
+        dest="mwpm_graphlike_only",
+        action="store_false",
+        help="Allow MWPM even when the parity-check matrix has columns with more than two ones.",
+    )
+    p.set_defaults(mwpm_graphlike_only=True)
     p.add_argument("--qpu-profile", type=str, default=None)
     p.add_argument(
         "--context-source",
@@ -254,6 +261,7 @@ def main() -> None:
                     p_lsd=args.p_lsd,
                     p_mwpm=args.p_mwpm,
                 ),
+                mwpm_graphlike_only=args.mwpm_graphlike_only,
             )
             context_payload: Optional[Dict[str, Any]] = None
             base_overrides: Dict[str, Any] = {}

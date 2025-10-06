@@ -67,9 +67,18 @@ class TeacherMix:
         mwpf_cfg: Optional[MWPFConfig] = None,
         lsd_cfg: Optional[LSDConfig] = None,
         mix_cfg: Optional[MixConfig] = None,
+        mwpm_graphlike_only: bool = True,
     ) -> None:
-        self.mix = mix_cfg or MixConfig()
-        probs = np.array([self.mix.p_mwpf, self.mix.p_lsd, self.mix.p_mwpm], dtype=float)
+        base_mix = mix_cfg or MixConfig()
+        self._max_cluster = base_mix.max_cluster
+        self._mwpm_graphlike_only = bool(mwpm_graphlike_only)
+        self._mwpm_enabled = True
+
+        p_mwpf = base_mix.p_mwpf
+        p_lsd = base_mix.p_lsd
+        p_mwpm = base_mix.p_mwpm
+
+        probs = np.array([p_mwpf, p_lsd, p_mwpm], dtype=float)
         if np.any(probs < 0):  # pragma: no cover - defensive
             raise ValueError("Mix probabilities must be non-negative")
 
@@ -86,11 +95,17 @@ class TeacherMix:
                 RuntimeWarning,
                 stacklevel=2,
             )
-            probs[0] = 0.0
+            p_mwpf = 0.0
 
         self.lsd = LSDTeacher(Hx, Hz, cfg=lsd_cfg or LSDConfig())
-        self.mwpm_x = MWPMFallback(Hx)
-        self.mwpm_z = MWPMFallback(Hz)
+        self.mwpm_x = MWPMFallback(
+            Hx,
+            require_graphlike=self._mwpm_graphlike_only,
+        )
+        self.mwpm_z = MWPMFallback(
+            Hz,
+            require_graphlike=self._mwpm_graphlike_only,
+        )
         self.erasure_surface = None
         self.erasure_qldpc = None
         if getattr(code_obj, "name", None) == "surface" and ErasureSurfaceMLTeacher is not None:
@@ -107,7 +122,7 @@ class TeacherMix:
                 self.erasure_qldpc = ErasureQLDPCPeelingTeacher(
                     Hx,
                     Hz,
-                    max_cluster=self.mix.max_cluster,
+                    max_cluster=self._max_cluster,
                 )
             except Exception as exc:  # pragma: no cover - degrade gracefully
                 warnings.warn(
@@ -115,14 +130,7 @@ class TeacherMix:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-
-        max_cluster = self.mix.max_cluster
-        total = probs.sum()
-        if total <= 0:
-            probs = np.array([0.0, 0.0, 1.0], dtype=float)
-        else:
-            probs = probs / total
-        self.mix = MixConfig(probs[0], probs[1], probs[2], max_cluster)
+        self._set_mix_probs(p_mwpf, p_lsd, p_mwpm)
 
     def route_batch(
         self,
@@ -208,7 +216,8 @@ class TeacherMix:
                 out = self.mwpf.decode_batch(dets, mwpf_scale=mwpf_scale)
                 out["which"] = "mwpf"
                 return _augment(out)
-            if r < self.mix.p_mwpf + self.mix.p_lsd:
+            mwpm_threshold = self.mix.p_mwpf + self.mix.p_lsd
+            if r < mwpm_threshold or not self._mwpm_enabled or self.mix.p_mwpm <= 0:
                 ex, ez = self.lsd.decode_batch_xz(
                     syndromes_x,
                     syndromes_z,
@@ -216,12 +225,25 @@ class TeacherMix:
                     erase_mask=erase_data_mask,
                 )
                 return _augment({"which": "lsd", "ex": ex, "ez": ez})
-            cx = self.mwpm_x.decode_batch(syndromes_x, column_weights=col_w_x)
-            cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
+            try:
+                cx = self.mwpm_x.decode_batch(syndromes_x, column_weights=col_w_x)
+                cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
+            except ValueError as exc:
+                msg = str(exc)
+                if "mwpm_not_graphlike" in msg or "two ones per column" in msg:
+                    self._disable_mwpm(msg)
+                    ex, ez = self.lsd.decode_batch_xz(
+                        syndromes_x,
+                        syndromes_z,
+                        llr_overrides=llr_override,
+                        erase_mask=erase_data_mask,
+                    )
+                    return _augment({"which": "lsd", "ex": ex, "ez": ez})
+                raise
             return _augment({"which": "mwpm", "cx": cx, "cz": cz})
         except Exception as exc:  # pragma: no cover - protective fallback
-            cx = self.mwpm_x.decode_batch(syndromes_x, column_weights=col_w_x)
-            cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
+            cx = self.mwpm_x._gf2_decode(syndromes_x)
+            cz = self.mwpm_z._gf2_decode(syndromes_z)
             return _augment(
                 {
                     "which": "mwpm_fallback",
@@ -230,6 +252,26 @@ class TeacherMix:
                     "error": str(exc),
                 }
             )
+
+    def _set_mix_probs(self, p_mwpf: float, p_lsd: float, p_mwpm: float) -> None:
+        probs = np.array([float(p_mwpf), float(p_lsd), float(p_mwpm)], dtype=float)
+        total = probs.sum()
+        if total <= 0:
+            probs = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            probs = probs / total
+        self.mix = MixConfig(float(probs[0]), float(probs[1]), float(probs[2]), self._max_cluster)
+
+    def _disable_mwpm(self, reason: str) -> None:
+        if not self._mwpm_enabled:
+            return
+        self._mwpm_enabled = False
+        warnings.warn(
+            f"MWPM disabled for mix (reason: {reason}); falling back to LSD/erasure teachers.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        self._set_mix_probs(self.mix.p_mwpf, self.mix.p_lsd + self.mix.p_mwpm, 0.0)
 
 
 def _resolve_mwpm_weights(

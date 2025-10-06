@@ -54,13 +54,30 @@ def _coerce_weights_to_float(weights: Optional[Iterable[Any]], ncols: int) -> Op
     return float_arr.astype(np.float32, copy=False)
 
 
-class MWPMFallback:
-    """PyMatching-backed MWPM decoder with a GF(2) fallback."""
+def _is_graphlike(H: np.ndarray) -> bool:
+    """Return True if every column has at most two non-zero entries."""
 
-    def __init__(self, H: np.ndarray, *, weights: Optional[Iterable[Any]] = None):
+    try:
+        col_sums = np.asarray(H.sum(axis=0)).ravel()
+    except Exception:
+        col_sums = np.asarray(np.sum(H, axis=0)).ravel()
+    return bool(np.all(col_sums <= 2))
+
+
+class MWPMFallback:
+    """PyMatching-backed MWPM decoder with optional graphlike enforcement."""
+
+    def __init__(
+        self,
+        H: np.ndarray,
+        *,
+        weights: Optional[Iterable[Any]] = None,
+        require_graphlike: bool = False,
+    ):
         self.H = np.asarray(H, dtype=np.uint8) & 1
         self._gf2_cols = self.H.shape[1]
         self.weights = _coerce_weights_to_float(weights, self._gf2_cols)
+        self.require_graphlike = bool(require_graphlike)
         self.m = None
         if _HAVE_PM:
             try:
@@ -102,6 +119,8 @@ class MWPMFallback:
             raise ValueError("syndromes must be rank-2 array [B, #checks]")
 
         if _HAVE_PM:
+            if self.require_graphlike and not _is_graphlike(self.H):
+                raise ValueError("mwpm_not_graphlike")
             matcher = self.m
             if column_weights is not None:
                 weights_arr = np.asarray(column_weights, dtype=np.float32)
