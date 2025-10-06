@@ -1,5 +1,9 @@
 MGHD/HyperBlossom — Progress Log
 
+2025-10-06 15:48 UTC
+
+- [2025-10-06 15:48 UTC] SHA 11e77ff — Ran `conda run -n mlqec-env make preflight`; Stim+DEM LER_dem=0.0 (mix unavailable), pytest 17 passed / 1 skipped, CUDA-Q smoke hit PyMatching cluster unsolvable panic (ignored by preflight guard). Conclusion: preflight wiring validated; CUDA-Q pipeline needs graphlike fix.
+
 2025-10-06 15:42 UTC
 
 - [2025-10-06 15:42 UTC] SHA b16311a — Added MGHD preflight harness (`tools/preflight_mghd.py`, `tests/test_dep_versions.py`, `.github/workflows/mghd-preflight.yml`); commands: `pytest tests/test_dep_versions.py -q`; LER/p50/p99: not run (infrastructure setup only); conclusion: preflight automation ready pending full run.
