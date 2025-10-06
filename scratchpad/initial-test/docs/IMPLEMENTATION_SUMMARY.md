@@ -1,13 +1,5 @@
 MGHD/HyperBlossom — Progress Log
 
-2025-10-06 15:48 UTC
-
-- [2025-10-06 15:48 UTC] SHA 11e77ff — Ran `conda run -n mlqec-env make preflight`; Stim+DEM LER_dem=0.0 (mix unavailable), pytest 17 passed / 1 skipped, CUDA-Q smoke hit PyMatching cluster unsolvable panic (ignored by preflight guard). Conclusion: preflight wiring validated; CUDA-Q pipeline needs graphlike fix.
-
-2025-10-06 15:42 UTC
-
-- [2025-10-06 15:42 UTC] SHA b16311a — Added MGHD preflight harness (`tools/preflight_mghd.py`, `tests/test_dep_versions.py`, `.github/workflows/mghd-preflight.yml`); commands: `pytest tests/test_dep_versions.py -q`; LER/p50/p99: not run (infrastructure setup only); conclusion: preflight automation ready pending full run.
-
 2025-09-29 11:20 UTC
 
 - Consolidated execution around `python -m mghd_public.core` with `train|eval|crops|bench` subcommands, migrated training loop to `mghd_public/training.py` and evaluator to `mghd_public/eval_helpers.py`; legacy CLIs now forward with deprecation notice. Quick sanity: import smoke only (no runtime train/eval yet).
@@ -777,3 +769,11 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 - [2025-10-05 18:02 UTC] SHA 68ebb9f — Guarded MWPM fallback to graphlike checks, auto-disabling MWPM for surface CUDA-Q runs, added CLI opt-out, and added regression tests. Commands: `conda run -n mlqec-env pytest -q`. Metrics: Stim validator unchanged (correlated DEM matching), CUDA-Q trajectory runs now skip MWPM cleanly and report LER_mix without crashes.
 
 - [2025-10-05 19:04 UTC] SHA 8614e88 — CUDA-Q sampler now emits logical observables (parities of Lx/Lz), CLI always reports LER_mix when obs exist, and regression ensures CUDA-Q fallback produces obs. Commands: `conda run -n mlqec-env pytest -q`. Metrics: Stim DEM validator unchanged; CUDA-Q fallback now outputs obs (currently zeros with fallback), enabling LER reporting once teachers supply predictions.
+
+2025-10-06 15:48 UTC
+
+- [2025-10-06 15:48 UTC] SHA 11e77ff — Ran `conda run -n mlqec-env make preflight`; Stim+DEM LER_dem=0.0 (mix unavailable), pytest 17 passed / 1 skipped, CUDA-Q smoke hit PyMatching cluster unsolvable panic (ignored by preflight guard). Conclusion: preflight wiring validated; CUDA-Q pipeline needs graphlike fix.
+
+2025-10-06 15:42 UTC
+
+- [2025-10-06 15:42 UTC] SHA b16311a — Added MGHD preflight harness (`tools/preflight_mghd.py`, `tests/test_dep_versions.py`, `.github/workflows/mghd-preflight.yml`); commands: `pytest tests/test_dep_versions.py -q`; LER/p50/p99: not run (infrastructure setup only); conclusion: preflight automation ready pending full run.
