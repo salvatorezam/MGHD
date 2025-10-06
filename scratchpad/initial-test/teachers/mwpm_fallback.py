@@ -26,6 +26,12 @@ except Exception as exc:  # pragma: no cover - executed without pymatching
     _PM_IMPORT_ERROR = exc
 
 
+class MwpmNotGraphlike(RuntimeError):
+    """Raised when PyMatching cannot operate due to non-graphlike structure."""
+
+    pass
+
+
 def _coerce_weights_to_float(weights: Optional[Iterable[Any]], ncols: int) -> Optional[np.ndarray]:
     """Best-effort conversion of MWPF-style weights to float32 for PyMatching."""
 
@@ -78,19 +84,27 @@ class MWPMFallback:
         self._gf2_cols = self.H.shape[1]
         self.weights = _coerce_weights_to_float(weights, self._gf2_cols)
         self.require_graphlike = bool(require_graphlike)
+        self._graphlike = _is_graphlike(self.H)
         self.m = None
-        if _HAVE_PM:
+        if self.require_graphlike and not self._graphlike:
+            raise MwpmNotGraphlike("mwpm_not_graphlike")
+
+        if _HAVE_PM and self._graphlike:
             try:
                 self.m = pm.Matching.from_check_matrix(self.H, weights=self.weights)  # type: ignore[union-attr]
-            except Exception as exc:  # pragma: no cover - dependent on optional library
-                warnings.warn(
-                    "PyMatching could not load the parity-check matrix; falling back to GF(2) projection.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._pm_failure = exc
+            except ValueError as exc:  # pragma: no cover - communicated to caller
+                raise MwpmNotGraphlike(str(exc)) from exc
+            except BaseException as exc:  # pyo3 panic surfaces here
+                raise MwpmNotGraphlike(f"PyMatching panic: {exc}") from exc
             else:
                 self._pm_failure = None
+        elif _HAVE_PM:
+            warnings.warn(
+                "PyMatching graphlike requirement not met; using GF(2) projection fallback.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._pm_failure = MwpmNotGraphlike("mwpm_not_graphlike")
         else:
             warnings.warn(
                 "PyMatching not available – MWPMFallback will use GF(2) projection fallback.",
@@ -119,14 +133,19 @@ class MWPMFallback:
             raise ValueError("syndromes must be rank-2 array [B, #checks]")
 
         if _HAVE_PM:
-            if self.require_graphlike and not _is_graphlike(self.H):
+            if self.require_graphlike and not self._graphlike:
                 raise ValueError("mwpm_not_graphlike")
             matcher = self.m
             if column_weights is not None:
                 weights_arr = np.asarray(column_weights, dtype=np.float32)
                 if weights_arr.shape[0] != self._gf2_cols:
                     raise ValueError("column_weights must match number of columns in H")
-                matcher = pm.Matching.from_check_matrix(self.H, weights=weights_arr)
+                try:
+                    matcher = pm.Matching.from_check_matrix(self.H, weights=weights_arr)
+                except ValueError as exc:
+                    raise MwpmNotGraphlike(str(exc)) from exc
+                except BaseException as exc:
+                    raise MwpmNotGraphlike(f"PyMatching panic: {exc}") from exc
             if matcher is not None:
                 if hasattr(matcher, "decode_batch"):
                     decoded = matcher.decode_batch(syndromes)  # type: ignore[union-attr]
@@ -140,7 +159,7 @@ class MWPMFallback:
         return self._gf2_decode(syndromes)
 
 
-__all__ = ["MWPMFallback", "_HAVE_PM"]
+__all__ = ["MWPMFallback", "MwpmNotGraphlike", "_HAVE_PM", "_is_graphlike"]
 
 
 if not _HAVE_PM and _PM_IMPORT_ERROR is not None:  # pragma: no cover - info

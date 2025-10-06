@@ -15,7 +15,7 @@ import warnings
 
 from .mwpf_teacher import MWPFConfig, MWPFTeacher
 from .lsd_teacher import LSDConfig, LSDTeacher
-from .mwpm_fallback import MWPMFallback
+from .mwpm_fallback import MWPMFallback, MwpmNotGraphlike, _is_graphlike
 
 try:
     from .erasure_surface_ml import ErasureSurfaceMLTeacher
@@ -98,14 +98,33 @@ class TeacherMix:
             p_mwpf = 0.0
 
         self.lsd = LSDTeacher(Hx, Hz, cfg=lsd_cfg or LSDConfig())
-        self.mwpm_x = MWPMFallback(
-            Hx,
-            require_graphlike=self._mwpm_graphlike_only,
-        )
-        self.mwpm_z = MWPMFallback(
-            Hz,
-            require_graphlike=self._mwpm_graphlike_only,
-        )
+        self.mwpm_x = None
+        self.mwpm_z = None
+        mwpm_ok = True
+        mwpm_reason = "mwpm_not_graphlike"
+        graphlike_ok = _is_graphlike(Hx) and _is_graphlike(Hz)
+        if self._mwpm_graphlike_only and not graphlike_ok:
+            mwpm_ok = False
+        if mwpm_ok:
+            try:
+                self.mwpm_x = MWPMFallback(
+                    Hx,
+                    require_graphlike=self._mwpm_graphlike_only,
+                )
+                self.mwpm_z = MWPMFallback(
+                    Hz,
+                    require_graphlike=self._mwpm_graphlike_only,
+                )
+            except MwpmNotGraphlike as exc:
+                mwpm_ok = False
+                mwpm_reason = str(exc) or mwpm_reason
+        if not mwpm_ok:
+            try:
+                self.mwpm_x = MWPMFallback(Hx, require_graphlike=False)
+                self.mwpm_z = MWPMFallback(Hz, require_graphlike=False)
+            except MwpmNotGraphlike:
+                self.mwpm_x = None
+                self.mwpm_z = None
         self.erasure_surface = None
         self.erasure_qldpc = None
         if getattr(code_obj, "name", None) == "surface" and ErasureSurfaceMLTeacher is not None:
@@ -131,6 +150,8 @@ class TeacherMix:
                     stacklevel=2,
                 )
         self._set_mix_probs(p_mwpf, p_lsd, p_mwpm)
+        if not mwpm_ok:
+            self._disable_mwpm(mwpm_reason)
 
     def route_batch(
         self,

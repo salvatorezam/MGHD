@@ -78,15 +78,19 @@ def test_route_batch_passes_mwpm_weights(monkeypatch):
 
 def test_route_batch_passes_mwpf_scale(monkeypatch):
     code = _dummy_code()
-    mix = TeacherMix(code, code.Hx, code.Hz, mix_cfg=MixConfig(p_mwpf=1.0, p_lsd=0.0, p_mwpm=0.0))
-
     captured_scale = {}
 
-    def fake_decode(dets, *, mwpf_scale=None):
-        captured_scale["scale"] = mwpf_scale
-        return {"fault_ids": np.zeros((1, 1), dtype=np.int32), "weights": np.zeros(1, dtype=np.float32)}
+    class StubMWPF:
+        def __init__(self, *args, **kwargs):
+            pass
 
-    mix.mwpf = SimpleNamespace(decode_batch=fake_decode)
+        def decode_batch(self, dets, *, mwpf_scale=None):
+            captured_scale["scale"] = mwpf_scale
+            return {"fault_ids": np.zeros((1, 1), dtype=np.int32), "weights": np.zeros(1, dtype=np.float32)}
+
+    monkeypatch.setattr("teachers.mix.MWPFTeacher", StubMWPF)
+
+    mix = TeacherMix(code, code.Hx, code.Hz, mix_cfg=MixConfig(p_mwpf=1.0, p_lsd=0.0, p_mwpm=0.0))
 
     dets = np.zeros((1, 0), dtype=np.uint8)
     sx = np.zeros((1, code.Hx.shape[0]), dtype=np.uint8)

@@ -276,6 +276,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             str(args.shots_per_batch),
             "--batches",
             str(args.batches),
+            "--p-mwpm",
+            "0",
         ]
         cudaq_result = run(cudaq_cmd, cudaq_log)
         cudaq_ler = parse_ler(cudaq_result.stdout)
