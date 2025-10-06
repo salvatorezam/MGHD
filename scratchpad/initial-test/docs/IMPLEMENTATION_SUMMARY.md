@@ -1,5 +1,9 @@
 MGHD/HyperBlossom — Progress Log
 
+2025-10-06 15:42 UTC
+
+- [2025-10-06 15:42 UTC] SHA b16311a — Added MGHD preflight harness (`tools/preflight_mghd.py`, `tests/test_dep_versions.py`, `.github/workflows/mghd-preflight.yml`); commands: `pytest tests/test_dep_versions.py -q`; LER/p50/p99: not run (infrastructure setup only); conclusion: preflight automation ready pending full run.
+
 2025-09-29 11:20 UTC
 
 - Consolidated execution around `python -m mghd_public.core` with `train|eval|crops|bench` subcommands, migrated training loop to `mghd_public/training.py` and evaluator to `mghd_public/eval_helpers.py`; legacy CLIs now forward with deprecation notice. Quick sanity: import smoke only (no runtime train/eval yet).

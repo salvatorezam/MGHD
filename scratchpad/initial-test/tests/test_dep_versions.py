@@ -1,14 +1,13 @@
-from importlib import import_module
 import importlib.metadata as im
 
 from packaging.version import Version
 
 
 def test_versions():
-    pm_version = Version(im.version("PyMatching"))
-    assert pm_version >= Version("2.3.0")
-    import_module("stim")
+    pm = Version(im.version("PyMatching"))
+    assert pm >= Version("2.3.0"), pm
+    __import__("stim")
     try:
-        import_module("cudaq")
+        __import__("cudaq")
     except Exception:
         pass
