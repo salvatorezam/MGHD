@@ -224,25 +224,12 @@ class TeacherMix:
             cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
             return _augment(
                 {
-                "which": "mwpm_fallback",
-                "cx": cx,
-                "cz": cz,
-                "error": str(exc),
+                    "which": "mwpm_fallback",
+                    "cx": cx,
+                    "cz": cz,
+                    "error": str(exc),
                 }
             )
-        finally:
-            result = locals().get("out")
-            if isinstance(result, dict):
-                if dem_pred_obs is not None:
-                    result["dem_pred_obs"] = dem_pred_obs
-                if dem_teacher is not None and dem_key:
-                    result["dem_teacher"] = dem_key
-            elif dem_teacher is not None and dem_pred_obs is not None:
-                locals()["out"] = {
-                    "which": "dem_only",
-                    "dem_pred_obs": dem_pred_obs,
-                    "dem_teacher": dem_key,
-                }
 
 
 def _resolve_mwpm_weights(

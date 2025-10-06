@@ -233,7 +233,7 @@ def main() -> None:
         families = [args.family]
 
     # Sampler (CUDA-Q is the default; actual CLN via trajectories)  [Ref CUDA-Q]
-    sampler = get_sampler(args.sampler)
+    sampler_name = args.sampler
 
     for family in families:
         distances = parse_distances(args.distances)
@@ -367,6 +367,20 @@ def main() -> None:
                                     stacklevel=2,
                                 )
 
+            sampler_kwargs: Dict[str, Any] = {}
+            if sampler_name == "stim":
+                dep_value = None
+                if profile_dict:
+                    dep_value = (
+                        profile_dict.get("gate_error", {})
+                        .get("after_clifford_depolarization")
+                    )
+                if dep_value is None:
+                    dep_value = 0.001
+                sampler_kwargs["rounds"] = args.dem_rounds
+                sampler_kwargs["dep"] = float(dep_value)
+            sampler = get_sampler(sampler_name, **sampler_kwargs)
+
             totals = {"mwpf": 0, "lsd": 0, "mwpm": 0, "mwpm_fallback": 0}
             if dem_teacher is not None:
                 totals["dem_matching"] = 0
@@ -374,6 +388,7 @@ def main() -> None:
             true_chunks = []
             pred_chunks = []
             dem_pred_chunks = []
+            missing_obs_warned = False
 
             bandit = None
             bandit_ctx = None
@@ -412,6 +427,30 @@ def main() -> None:
                     n_shots=args.shots_per_batch,
                     seed=int(rng.integers(1 << 32) - 1),
                 )
+
+                if args.dem_enable and not missing_obs_warned:
+                    if batch.obs is None or batch.obs.size == 0:
+                        warnings.warn(
+                            "Sampler did not return logical observables; LER will be NA. "
+                            "Use --sampler stim for DEM validation or extend the sampler to emit obs.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        missing_obs_warned = True
+
+                if (
+                    dem_teacher is not None
+                    and getattr(dem_teacher, "num_detectors", None) is not None
+                    and batch.dets.shape[1] != dem_teacher.num_detectors
+                ):
+                    warnings.warn(
+                        "DEM teacher detector count mismatch. Ensure the sampler mirrors the Stim generator "
+                        "(--sampler stim) or align detectors (e.g., --dem-align).",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    dem_teacher = None
+
                 sx, sz = _resolve_syndromes(code, batch.dets)
 
                 scale = 1.0
