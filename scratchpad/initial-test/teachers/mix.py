@@ -13,9 +13,11 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import warnings
 
+from mghd.utils.graphlike import is_graphlike
+
 from .mwpf_teacher import MWPFConfig, MWPFTeacher
 from .lsd_teacher import LSDConfig, LSDTeacher
-from .mwpm_fallback import MWPMFallback, MwpmNotGraphlike, _is_graphlike
+from .mwpm_fallback import MWPMFallback, MwpmNotGraphlike
 
 try:
     from .erasure_surface_ml import ErasureSurfaceMLTeacher
@@ -83,12 +85,15 @@ class TeacherMix:
             raise ValueError("Mix probabilities must be non-negative")
 
         self.code_obj = code_obj
+        self.flags: Dict[str, Any] = {}
+        self.teachers: Dict[str, Any] = {}
         self.mwpf = None
         try:
             self.mwpf = MWPFTeacher(
                 code_obj,
                 config=mwpf_cfg or MWPFConfig(cluster_node_limit=50),
             )
+            self.teachers["mwpf"] = self.mwpf
         except Exception as exc:  # pragma: no cover - degrade gracefully
             warnings.warn(
                 f"MWPFTeacher unavailable ({exc}); disabling MWPF in mix.",
@@ -96,35 +101,45 @@ class TeacherMix:
                 stacklevel=2,
             )
             p_mwpf = 0.0
+            self.teachers["mwpf"] = None
 
         self.lsd = LSDTeacher(Hx, Hz, cfg=lsd_cfg or LSDConfig())
+        self.teachers["lsd"] = self.lsd
         self.mwpm_x = None
         self.mwpm_z = None
         mwpm_ok = True
         mwpm_reason = "mwpm_not_graphlike"
-        graphlike_ok = _is_graphlike(Hx) and _is_graphlike(Hz)
+        graphlike_ok = is_graphlike(Hx) and is_graphlike(Hz)
         if self._mwpm_graphlike_only and not graphlike_ok:
             mwpm_ok = False
         if mwpm_ok:
             try:
                 self.mwpm_x = MWPMFallback(
-                    Hx,
+                    code_obj,
+                    basis="x",
                     require_graphlike=self._mwpm_graphlike_only,
                 )
                 self.mwpm_z = MWPMFallback(
-                    Hz,
+                    code_obj,
+                    basis="z",
                     require_graphlike=self._mwpm_graphlike_only,
                 )
+                self.teachers["mwpm"] = (self.mwpm_x, self.mwpm_z)
             except MwpmNotGraphlike as exc:
                 mwpm_ok = False
                 mwpm_reason = str(exc) or mwpm_reason
         if not mwpm_ok:
+            self.flags["mwpm_not_graphlike"] = True
             try:
-                self.mwpm_x = MWPMFallback(Hx, require_graphlike=False)
-                self.mwpm_z = MWPMFallback(Hz, require_graphlike=False)
+                self.mwpm_x = MWPMFallback(code_obj, basis="x", require_graphlike=False)
+                self.mwpm_z = MWPMFallback(code_obj, basis="z", require_graphlike=False)
+                self.teachers["mwpm"] = (self.mwpm_x, self.mwpm_z)
             except MwpmNotGraphlike:
                 self.mwpm_x = None
                 self.mwpm_z = None
+                self.teachers["mwpm"] = None
+        if not graphlike_ok and not self.flags.get("mwpm_not_graphlike"):
+            self.flags["mwpm_not_graphlike"] = True
         self.erasure_surface = None
         self.erasure_qldpc = None
         if getattr(code_obj, "name", None) == "surface" and ErasureSurfaceMLTeacher is not None:
@@ -246,10 +261,19 @@ class TeacherMix:
                     erase_mask=erase_data_mask,
                 )
                 return _augment({"which": "lsd", "ex": ex, "ez": ez})
+            if self.mwpm_x is None or self.mwpm_z is None:
+                self._disable_mwpm("mwpm_not_graphlike")
+                ex, ez = self.lsd.decode_batch_xz(
+                    syndromes_x,
+                    syndromes_z,
+                    llr_overrides=llr_override,
+                    erase_mask=erase_data_mask,
+                )
+                return _augment({"which": "lsd", "ex": ex, "ez": ez})
             try:
                 cx = self.mwpm_x.decode_batch(syndromes_x, column_weights=col_w_x)
                 cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
-            except ValueError as exc:
+            except (ValueError, MwpmNotGraphlike) as exc:
                 msg = str(exc)
                 if "mwpm_not_graphlike" in msg or "two ones per column" in msg:
                     self._disable_mwpm(msg)
@@ -263,6 +287,15 @@ class TeacherMix:
                 raise
             return _augment({"which": "mwpm", "cx": cx, "cz": cz})
         except Exception as exc:  # pragma: no cover - protective fallback
+            if self.mwpm_x is None or self.mwpm_z is None:
+                ex, ez = self.lsd.decode_batch_xz(
+                    syndromes_x,
+                    syndromes_z,
+                    llr_overrides=llr_override,
+                    erase_mask=erase_data_mask,
+                )
+                return _augment({"which": "lsd", "ex": ex, "ez": ez, "error": str(exc)})
+
             cx = self.mwpm_x._gf2_decode(syndromes_x)
             cz = self.mwpm_z._gf2_decode(syndromes_z)
             return _augment(
@@ -292,6 +325,9 @@ class TeacherMix:
             RuntimeWarning,
             stacklevel=2,
         )
+        self.teachers["mwpm"] = None
+        self.mwpm_x = None
+        self.mwpm_z = None
         self._set_mix_probs(self.mix.p_mwpf, self.mix.p_lsd + self.mix.p_mwpm, 0.0)
 
 
@@ -307,10 +343,11 @@ def _resolve_mwpm_weights(
         if value is None:
             return None
         try:
-            arr = np.asarray(value, dtype=np.float32)
+            arr = np.asarray(list(value) if not isinstance(value, np.ndarray) else value, dtype=object)
+            arr = arr.astype(np.float64, casting="safe")
         except Exception:
             return None
-        return arr
+        return arr.astype(np.float32, copy=False)
 
     if isinstance(weights, dict):
         w_x = _to_array(weights.get("x") or weights.get("X"))

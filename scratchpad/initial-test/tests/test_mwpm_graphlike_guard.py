@@ -3,18 +3,20 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from teachers.mwpm_fallback import MWPMFallback, MwpmNotGraphlike, _is_graphlike
+from mghd.utils.graphlike import is_graphlike
+from teachers.mwpm_fallback import MWPMFallback, MwpmNotGraphlike
 
 
 def test_is_graphlike_detection():
     H = np.array([[1, 1, 0], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
-    assert not _is_graphlike(H)
+    assert not is_graphlike(H)
 
 
 def test_mwpm_init_raises_on_non_graphlike():
     H = np.array([[1, 1, 0], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+    code = SimpleNamespace(Hx=H, Hz=H)
     with pytest.raises(MwpmNotGraphlike):
-        MWPMFallback(H, require_graphlike=True)
+        MWPMFallback(code, basis="x", require_graphlike=True)
 
 
 def test_teacher_mix_disables_non_graphlike_mwpm(monkeypatch):
@@ -54,5 +56,6 @@ def test_teacher_mix_disables_non_graphlike_mwpm(monkeypatch):
     )
 
     assert not teacher_mix._mwpm_enabled
-    assert teacher_mix.mwpm_x is not None
+    assert teacher_mix.mwpm_x is None
     assert teacher_mix.mix.p_mwpm == 0.0
+    assert teacher_mix.teachers.get("mwpm") is None

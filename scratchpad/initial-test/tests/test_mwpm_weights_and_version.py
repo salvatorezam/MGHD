@@ -39,7 +39,8 @@ def test_weights_fraction_like_and_decode_shim(monkeypatch):
     H = np.array([[1, 0, 1], [0, 1, 1]], dtype=np.uint8)
     weights = [Rat(1, 2), Rat(3, 4), Rat(5, 6)]
 
-    decoder = module.MWPMFallback(H, weights=weights)
+    code = types.SimpleNamespace(Hx=H, Hz=H)
+    decoder = module.MWPMFallback(code, basis="x", weights=weights)
 
     assert decoder.weights is not None
     assert decoder.weights.dtype == np.float32

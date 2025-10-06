@@ -29,6 +29,13 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC_DIR = ROOT / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from mghd.utils.graphlike import is_graphlike
+
 from samplers import get_sampler
 from teachers.mix import MixConfig, TeacherMix
 
@@ -252,16 +259,37 @@ def main() -> None:
             Hz = getattr(code, "Hz", None)
 
             # Teacher stack
+            graph_ok = (
+                Hx is not None
+                and Hz is not None
+                and is_graphlike(Hx)
+                and is_graphlike(Hz)
+            )
+            pymatching_ok = args.dem_enable or graph_ok
+            if sampler_name == "cudaq" and not pymatching_ok:
+                warnings.warn(
+                    f"PyMatching disabled (sampler=cudaq, graphlike={graph_ok}, dem={args.dem_enable})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                p_mwpf_effective = 0.0
+                p_mwpm_effective = 0.0
+                mwpm_guard = True
+            else:
+                p_mwpf_effective = args.p_mwpf
+                p_mwpm_effective = args.p_mwpm
+                mwpm_guard = args.mwpm_graphlike_only
+
             mix = TeacherMix(
                 code,
                 Hx,
                 Hz,
                 mix_cfg=MixConfig(
-                    p_mwpf=args.p_mwpf,
+                    p_mwpf=p_mwpf_effective,
                     p_lsd=args.p_lsd,
-                    p_mwpm=args.p_mwpm,
+                    p_mwpm=p_mwpm_effective,
                 ),
-                mwpm_graphlike_only=args.mwpm_graphlike_only,
+                mwpm_graphlike_only=mwpm_guard,
             )
             context_payload: Optional[Dict[str, Any]] = None
             base_overrides: Dict[str, Any] = {}

@@ -11,6 +11,8 @@ def test_mix_instantiation_and_route_smoke(monkeypatch):
         num_detectors = 4
         detectors_per_fault = [[0, 2], [1, 3]]  # two faults flip pairs of detectors
         fault_weights = [1.0, 1.0]
+        Hx = H
+        Hz = H
 
     code = ToyCode()
     # monkeypatch mwpf/ldpc imports if packages are missing
