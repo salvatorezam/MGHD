@@ -527,7 +527,6 @@ These optimizations provide significant improvements in:
 
 All changes maintain backward compatibility while adding new capabilities for rotated surface code support and enhanced performance monitoring.
 
-
 ## 2025-08-31 Evaluation & Comparison Phase
 
 ### Model Training Completion
@@ -666,7 +665,7 @@ This evaluation phase represents the culmination of extensive hyperparameter opt
   - **Z side**: total 0.141ms (clustering 13.8%, MGHD 83.2%, projection 3.0%)
   - **Projection speedup**: ~6x faster than greedy (0.004ms vs 0.024ms mean)
   - **Total speedup**: ~15% faster overall latency with perfect accuracy
-  
+
 - [2025-09-26 08:05 UTC] Updated clustered decoder to emit v2 geometry metadata via mghd_clustered/clustered_primary.py; enhanced MGHDDecoderPublic PackedCrop batching in mghd_public/infer.py; captured MGHD-only sweep results/ler_baseline/clustered_surface_sweep_v2_mghd_only.json.
 - [2025-09-26 08:25 UTC] Added Tier-0 mixed defaults (k_max=2,r_max=1) and cluster filters (--min-nullity/--min-size) in tools/bench_clustered_sweep_surface.py and mghd_clustered/clustered_primary.py; metadata now records thresholds.
 - [2025-09-26 08:39 UTC] Added Phase-A sweep runner (tools/run_phase_a_sweeps.py) to orchestrate high-shot MGHD validations with min-nullity filters and LER guardrails.
@@ -767,6 +766,6 @@ PY` (runs CUDA-lazy); metrics: CSS commutation verified across surface/BB/HGP/QR
 - [2025-10-05 13:43 UTC] SHA e381c633c474712c5946ea2268356bc47ed47988 — Wired TAD Phase 1 plumbing: TeacherMix now threads schedule-derived priors into LSD/MWPF/MWPM paths, `tools/train_core` gains QPU profile/context/RL knobs, and new smoke tests cover weighting + LinTS bandit updates with optional torch-less imports. Commands: `conda run -n mlqec-env pytest -q`. Metrics: pytest suite 17 passed / 1 skipped (warnings only), CLI runs without torch installed while exposing new flags.
 - [2025-10-05 14:27 UTC] SHA 660ddfecfddf9723e35d224bfda95631b1104984 — Added TAD Phase 2 DEM teacher: PyMatching-based `DEMMatchingTeacher`, Stim DEM cache helpers, CLI flags for correlated matching/rounds, and smoke coverage gated on optional deps. Commands: `conda run -n mlqec-env pytest tests/test_dem_surface_smoke.py -q`, `conda run -n mlqec-env pytest -q`. Metrics: DEM smoke gated on Stim/PyMatching; main suite stays green with optional warnings.
 
-- [2025-10-05 15:08 UTC] SHA <rebased> — Added template QPU profile, aligned Stim sampler with DEM generator (surface memory), threaded depolarization/shape checks into tools/train_core, and added DEM/stim smoke coverage. Commands: `conda run -n mlqec-env pytest -q`, `conda run -n mlqec-env pytest tests/test_stim_sampler_dem_match.py tests/test_mix_ler_with_stim.py -q`. Metrics: Stim sampler now returns obs/dets matching the DEM; CLI always reports `LER_mix` when observables exist, warns when samplers omit obs, and points to `--dem-align` for detector permutations.
+- [2025-10-05 18:02 UTC] SHA 68ebb9f — Guarded MWPM fallback to graphlike checks, auto-disabling MWPM for surface CUDA-Q runs, added CLI opt-out, and added regression tests. Commands: `conda run -n mlqec-env pytest -q`. Metrics: Stim validator unchanged (correlated DEM matching), CUDA-Q trajectory runs now skip MWPM cleanly and report LER_mix without crashes.
 
-- [2025-10-05 18:02 UTC] SHA <rebased> — Guarded MWPM fallback to graphlike checks, auto-disabling MWPM for surface CUDA-Q runs, added CLI opt-out, and added regression tests. Commands: `conda run -n mlqec-env pytest -q`. Metrics: Stim validator unchanged (correlated DEM matching), CUDA-Q trajectory runs now skip MWPM cleanly and report LER_mix without crashes.
+- [2025-10-05 19:04 UTC] SHA 8614e88 — CUDA-Q sampler now emits logical observables (parities of Lx/Lz), CLI always reports LER_mix when obs exist, and regression ensures CUDA-Q fallback produces obs. Commands: `conda run -n mlqec-env pytest -q`. Metrics: Stim DEM validator unchanged; CUDA-Q fallback now outputs obs (currently zeros with fallback), enabling LER reporting once teachers supply predictions.

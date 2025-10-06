@@ -18,15 +18,63 @@ import numpy as np
 from . import SampleBatch
 
 
+def _ensure_css_logicals(code: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Ensure code exposes Lx/Lz arrays, deriving them if necessary."""
+
+    Lx = getattr(code, "Lx", None)
+    Lz = getattr(code, "Lz", None)
+    if (Lx is None or Lz is None) and hasattr(code, "derive_logicals"):
+        try:
+            Lx, Lz = code.derive_logicals()
+            if Lx is not None:
+                code.Lx = Lx
+            if Lz is not None:
+                code.Lz = Lz
+        except Exception:
+            pass
+    return getattr(code, "Lx", None), getattr(code, "Lz", None)
+
+
+def _obs_from_data_parities(code: Any, ex: np.ndarray, ez: np.ndarray) -> np.ndarray:
+    """Project data-space X/Z error indicators to logical observables."""
+
+    Lx, Lz = _ensure_css_logicals(code)
+    shots = ex.shape[0]
+
+    obs_z = np.zeros((shots, 0), dtype=np.uint8)
+    if Lz is not None and np.size(Lz):
+        Lz_arr = np.asarray(Lz, dtype=np.uint8)
+        if Lz_arr.ndim == 1:
+            Lz_arr = Lz_arr[np.newaxis, :]
+        obs_z = (ex @ (Lz_arr.T & 1)) & 1
+
+    obs_x = np.zeros((shots, 0), dtype=np.uint8)
+    if Lx is not None and np.size(Lx):
+        Lx_arr = np.asarray(Lx, dtype=np.uint8)
+        if Lx_arr.ndim == 1:
+            Lx_arr = Lx_arr[np.newaxis, :]
+        obs_x = (ez @ (Lx_arr.T & 1)) & 1
+
+    if obs_x.size and obs_z.size:
+        return np.concatenate([obs_z, obs_x], axis=1).astype(np.uint8)
+    if obs_z.size:
+        return obs_z.astype(np.uint8)
+    if obs_x.size:
+        return obs_x.astype(np.uint8)
+    return np.zeros((shots, 0), dtype=np.uint8)
+
+
 class CudaQSampler:
     """
     Uses CUDA-Q's Monte-Carlo trajectory method to sample detection events
     under general circuit-level noise (Kraus/coherent supported).
     """
 
-    def __init__(self,
-                 device_profile: str = "garnet",
-                 profile_kwargs: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        device_profile: str = "garnet",
+        profile_kwargs: Optional[Dict[str, Any]] = None,
+    ):
         self.device_profile = device_profile
         self.profile_kwargs = dict(profile_kwargs or {})
         env_mode = os.getenv("MGHD_MODE", "foundation")
@@ -35,6 +83,7 @@ class CudaQSampler:
             self.mode = "foundation"
         self.rounds = int(self.profile_kwargs.get("rounds", 3))
         self.inject_erasure_frac = float(self.profile_kwargs.pop("inject_erasure_frac", 0.0))
+        self.emit_obs = bool(self.profile_kwargs.pop("emit_obs", True))
         # Lazy import of user's modules (keeps repo portable)
         self._gpu_noise = self._maybe_import("cudaq_backend.garnet_noise", "make_garnet_noise")
         # Optional adapter if user provides it (not required here)
@@ -48,10 +97,12 @@ class CudaQSampler:
         except Exception:
             return None
 
-    def sample(self,
-               code_obj: Any,
-               n_shots: int,
-               seed: Optional[int] = None) -> SampleBatch:
+    def sample(
+        self,
+        code_obj: Any,
+        n_shots: int,
+        seed: Optional[int] = None,
+    ) -> SampleBatch:
         """
         Args:
           code_obj: an object from codes_registry (must provide a circuit builder
@@ -95,7 +146,10 @@ class CudaQSampler:
             meta["sampler"] = "css_fallback"
             meta["cudaq_error"] = str(exc)
 
-        obs = self._logical_observables(code_obj, x_err, z_err)
+        if self.emit_obs:
+            obs = _obs_from_data_parities(code_obj, x_err, z_err)
+        else:
+            obs = np.zeros((n_shots, 0), dtype=np.uint8)
         erase_data_mask, erase_det_mask, p_erase_data = self._build_erasure_masks(
             n_shots,
             dets.shape[1],
@@ -274,26 +328,7 @@ class CudaQSampler:
 
     @staticmethod
     def _logical_observables(code_obj: Any, x_err: np.ndarray, z_err: np.ndarray) -> np.ndarray:
-        parts = []
-        Lz = getattr(code_obj, "Lz", None)
-        if Lz is not None and np.size(Lz):
-            Lz_arr = np.asarray(Lz, dtype=np.uint8)
-            if Lz_arr.ndim == 1:
-                Lz_arr = Lz_arr[np.newaxis, :]
-            z_part = (x_err @ (Lz_arr.T % 2)) % 2
-            parts.append(z_part.astype(np.uint8))
-
-        Lx = getattr(code_obj, "Lx", None)
-        if Lx is not None and np.size(Lx):
-            Lx_arr = np.asarray(Lx, dtype=np.uint8)
-            if Lx_arr.ndim == 1:
-                Lx_arr = Lx_arr[np.newaxis, :]
-            x_part = (z_err @ (Lx_arr.T % 2)) % 2
-            parts.append(x_part.astype(np.uint8))
-
-        if parts:
-            return np.concatenate(parts, axis=1)
-        return np.zeros((x_err.shape[0], 0), dtype=np.uint8)
+        return _obs_from_data_parities(code_obj, x_err, z_err)
 
 
 # Register default
