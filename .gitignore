@@ -347,3 +347,7 @@ docs/
 # Build artifacts
 mghd.egg-info/
 *.egg-info/
+
+# Cache directories
+color_cache/
+dem_cache/

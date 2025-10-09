@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from core import solve_on_erasure
+from mghd.decoders.lsd.cluster_core import solve_on_erasure
 
 
 class ErasureSurfaceMLTeacher:

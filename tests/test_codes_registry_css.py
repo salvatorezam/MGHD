@@ -10,7 +10,7 @@ def _css_ok(code):
 
 
 def test_surface_small_commutes():
-    cr = importlib.import_module("codes_registry")
+    cr = importlib.import_module("mghd.codes.registry")
     for d in [3, 5, 7]:
         code = cr.get_code("surface", distance=d)
         _css_ok(code)
@@ -19,21 +19,21 @@ def test_surface_small_commutes():
 
 
 def test_repetition_commutes():
-    cr = importlib.import_module("codes_registry")
+    cr = importlib.import_module("mghd.codes.registry")
     code = cr.get_code("repetition", distance=5)
     _css_ok(code)
     assert code.n == 5
 
 
 def test_steane_hardcoded():
-    cr = importlib.import_module("codes_registry")
+    cr = importlib.import_module("mghd.codes.registry")
     code = cr.get_code("steane")
     _css_ok(code)
     assert code.n == 7 and code.distance == 3
 
 
 def test_hgp_builder_css():
-    cr = importlib.import_module("codes_registry")
+    cr = importlib.import_module("mghd.codes.registry")
     H1 = np.array([[1, 1, 0, 0], [0, 1, 1, 0]], dtype=np.uint8)
     H2 = np.array([[1, 0, 1], [0, 1, 1]], dtype=np.uint8)
     code = cr.get_code("hgp", H1=H1, H2=H2)

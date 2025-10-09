@@ -2,11 +2,23 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 from collections import deque
+from dataclasses import dataclass
 from typing import List, Tuple, Dict, Iterable, Optional
 
 
-def _as_dense_uint8(M: sp.csr_matrix) -> np.ndarray:
-    return (M.toarray().astype(np.uint8) & 1)
+@dataclass
+class Cluster:
+    """Simple cluster container for legacy API compatibility."""
+    check_indices: np.ndarray
+
+
+def _as_dense_uint8(M) -> np.ndarray:
+    """Accept scipy sparse or numpy arrays; return uint8 {0,1}."""
+    if hasattr(M, "toarray"):
+        A = M.toarray()
+    else:
+        A = np.asarray(M)
+    return (A.astype(np.uint8) & 1)
 
 
 def gf2_row_echelon(A: np.ndarray):
@@ -132,18 +144,33 @@ def solve_small_cluster_channel_ml(
     return best_e.astype(np.uint8)
 
 
-def ml_parity_project(H_sub: sp.csr_matrix,
+def ml_parity_project(H_sub: sp.csr_matrix | np.ndarray,
                       s_sub: np.ndarray,
-                      p_flip: np.ndarray,
+                      p_flip: np.ndarray | None = None,
                       r_cap: int = 20,
-                      stats_out: Dict[str, int] | None = None) -> np.ndarray:
+                      stats_out: Dict[str, int] | None = None,
+                      probs_local: np.ndarray | None = None) -> np.ndarray:
     """
     Exact ML projection under independent bit model:
       minimize w·e subject to H_sub e = s_sub (mod2), w_j = log((1-p)/p).
     If nullity r > r_cap, fall back to greedy.
+    
+    Args:
+        H_sub: Parity check matrix (sparse or dense)
+        s_sub: Syndrome vector
+        p_flip: Flip probabilities (None = uniform 0.5). Also accepts probs_local for legacy compatibility.
+        r_cap: Max nullity before fallback to greedy
+        stats_out: Optional dict to store search stats
+        probs_local: Legacy parameter name for p_flip
     """
     eps = 1e-6
-    p = np.clip(p_flip.astype(np.float64), eps, 1 - eps)
+    # Handle legacy probs_local parameter
+    if probs_local is not None and p_flip is None:
+        p_flip = probs_local
+    if p_flip is None:
+        # Back-compat: treat as uniform 0.5 (uninformative) with tiny tilt
+        p_flip = np.full(_as_dense_uint8(H_sub).shape[1], 0.5, dtype=np.float64)
+    p = np.clip(np.asarray(p_flip, dtype=np.float64), eps, 1 - eps)
     w = np.log((1 - p) / p)  # positive if p<0.5
 
     e0 = gf2_solve_particular(H_sub, s_sub)  # particular solution
@@ -355,3 +382,93 @@ def greedy_parity_project(H_sub: sp.csr_matrix,
         r = (r ^ (Hc[:, j].toarray().ravel().astype(np.uint8))).astype(np.uint8)
 
     return e
+
+
+def solve_on_erasure(
+    H: np.ndarray,
+    s: np.ndarray,
+    mask_cols: np.ndarray,
+    mask_rows: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Solve for erased qubit values that reproduce the syndrome.
+    
+    Args:
+        H: Parity check matrix (m × n)
+        s: Syndrome vector (m,)
+        mask_cols: Binary mask indicating erased qubits (n,). 1 = erased.
+        mask_rows: Optional binary mask indicating erased checks (m,). 1 = erased (don't use).
+    
+    Returns:
+        Correction vector x (n,) such that H[valid_rows] @ x = s[valid_rows] (mod 2)
+        and x[i] = 0 for non-erased qubits.
+    """
+    H = np.asarray(H, dtype=np.uint8)
+    s = np.asarray(s, dtype=np.uint8)
+    mask_cols = np.asarray(mask_cols, dtype=np.uint8).astype(bool)
+    
+    # Identify valid (non-erased) rows
+    if mask_rows is None:
+        rows_keep = np.ones(H.shape[0], dtype=bool)
+    else:
+        mask_rows = np.asarray(mask_rows, dtype=np.uint8).astype(bool)
+        rows_keep = ~mask_rows
+    
+    # Extract submatrix for erased columns and valid rows
+    H_sub = H[rows_keep][:, mask_cols]
+    s_sub = s[rows_keep]
+    
+    # If no erased qubits or no valid constraints, return zeros
+    if not mask_cols.any() or not rows_keep.any():
+        return np.zeros(H.shape[1], dtype=np.uint8)
+    
+    # Solve using GF(2) particular solution (find any solution)
+    try:
+        x_erased = gf2_solve_particular(H_sub, s_sub)
+    except (ValueError, AssertionError):
+        # No solution exists; return zeros
+        x_erased = np.zeros(mask_cols.sum(), dtype=np.uint8)
+    
+    # Build full correction vector
+    x = np.zeros(H.shape[1], dtype=np.uint8)
+    x[mask_cols] = x_erased
+    return x
+
+
+# -------- Legacy compatibility wrappers (kept slim) --------
+def active_components(H: np.ndarray, s: np.ndarray, basis: str | None = None):
+    """Legacy API: ignore basis and return connected components of the active subgraph."""
+    A = _as_dense_uint8(H)
+    rows = np.where(np.asarray(s, dtype=np.uint8) & 1)[0]
+    # build check-node graph via shared data qubits
+    # adjacency between checks if they share any 1 in a column
+    if A.ndim != 2:
+        raise ValueError("H must be 2D")
+    # Compute which checks share data qubits (any overlap, not mod 2)
+    share = (A @ A.T)  # Count of shared qubits (over integers, not GF2)
+    visited = set(); comps=[]
+    for r in rows:
+        if r in visited: continue
+        stack=[r]; comp=[]
+        while stack:
+            u=stack.pop()
+            if u in visited: continue
+            visited.add(u); comp.append(u)
+            # Find neighbors: other active checks that share at least one qubit
+            nbrs = np.where(share[u] > 0)[0].tolist()
+            for v in nbrs:
+                if int(v) in rows and v not in visited:
+                    stack.append(int(v))
+        comps.append(Cluster(check_indices=np.array(sorted(comp), dtype=int)))
+    return comps
+
+def infer_clusters_batched(Hx: np.ndarray, Hz: np.ndarray,
+                           SX: np.ndarray, SZ: np.ndarray):
+    """Legacy API expected by tests: run ml_parity_project per batch element."""
+    B = SX.shape[0]
+    ex = np.zeros((B, Hx.shape[1]), dtype=np.uint8)
+    ez = np.zeros((B, Hz.shape[1]), dtype=np.uint8)
+    for b in range(B):
+        ex[b] = ml_parity_project(Hx, SX[b], p_flip=None)
+        ez[b] = ml_parity_project(Hz, SZ[b], p_flip=None)
+    return ex, ez

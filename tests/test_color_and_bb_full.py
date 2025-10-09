@@ -10,7 +10,7 @@ def _css_ok(code):
 
 
 def _get_or_skip(family: str, distance: int, **kw):
-    cr = importlib.import_module("codes_registry")
+    cr = importlib.import_module("mghd.codes.registry")
     try:
         return cr.get_code(family, distance=distance, **kw)
     except RuntimeError as exc:
@@ -38,14 +38,14 @@ def test_color_488_triangle_css():
 
 
 def test_gb_two_block_css_and_shape():
-    cr = importlib.import_module("codes_registry")
+    cr = importlib.import_module("mghd.codes.registry")
     code = cr.get_code("gb", n=31, taps_a=(0, 1, 3), taps_b=(0, 2, 7))
     _css_ok(code)
     assert code.Hx.shape[1] == 2 * 31
 
 
 def test_bb_bivariate_css_and_shape():
-    cr = importlib.import_module("codes_registry")
+    cr = importlib.import_module("mghd.codes.registry")
     code = cr.get_code(
         "bb",
         n1=11,

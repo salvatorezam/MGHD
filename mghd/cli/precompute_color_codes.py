@@ -45,11 +45,16 @@ def main(argv: List[str] | None = None) -> int:
         for kind in sorted(wanted):
             if kind == "666":
                 try:
-                    from mghd.core import codes_external as cx
+                    # New layout: external color-code providers live under mghd.codes.*
+                    from mghd.codes import external_providers as cx  # may raise if providers not installed
                 except ImportError:
                     import importlib
-                    cx = importlib.import_module("codes_external")
-                builder = getattr(cx, "build_color_666_qecsim", None)
+                    # Fallback for legacy import paths, if needed
+                    try:
+                        cx = importlib.import_module("mghd.codes.external_providers")
+                    except ImportError:
+                        cx = None
+                builder = getattr(cx, "build_color_666_qecsim", None) if cx else None
             else:
                 try:
                     from mghd.core import codes_external_488 as cx488

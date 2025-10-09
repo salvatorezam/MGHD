@@ -14,11 +14,13 @@ import warnings
 
 import numpy as np
 
-import core
+from mghd.decoders.lsd.cluster_core import ml_parity_project
 
 try:  # pragma: no cover - optional dependency
-    from ldpc.bplsd_decoder import BpLsdDecoder  # type: ignore
-
+    # ldpc 0.1.x has bposd_decoder, not bplsd_decoder
+    # BP+OSD with osd_method can approximate LSD behavior
+    import ldpc
+    BpLsdDecoder = ldpc.bposd_decoder  # type: ignore
     _HAVE_LDPC = True
     _LDPC_IMPORT_ERROR: Optional[Exception] = None
 except Exception as exc:  # pragma: no cover - executed when ldpc missing
@@ -33,7 +35,7 @@ class LSDConfig:
     max_iter: int = 3
     bp_method: str = "product_sum"
     schedule: str = "serial"
-    lsd_method: str = "lsd_cs"  # cluster-search
+    lsd_method: str = "OSD_CS"  # cluster-search; valid options: 'OSD_0', 'OSD_E', 'OSD_CS'
     lsd_order: int = 2
 
 
@@ -137,8 +139,8 @@ class LSDTeacher:
                 probs_x[mask] = 0.5
                 probs_z[mask] = 0.5
 
-            ex[b] = core.ml_parity_project(self.Hx, syndromes_x[b], probs_x)
-            ez[b] = core.ml_parity_project(self.Hz, syndromes_z[b], probs_z)
+            ex[b] = ml_parity_project(self.Hx, syndromes_x[b], probs_x)
+            ez[b] = ml_parity_project(self.Hz, syndromes_z[b], probs_z)
         return ex, ez
 
 

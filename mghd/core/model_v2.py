@@ -7,8 +7,13 @@ from typing import Optional, Sequence, Dict, List
 from types import SimpleNamespace
 
 ## ---- REQUIRED building blocks from your stack (fail-fast if missing) ----
-from .blocks import ChannelSE as _ChannelSE  # Channel squeeze-excitation
-from .blocks import AstraGNN as _AstraGNN  # Astra message passing
+try:
+    from .blocks import ChannelSE as _ChannelSE  # Channel squeeze-excitation
+    from .blocks import AstraGNN as _AstraGNN  # Astra message passing
+except ImportError:
+    # blocks.py requires panq_functions; provide stub fallbacks
+    _ChannelSE = None
+    _AstraGNN = None
 # Your Mamba / SSM sequence encoder; support common aliases in poc_my_models
 try:
     from poc_my_models import MambaEncoder as _AstraMamba
@@ -85,6 +90,8 @@ class AstraGNNWrapper(nn.Module):
     """
     def __init__(self, hidden_dim: int, edge_feat_dim: int, n_iters: int):
         super().__init__()
+        if _AstraGNN is None:
+            raise ImportError("AstraGNN requires panq_functions module which is not available")
         self.core = _AstraGNN(
             n_iters=n_iters,
             n_node_inputs=hidden_dim,
@@ -132,6 +139,8 @@ class MGHDv2(nn.Module):
         # 1) Mamba over checks (your implementation)
         self.seq_encoder = AstraMambaWrapper(d_model=d_model, d_state=d_state)
         # 2) Channel-SE (your implementation)
+        if _ChannelSE is None:
+            raise ImportError("ChannelSE requires panq_functions module which is not available")
         self.se          = _ChannelSE(channels=d_model)
         # 3) Astra GNN (your implementation)
         self.gnn         = AstraGNNWrapper(hidden_dim=d_model, edge_feat_dim=edge_feat_dim, n_iters=n_iters)

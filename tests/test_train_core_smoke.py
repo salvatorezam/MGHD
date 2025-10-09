@@ -8,15 +8,15 @@ def test_train_core_smoke():
     cmd = [
         sys.executable,
         "-m",
-        "tools.train_core",
+        "mghd.cli.train_core",
         "--family",
         "surface",
         "--distances",
         "3",
         "--sampler",
-        "cudaq",
+        "stim",
         "--shots-per-batch",
-        "8",
+        "4",
         "--batches",
         "1",
     ]

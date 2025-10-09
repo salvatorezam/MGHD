@@ -36,11 +36,33 @@ if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
 
 from mghd.utils.graphlike import is_graphlike
 
-from samplers import get_sampler
+from mghd.samplers.registry import get_sampler
 from mghd.decoders.mix import MixConfig, TeacherMix
 
-from .code_loader import load_code
-from .curriculum import parse_distances
+try:
+    from .code_loader import load_code  # optional; may not exist after reorg
+except ImportError:
+    load_code = None
+from mghd.codes.registry import get_code
+
+
+def parse_distances(spec: str) -> list[int]:
+    """
+    Accept forms like '5', '3,5,7', '3-31:2'. Returns list of ints.
+    """
+    import re
+    spec = spec.strip()
+    if re.fullmatch(r"\d+", spec):
+        return [int(spec)]
+    if "," in spec:
+        return [int(x) for x in spec.split(",")]
+    m = re.fullmatch(r"(\d+)-(\d+):(\d+)", spec)
+    if m:
+        lo, hi, step = map(int, m.groups())
+        return list(range(lo, hi+1, step))
+    raise ValueError(f"Bad distance spec: {spec}")
+
+
 from mghd.utils.metrics import LEResult, logical_error_rate, summary_line
 
 
@@ -249,12 +271,25 @@ def main() -> None:
     # Sampler (CUDA-Q is the default; actual CLN via trajectories)  [Ref CUDA-Q]
     sampler_name = args.sampler
 
+    # Get the Sampler class for supports_family check
+    if args.sampler == "stim":
+        from mghd.samplers.stim_sampler import StimSampler as Sampler
+    elif args.sampler == "cudaq":
+        from mghd.samplers.cudaq_sampler import CudaQSampler as Sampler
+    else:
+        raise ValueError(f"Unknown sampler {args.sampler}")
+
+    # iterate requested families; skip ones unsupported by the chosen sampler
     for family in families:
+        if hasattr(Sampler, "supports_family") and not Sampler.supports_family(family):
+            print(f"[warn] sampler={args.sampler} does not support family={family}; skipping.")
+            continue
+        # existing per-family training / evaluation code follows...
         distances = parse_distances(args.distances)
         for d in distances:
             print(f"\n=== Family={family}  d={d}  sampler={args.sampler} ===")
             # Load code object (Hx/Hz, detector metadata, hypergraph mapping if available)
-            code = load_code(family, d)
+            code = load_code(family, d) if load_code else get_code(family, distance=d)
             Hx = getattr(code, "Hx", None)
             Hz = getattr(code, "Hz", None)
 

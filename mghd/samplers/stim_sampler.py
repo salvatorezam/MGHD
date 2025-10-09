@@ -35,6 +35,14 @@ def sample_surface_memory(
 class StimSampler:
     """Stim sampler that mirrors the DEM construction for surface codes."""
 
+    # Families this sampler can build Stim circuits for (extend as you implement more).
+    _SUPPORTED = {"surface"}  # add "repetition", "steane", etc. when builders exist
+
+    @classmethod
+    def supports_family(cls, family: str) -> bool:
+        """Return True iff this sampler can generate a Stim circuit for the family."""
+        return family in cls._SUPPORTED
+
     def __init__(self, *, rounds: int = 5, dep: Optional[float] = None) -> None:
         self.rounds = int(rounds)
         self.dep = dep
