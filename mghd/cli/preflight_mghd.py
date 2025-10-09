@@ -1,0 +1,317 @@
+#!/usr/bin/env python
+"""MGHD preflight and validator."""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, Optional
+
+
+@dataclass
+class StepResult:
+    name: str
+    status: str
+    details: Dict[str, object]
+
+    def to_summary(self) -> Dict[str, object]:
+        data = {"status": self.status}
+        data.update(self.details)
+        return data
+
+
+def section(title: str) -> None:
+    print(f"\n=== {title} ===")
+
+
+class PreflightError(RuntimeError):
+    """Raised when a blocking preflight error occurs."""
+
+
+def check_deps(log_path: Path) -> Dict[str, object]:
+    import importlib.metadata as im
+
+    from packaging.version import Version  # type: ignore
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    versions: Dict[str, object] = {"cudaq_available": False}
+
+    def emit(line: str) -> None:
+        print(line)
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(line + "\n")
+
+    log_path.write_text("", encoding="utf-8")
+
+    pm_version = None
+    for dist in ("pymatching", "PyMatching"):
+        try:
+            pm_version = im.version(dist)
+        except im.PackageNotFoundError:
+            continue
+        else:
+            versions["pymatching"] = pm_version
+            break
+    if pm_version is None:
+        emit("ERROR: PyMatching is not installed; install PyMatching>=2.3.0.")
+        raise PreflightError("pymatching missing")
+
+    if Version(pm_version) < Version("2.3.0"):
+        emit(f"ERROR: PyMatching version {pm_version} < 2.3.0; upgrade to run correlated matching.")
+        raise PreflightError("pymatching too old")
+
+    try:
+        stim_version = im.version("stim")
+    except im.PackageNotFoundError as exc:
+        emit(f"ERROR: stim import failed ({exc}); install stim>=1.13.")
+        raise PreflightError("stim missing") from exc
+    else:
+        versions["stim"] = stim_version
+
+    emit(f"PyMatching version: {pm_version}")
+    emit(f"Stim version:       {stim_version}")
+
+    try:
+        __import__("cudaq")
+    except Exception:
+        emit("CUDA-Q:            not installed (smoke test will be skipped)")
+        versions["cudaq"] = None
+    else:
+        versions["cudaq_available"] = True
+        try:
+            cudaq_version = im.version("cudaq")
+        except im.PackageNotFoundError:
+            cudaq_version = "installed"
+        versions["cudaq"] = cudaq_version
+        emit(f"CUDA-Q version:   {cudaq_version}")
+
+    return versions
+
+
+def run(cmd: Iterable[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd_list = list(cmd)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("$ " + " ".join(cmd_list) + "\n")
+        log_file.flush()
+        process = subprocess.Popen(
+            cmd_list,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        output_chunks: list[str] = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            log_file.write(line)
+            output_chunks.append(line)
+        retcode = process.wait()
+    return subprocess.CompletedProcess(cmd_list, retcode, "".join(output_chunks), "")
+
+
+LER_PATTERN = re.compile(r"LER(?:_(?P<kind>dem|mix))?\s*[:=]\s*(?P<value>[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)")
+
+
+def parse_ler(stdout: str) -> Dict[str, Optional[float]]:
+    results: Dict[str, Optional[float]] = {"dem": None, "mix": None}
+    for match in LER_PATTERN.finditer(stdout):
+        kind = match.group("kind") or "mix"
+        try:
+            results[kind] = float(match.group("value"))
+        except ValueError:
+            continue
+    return results
+
+
+def write_skip_log(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(message + "\n", encoding="utf-8")
+    print(message)
+
+
+def summarize(rows: Iterable[StepResult]) -> None:
+    section("Summary")
+    header = f"{'Stage':<18}{'Status':<8}Details"
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        status = row.status.upper()
+        detail = row.details.get("note") or row.details.get("message") or ""
+        ler = row.details.get("ler")
+        if isinstance(ler, dict):
+            ler_parts = [
+                f"LER_dem={ler['dem']:.4f}" if ler.get("dem") is not None else None,
+                f"LER_mix={ler['mix']:.4f}" if ler.get("mix") is not None else None,
+            ]
+            ler_text = ", ".join(filter(None, ler_parts))
+            detail = f"{detail} {ler_text}".strip()
+        print(f"{row.name:<18}{status:<8}{detail}")
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    parser = argparse.ArgumentParser("MGHD preflight and validator")
+    parser.add_argument("--families", default="surface")
+    parser.add_argument("--distances", default="5")
+    parser.add_argument("--shots-per-batch", type=int, default=64)
+    parser.add_argument("--batches", type=int, default=50)
+    parser.add_argument("--dem-rounds", type=int, default=5)
+    parser.add_argument("--qpu-profile", default="qpu_profiles/iqm_garnet_example.json")
+    parser.add_argument("--context-source", default="qiskit")
+    parser.add_argument("--max-ler-dem", type=float, default=0.10)
+    parser.add_argument("--max-ler-mix", type=float, default=0.10)
+    parser.add_argument(
+        "--pytest",
+        dest="run_pytest",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument("--skip-cudaq", action="store_true")
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    repo_root = Path(__file__).resolve().parents[1]
+    artifact_root = repo_root / "artifacts" / "preflight"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+
+    summary_rows: list[StepResult] = []
+    summary_json: Dict[str, object] = {"arguments": vars(args)}
+
+    # 1) Dependencies
+    section("Dependency Check")
+    deps_log = artifact_root / "deps.txt"
+    try:
+        versions = check_deps(deps_log)
+    except PreflightError as exc:
+        summary_json["versions"] = {}
+        summary_rows.append(StepResult("dependencies", "fail", {"message": str(exc)}))
+        summary_json["steps"] = {row.name: row.to_summary() for row in summary_rows}
+        summary_path = artifact_root / "summary.json"
+        summary_path.write_text(json.dumps(summary_json, indent=2) + "\n", encoding="utf-8")
+        print(f"Summary written to {summary_path}")
+        summarize(summary_rows)
+        return 1
+
+    summary_json["versions"] = {k: v for k, v in versions.items() if k != "cudaq_available"}
+    summary_rows.append(StepResult("dependencies", "pass", {"message": "versions ok"}))
+
+    # 2) PyTest
+    pytest_result: Optional[subprocess.CompletedProcess[str]] = None
+    if args.run_pytest:
+        section("PyTest")
+        pytest_result = run([sys.executable, "-m", "pytest", "-q"], artifact_root / "pytest.txt")
+        pytest_status = "pass" if pytest_result.returncode == 0 else "fail"
+        pytest_details: Dict[str, object] = {"returncode": pytest_result.returncode}
+        if pytest_status == "fail":
+            pytest_details["note"] = "pytest failed"
+        summary_rows.append(StepResult("pytest", pytest_status, pytest_details))
+    else:
+        section("PyTest")
+        write_skip_log(artifact_root / "pytest.txt", "pytest skipped by --no-pytest flag")
+        summary_rows.append(StepResult("pytest", "skip", {"note": "skipped"}))
+
+    # 3) Stim + DEM correlated matching
+    section("Stim + DEM A/B")
+    stim_cmd = [
+        sys.executable,
+        "-m",
+        "tools.train_core",
+        "--families",
+        args.families,
+        "--distances",
+        args.distances,
+        "--sampler",
+        "stim",
+        "--dem-enable",
+        "--dem-correlated",
+        "--dem-rounds",
+        str(args.dem_rounds),
+        "--shots-per-batch",
+        str(args.shots_per_batch),
+        "--batches",
+        str(args.batches),
+    ]
+    stim_result = run(stim_cmd, artifact_root / "stim_dem.txt")
+    stim_ler = parse_ler(stim_result.stdout)
+    stim_ok = stim_result.returncode == 0
+    notes: list[str] = []
+    if stim_ler["dem"] is not None and stim_ler["dem"] > args.max_ler_dem:
+        stim_ok = False
+        notes.append(f"LER_dem {stim_ler['dem']:.4f} > {args.max_ler_dem:.4f}")
+    if stim_ler["mix"] is not None and stim_ler["mix"] > args.max_ler_mix:
+        stim_ok = False
+        notes.append(f"LER_mix {stim_ler['mix']:.4f} > {args.max_ler_mix:.4f}")
+    if stim_ler["dem"] is None and stim_ler["mix"] is None:
+        notes.append("LER metrics not found")
+    stim_status = "pass" if stim_ok else "fail"
+    stim_detail = {"returncode": stim_result.returncode, "ler": stim_ler}
+    if notes:
+        stim_detail["note"] = "; ".join(notes)
+    summary_rows.append(StepResult("stim_dem", stim_status, stim_detail))
+
+    # 4) CUDA-Q smoke
+    cudaq_log = artifact_root / "cudaq.txt"
+    cudaq_available = bool(versions.get("cudaq_available")) and not args.skip_cudaq
+    if cudaq_available:
+        section("CUDA-Q Smoke")
+        cudaq_cmd = [
+            sys.executable,
+            "-m",
+            "tools.train_core",
+            "--families",
+            args.families,
+            "--distances",
+            args.distances,
+            "--sampler",
+            "cudaq",
+            "--qpu-profile",
+            args.qpu_profile,
+            "--context-source",
+            args.context_source,
+            "--shots-per-batch",
+            str(args.shots_per_batch),
+            "--batches",
+            str(args.batches),
+        ]
+        cudaq_result = run(cudaq_cmd, cudaq_log)
+        cudaq_ler = parse_ler(cudaq_result.stdout)
+        cudaq_status = "pass" if cudaq_result.returncode == 0 else "fail"
+        cudaq_detail = {"returncode": cudaq_result.returncode, "ler": cudaq_ler}
+        if cudaq_status == "fail":
+            cudaq_detail["note"] = "non-zero exit (ignored for overall pass)"
+        summary_rows.append(StepResult("cudaq", cudaq_status, cudaq_detail))
+    else:
+        section("CUDA-Q Smoke")
+        reason = "CUDA-Q not available" if not versions.get("cudaq_available") else "skipped via --skip-cudaq"
+        write_skip_log(cudaq_log, reason)
+        summary_rows.append(StepResult("cudaq", "skip", {"note": reason}))
+
+    summary_json["steps"] = {row.name: row.to_summary() for row in summary_rows}
+    summary_json.setdefault("versions", {})
+    summary_json["cudaq_available"] = bool(versions.get("cudaq_available"))
+
+    summary_path = artifact_root / "summary.json"
+    summary_path.write_text(json.dumps(summary_json, indent=2) + "\n", encoding="utf-8")
+    print(f"Summary written to {summary_path}")
+
+    summarize(summary_rows)
+
+    overall_ok = True
+    for row in summary_rows:
+        if row.name == "pytest" and row.status == "skip":
+            continue
+        if row.status != "pass":
+            overall_ok = False
+            break
+    if not any(row.name == "stim_dem" and row.status == "pass" for row in summary_rows):
+        overall_ok = False
+
+    return 0 if overall_ok else 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
