@@ -331,3 +331,8 @@ scratchpad/initial-test/external
 /MGHD-data/
 /MGHD-scratch/
 
+
+# Server organization and access documentation (not for tracking)
+SERVER_ACCESS_SOLUTIONS.md
+SERVER_ORGANIZATION_COMPLETE.md
+DATA_ORGANIZATION.md
