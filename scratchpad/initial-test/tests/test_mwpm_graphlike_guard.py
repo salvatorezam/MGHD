@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from mghd.utils.graphlike import is_graphlike
-from teachers.mwpm_fallback import MWPMFallback, MwpmNotGraphlike
+from mghd.decoders.mwpm_fallback import MWPMFallback, MwpmNotGraphlike
 
 
 def test_is_graphlike_detection():
@@ -20,7 +20,7 @@ def test_mwpm_init_raises_on_non_graphlike():
 
 
 def test_teacher_mix_disables_non_graphlike_mwpm(monkeypatch):
-    from teachers import mix as mix_mod
+    from mghd.decoders import mix as mix_mod
 
     H = np.array([[1, 1, 0], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
 

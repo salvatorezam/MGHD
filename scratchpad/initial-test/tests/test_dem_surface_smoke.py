@@ -6,8 +6,8 @@ def test_surface_dem_smoke():
     stim = pytest.importorskip("stim")
     pytest.importorskip("pymatching")
 
-    from teachers.dem_utils import build_surface_memory_dem
-    from teachers.dem_matching import DEMMatchingTeacher
+    from mghd.decoders.dem_utils import build_surface_memory_dem
+    from mghd.decoders.dem_matching import DEMMatchingTeacher
 
     dem = build_surface_memory_dem(
         distance=3,

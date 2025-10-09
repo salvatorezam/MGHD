@@ -4,8 +4,8 @@ import pytest
 stim = pytest.importorskip("stim")
 pytest.importorskip("pymatching")
 
-from samplers.stim_sampler import sample_surface_memory
-from teachers.dem_utils import build_surface_memory_dem
+from mghd.samplers.stim_sampler import sample_surface_memory
+from mghd.decoders.dem_utils import build_surface_memory_dem
 
 
 def test_stim_sampler_matches_dem():

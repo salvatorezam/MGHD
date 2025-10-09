@@ -137,7 +137,7 @@ class CudaqGarnetSampler:
             return False
         try:
             # Lazy import (no CUDA usage here)
-            from cudaq_backend import (
+            from mghd.samplers.cudaq_backend import (
                 sample_surface_cudaq,  # noqa: F401
                 get_backend_info,      # noqa: F401
                 validate_backend_installation,  # noqa: F401
@@ -168,7 +168,7 @@ class CudaqGarnetSampler:
         s_bin: np.ndarray
         if self._ensure_cudaq():
             try:
-                from cudaq_backend import sample_surface_cudaq  # type: ignore
+                from mghd.samplers.cudaq_backend import sample_surface_cudaq  # type: ignore
                 # Two rounds are sufficient to assemble one Z and one X stabilizer round
                 base_kwargs = dict(
                     mode=self.mode,
@@ -337,7 +337,7 @@ class CudaqGarnetSampler:
         if not (_HAS_MWPF and _HAS_STIM):
             raise RuntimeError("MWPF+Stim not available in environment")
         # Build H matrices for rotated d=3 and corresponding DEM
-        from cudaq_backend.circuits import build_H_rotated_d3_from_cfg
+        from mghd.samplers.cudaq_backend.circuits import build_H_rotated_d3_from_cfg
         Hx, Hz, meta = build_H_rotated_d3_from_cfg({})
         dem = self._build_stim_dem_rotated_d3(Hx, Hz)
         # Compile decoder directly from DEM without attaching a circuit

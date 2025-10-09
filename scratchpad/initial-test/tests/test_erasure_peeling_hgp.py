@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import numpy as np
 
-from teachers.erasure_peeling import ErasureQLDPCPeelingTeacher
+from mghd.decoders.erasure_peeling import ErasureQLDPCPeelingTeacher
 
 
 def _load_small_hgp():

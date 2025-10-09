@@ -198,7 +198,7 @@ class CudaQSampler:
         return extra
 
     def _sample_surface(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        from cudaq_backend.backend_api import cudaq_sample_surface_wrapper
+        from mghd.samplers.cudaq_backend.backend_api import cudaq_sample_surface_wrapper
 
         layout_info = getattr(code_obj, "layout", {})
         layout_dict = None
@@ -252,7 +252,7 @@ class CudaQSampler:
         return dets, x_err, z_err
 
     def _sample_repetition(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        from cudaq_backend.backend_api import cudaq_sample_repetition_wrapper
+        from mghd.samplers.cudaq_backend.backend_api import cudaq_sample_repetition_wrapper
 
         Hx = np.asarray(code_obj.Hx, dtype=np.uint8)
         Hz = np.asarray(code_obj.Hz, dtype=np.uint8)

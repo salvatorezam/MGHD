@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from teachers.mix import MixConfig, TeacherMix
+from mghd.decoders.mix import MixConfig, TeacherMix
 
 
 def _dummy_code(n: int = 4):
@@ -118,7 +118,7 @@ def test_weighting_modules_importable():
 
 
 def test_rl_bandit_update_smoke():
-    from tad_rl.lin_ts import LinTSBandit
+    from mghd.tad.rl.lin_ts import LinTSBandit
 
     bandit = LinTSBandit(d=5)
     x = np.arange(5.0)

@@ -45,14 +45,14 @@ def main(argv: List[str] | None = None) -> int:
         for kind in sorted(wanted):
             if kind == "666":
                 try:
-                    from mghd_main import codes_external as cx
+                    from mghd.core import codes_external as cx
                 except ImportError:
                     import importlib
                     cx = importlib.import_module("codes_external")
                 builder = getattr(cx, "build_color_666_qecsim", None)
             else:
                 try:
-                    from mghd_main import codes_external_488 as cx488
+                    from mghd.core import codes_external_488 as cx488
                 except ImportError:
                     cx488 = None
                 builder = getattr(cx488, "build_color_488", None) if cx488 else None

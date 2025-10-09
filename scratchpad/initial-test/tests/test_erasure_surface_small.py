@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from codes_registry import get_code
-from teachers.erasure_surface_ml import ErasureSurfaceMLTeacher
+from mghd.codes.registry import get_code
+from mghd.decoders.erasure_surface_ml import ErasureSurfaceMLTeacher
 
 
 def test_erasure_surface_ml_matches_syndrome():

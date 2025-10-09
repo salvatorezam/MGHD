@@ -37,7 +37,7 @@ if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
 from mghd.utils.graphlike import is_graphlike
 
 from samplers import get_sampler
-from teachers.mix import MixConfig, TeacherMix
+from mghd.decoders.mix import MixConfig, TeacherMix
 
 from .code_loader import load_code
 from .curriculum import parse_distances
@@ -298,7 +298,7 @@ def main() -> None:
             profile_dict: Dict[str, Any] = {}
             if args.qpu_profile and args.context_source != "none":
                 try:
-                    from mghd_main.qpu_profile import load_qpu_profile
+                    from mghd.core.qpu_profile import load_qpu_profile
 
                     profile = load_qpu_profile(args.qpu_profile)
                 except Exception as exc:
@@ -359,9 +359,9 @@ def main() -> None:
                             stacklevel=2,
                         )
                     else:
-                        from teachers.dem_utils import dem_cache_path, build_surface_memory_dem
+                        from mghd.decoders.dem_utils import dem_cache_path, build_surface_memory_dem
                         try:
-                            from teachers.dem_matching import DEMMatchingTeacher
+                            from mghd.decoders.dem_matching import DEMMatchingTeacher
                         except Exception as exc:
                             warnings.warn(
                                 f"DEM matching unavailable: {exc}",
@@ -429,7 +429,7 @@ def main() -> None:
             bandit = None
             bandit_ctx = None
             if args.rl_online:
-                from tad_rl.lin_ts import LinTSBandit
+                from mghd.tad.rl.lin_ts import LinTSBandit
 
                 if ctx_vec is None:
                     ctx_vec = np.ones(1, dtype=np.float32)

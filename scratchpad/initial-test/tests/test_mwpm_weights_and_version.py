@@ -7,7 +7,7 @@ import numpy as np
 
 
 def test_weights_fraction_like_and_decode_shim(monkeypatch):
-    from teachers import mwpm_fallback as module
+    from mghd.decoders import mwpm_fallback as module
 
     class StubMatching:
         def __init__(self, H: np.ndarray, weights):

@@ -2,9 +2,9 @@ from __future__ import annotations
 import os, numpy as np
 from typing import Dict, Any, List
 # Lazy CUDA-Q backend hooks; imported only when sampling is invoked
-from cudaq_backend.garnet_noise import FOUNDATION_DEFAULTS  # single source of truth for noise
-from cudaq_backend.backend_api import cudaq_sample_surface_wrapper
-from cudaq_backend.circuits import make_surface_layout_general, build_H_rotated_general
+from mghd.samplers.cudaq_backend.garnet_noise import FOUNDATION_DEFAULTS  # single source of truth for noise
+from mghd.samplers.cudaq_backend.backend_api import cudaq_sample_surface_wrapper
+from mghd.samplers.cudaq_backend.circuits import make_surface_layout_general, build_H_rotated_general
 
 _USE_SYNTH = os.getenv("MGHD_SYNTHETIC","0") == "1"
 _MODE = os.getenv("MGHD_MODE","foundation")  # {"foundation","student"}

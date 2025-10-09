@@ -17,12 +17,12 @@ def test_mix_instantiation_and_route_smoke(monkeypatch):
     code = ToyCode()
     # monkeypatch mwpf/ldpc imports if packages are missing
     try:
-        from teachers.mwpf_teacher import MWPFTeacher, MWPFConfig  # noqa: F401
-        from teachers.lsd_teacher import LSDTeacher, LSDConfig  # noqa: F401
+        from mghd.decoders.mwpf_teacher import MWPFTeacher, MWPFConfig  # noqa: F401
+        from mghd.decoders.lsd_teacher import LSDTeacher, LSDConfig  # noqa: F401
     except Exception:
         pytest.skip("mwpf/ldpc not installed in CI")
 
-    from teachers.mix import TeacherMix, MixConfig
+    from mghd.decoders.mix import TeacherMix, MixConfig
 
     mix = TeacherMix(code, H, H, mwpf_cfg=MWPFConfig(cluster_node_limit=10),
                      lsd_cfg=LSDConfig(max_iter=1), mix_cfg=MixConfig(p_mwpf=0.5, p_lsd=0.4, p_mwpm=0.1))

@@ -5,11 +5,11 @@ from pathlib import Path
 import numpy as np
 
 from mghd_public.features_v2 import pack_cluster
-from teachers.ensemble import get_teacher_label, TeacherOut
+from mghd.decoders.ensemble import get_teacher_label, TeacherOut
 from mghd_clustered import cluster_core as cc
 from mghd_clustered.garnet_adapter import sample_round, split_components_for_side
-from teachers.mwpf_ctx import MWPFContext
-from teachers.mwpm_ctx import MWPMatchingContext
+from mghd.decoders.mwpf_ctx import MWPFContext
+from mghd.decoders.mwpm_ctx import MWPMatchingContext
 
 def short_sha(*objs) -> str:
     h = hashlib.sha1()

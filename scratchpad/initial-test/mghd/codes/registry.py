@@ -789,7 +789,7 @@ def _write_color_cache(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray,
 def _build_color_via_external(kind: str, distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
     if kind == "666":
         try:
-            from mghd_main import codes_external as cx
+            from mghd.core import codes_external as cx
         except ImportError:
             import importlib
             cx = importlib.import_module("codes_external")
@@ -799,7 +799,7 @@ def _build_color_via_external(kind: str, distance: int) -> Tuple[np.ndarray, np.
         return builder(distance)
     if kind == "488":
         try:
-            from mghd_main import codes_external_488 as cx488
+            from mghd.core import codes_external_488 as cx488
         except ImportError as exc:
             raise RuntimeError("codes_external_488 unavailable; install panqec or quantum-pecos.") from exc
         return cx488.build_color_488(distance)
