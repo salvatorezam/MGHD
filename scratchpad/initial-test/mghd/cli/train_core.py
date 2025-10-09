@@ -41,7 +41,7 @@ from mghd.decoders.mix import MixConfig, TeacherMix
 
 from .code_loader import load_code
 from .curriculum import parse_distances
-from tools.metrics import LEResult, logical_error_rate, summary_line
+from mghd.utils.metrics import LEResult, logical_error_rate, summary_line
 
 
 def _resolve_syndromes(code_obj, dets):

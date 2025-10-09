@@ -1,5 +1,5 @@
 import numpy as np
-from tools.metrics import logical_error_rate
+from mghd.utils.metrics import logical_error_rate
 
 
 def test_ler_math():
