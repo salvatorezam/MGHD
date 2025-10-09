@@ -339,3 +339,10 @@ DATA_ORGANIZATION.md
 
 # Scratchpad directory (local development only)
 scratchpad/
+
+# Docs (local reference only)
+docs/
+
+# Build artifacts
+mghd.egg-info/
+*.egg-info/
