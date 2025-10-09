@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from core import solve_on_erasure
+from mghd.core import solve_on_erasure
 
 
 def _check_solution(H, s, x, mask_cols, mask_rows=None):

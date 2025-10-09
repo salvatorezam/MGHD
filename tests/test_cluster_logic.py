@@ -1,5 +1,5 @@
 import numpy as np
-import core
+from mghd import core
 
 
 def _bruteforce_ml(H, s, w=None):
