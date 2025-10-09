@@ -1,15 +1,25 @@
-"""Teacher package exposing MWPF/LSD/MWPM helpers and mixers."""
+"""
+Backward compatibility shim for teachers.
 
+This module is deprecated. Please use 'mghd.decoders' instead.
+"""
 import warnings
 
-from .lsd_teacher import LSDConfig, LSDTeacher
-from .mix import MixConfig, TeacherMix
-from .mwpf_teacher import MWPFConfig, MWPFTeacher
-from .mwpm_fallback import MWPMFallback
+warnings.warn(
+    "Importing from 'teachers' is deprecated. Use 'from mghd.decoders import ...' instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
+# Re-export everything from mghd.decoders
+from mghd.decoders.lsd_teacher import LSDConfig, LSDTeacher
+from mghd.decoders.mix import MixConfig, TeacherMix
+from mghd.decoders.mwpf_teacher import MWPFConfig, MWPFTeacher
+from mghd.decoders.mwpm_fallback import MWPMFallback
 
 try:
-    from .erasure_surface_ml import ErasureSurfaceMLTeacher
-except Exception as exc:  # pragma: no cover - optional dependency stack
+    from mghd.decoders.erasure_surface_ml import ErasureSurfaceMLTeacher
+except Exception as exc:
     ErasureSurfaceMLTeacher = None
     warnings.warn(
         f"ErasureSurfaceMLTeacher unavailable ({exc}); import will skip erasure teacher.",
@@ -18,8 +28,8 @@ except Exception as exc:  # pragma: no cover - optional dependency stack
     )
 
 try:
-    from .erasure_peeling import ErasureQLDPCPeelingTeacher
-except Exception as exc:  # pragma: no cover - optional dependency stack
+    from mghd.decoders.erasure_peeling import ErasureQLDPCPeelingTeacher
+except Exception as exc:
     ErasureQLDPCPeelingTeacher = None
     warnings.warn(
         f"ErasureQLDPCPeelingTeacher unavailable ({exc}); import will skip erasure teacher.",
@@ -28,8 +38,8 @@ except Exception as exc:  # pragma: no cover - optional dependency stack
     )
 
 try:
-    from .dem_matching import DEMMatchingTeacher
-except Exception as exc:  # pragma: no cover - optional dependency stack
+    from mghd.decoders.dem_matching import DEMMatchingTeacher
+except Exception as exc:
     DEMMatchingTeacher = None
     warnings.warn(
         f"DEMMatchingTeacher unavailable ({exc}); install pymatching for DEM decoding.",
