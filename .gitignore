@@ -336,3 +336,6 @@ scratchpad/initial-test/external
 SERVER_ACCESS_SOLUTIONS.md
 SERVER_ORGANIZATION_COMPLETE.md
 DATA_ORGANIZATION.md
+
+# Scratchpad directory (local development only)
+scratchpad/
