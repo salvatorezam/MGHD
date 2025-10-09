@@ -1,0 +1,91 @@
+#!/usr/bin/env python
+"""Cache triangular color-code CSS matrices for odd d (<= max_d)."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+
+DATA_DIR = Path("color_cache")
+
+
+def _ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_npz(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: dict) -> None:
+    path = DATA_DIR / f"color_{kind}_d{distance}.npz"
+    np.savez_compressed(
+        path,
+        Hx=Hx.astype(np.uint8),
+        Hz=Hz.astype(np.uint8),
+        n=int(n),
+        meta=json.dumps(layout),
+    )
+    print(f"[cache] wrote {path}")
+
+
+def main(argv: List[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Precompute triangular color-code parity checks")
+    parser.add_argument("--max-d", type=int, default=31, help="Maximum odd distance to precompute (>=3).")
+    parser.add_argument("--which", choices=["666", "488", "both"], default="both",
+                        help="Which tilings to precompute.")
+    args = parser.parse_args(argv)
+
+    wanted = {"666", "488"} if args.which == "both" else {args.which}
+    _ensure_data_dir()
+    failures: List[Tuple[str, int, str]] = []
+    warned_488 = False
+
+    for d in range(3, args.max_d + 1, 2):
+        for kind in sorted(wanted):
+            if kind == "666":
+                try:
+                    from mghd_main import codes_external as cx
+                except ImportError:
+                    import importlib
+                    cx = importlib.import_module("codes_external")
+                builder = getattr(cx, "build_color_666_qecsim", None)
+            else:
+                try:
+                    from mghd_main import codes_external_488 as cx488
+                except ImportError:
+                    cx488 = None
+                builder = getattr(cx488, "build_color_488", None) if cx488 else None
+            if builder is None:
+                if kind == "488":
+                    if not warned_488:
+                        print("[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation.")
+                        failures.append((kind, d, "provider unavailable"))
+                        warned_488 = True
+                else:
+                    failures.append((kind, d, "codes_external missing builder"))
+                continue
+            try:
+                Hx, Hz, n, layout = builder(d)
+            except ImportError as exc:  # pragma: no cover - informative logging
+                if kind == "488":
+                    if not warned_488:
+                        print("[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation.")
+                        failures.append((kind, d, str(exc)))
+                        warned_488 = True
+                else:
+                    failures.append((kind, d, str(exc)))
+                continue
+            except Exception as exc:  # pragma: no cover - informative logging
+                failures.append((kind, d, str(exc)))
+                continue
+            _save_npz(kind, d, Hx, Hz, n, layout)
+    if failures:
+        print("[warn] failed entries:")
+        for kind, d, msg in failures:
+            print(f"  color_{kind} d={d}: {msg}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

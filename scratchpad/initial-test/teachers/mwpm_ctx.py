@@ -1,5 +1,9 @@
 from __future__ import annotations
+
 import numpy as np
+
+from mghd.utils.graphlike import is_graphlike
+
 try:
     import pymatching as pm
 except ImportError:
@@ -16,17 +20,19 @@ class MWPMatchingContext:
         """
         if pm is None:
             return self._decode_fallback(H_sub, synd_bits, side)
-        
+
         try:
             # Create cache key for this matrix
             cache_key = (H_sub.tobytes(), side)
-            
+
             if cache_key not in self._matcher_cache:
                 # Create pymatching Matching object
                 # Convert to binary matrix for pymatching
                 H_binary = (H_sub % 2).astype(np.uint8)
+                if not is_graphlike(H_binary):
+                    raise ValueError("mwpm_not_graphlike")
                 self._matcher_cache[cache_key] = pm.Matching(H_binary)
-            
+
             matcher = self._matcher_cache[cache_key]
             
             # Decode syndrome
@@ -39,7 +45,7 @@ class MWPMatchingContext:
             
             return correction_uint8, weight
             
-        except Exception as e:
+        except BaseException as e:
             # Fallback on any error
             print(f"Warning: MWPM decode failed ({e}), using fallback")
             return self._decode_fallback(H_sub, synd_bits, side)

@@ -1,0 +1,27 @@
+name: mghd-preflight
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt || true
+          pip install "PyMatching>=2.3" "stim>=1.13" "cudaq" || true
+      - name: Run MGHD preflight
+        run: make preflight
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mghd-preflight-logs
+          path: artifacts/preflight/

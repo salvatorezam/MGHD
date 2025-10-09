@@ -4,19 +4,27 @@
     "**/.git/**": true,
     "**/__pycache__/**": true,
     "**/.pytest_cache/**": true,
-    "results/**": true,
+    "results/**": false,
     "Plots and Data/**": true,
-    "experiments/**": true,
-    "fastpath/**": true,
+    "experiments/**": false,
+    "fastpath/**": false,
     "reports/**": true
   },
   "search.exclude": {
     "**/archive/**": true,
-    "results/**": true,
+    "results/**": false,
     "Plots and Data/**": true,
-    "experiments/**": true,
-    "fastpath/**": true,
-    "reports/**": true
+    "experiments/**": false,
+    "fastpath/**": false,
+    "reports/**": true,
+    "**/miniconda3/**": true,
+    "**/.cache/**": true
   },
-  "explorer.compactFolders": true
+  "explorer.compactFolders": true,
+  "git.ignoredRepositories": [
+    "/u/home/kulp/MGHD-data",
+    "/u/home/kulp/MGHD-scratch"
+  ],
+  "python.defaultInterpreterPath": "/u/home/kulp/miniconda3/envs/mlqec-env/bin/python",
+  "terminal.integrated.cwd": "/u/home/kulp/MGHD/scratchpad/initial-test"
 }

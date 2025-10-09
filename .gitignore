@@ -270,3 +270,64 @@ PROJECT_SUMMARY.md
 **/IMPLEMENTATION_SUMMARY.md
 **/STEP2_COMPLETE.md
 
+
+# =============================================================================
+# WORKSPACE RESTRICTIONS - ONLY scratchpad/initial-test/ should be tracked
+# =============================================================================
+
+# Exclude root level files
+/*.md
+/*.py
+/*.txt
+/*.sh
+/*.json
+/*.yaml
+/*.yml
+/*.cfg
+/*.ini
+/*.log
+/*.tmp
+/*.cache
+/data/
+/results/
+/experiments/
+/models/
+/plots/
+/figures/
+/logs/
+/tmp/
+/cache/
+/build/
+/dist/
+
+# Exclude specific documentation files in the workspace
+scratchpad/initial-test/docs/Agents.md
+scratchpad/initial-test/docs/IMPLEMENTATION_SUMMARY.md
+
+# Exclude __pycache__ everywhere
+**/__pycache__/
+
+
+# Additional __pycache__ exclusions for workspace
+scratchpad/initial-test/**/__pycache__/
+
+
+# Exclude symlinks to external data
+scratchpad/initial-test/data
+scratchpad/initial-test/results  
+scratchpad/initial-test/experiments
+scratchpad/initial-test/models
+scratchpad/initial-test/plots
+scratchpad/initial-test/tmp
+
+
+# Quick access symlinks (read-only, not for git)
+scratchpad/initial-test/home-quick
+scratchpad/initial-test/conda-env
+scratchpad/initial-test/external
+
+
+# Exclude entire data directory from git
+/MGHD-data/
+/MGHD-scratch/
+

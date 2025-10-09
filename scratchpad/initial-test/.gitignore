@@ -1,0 +1,289 @@
+# =============================================================================
+# MGHD REMOTE SERVER WORKSPACE .gitignore
+# Comprehensive exclusions for server-based ML development
+# Only files in scratchpad/initial-test/ should be tracked
+# =============================================================================
+
+# =============================================================================
+# WORKSPACE BOUNDARY - EXCLUDE EVERYTHING OUTSIDE THIS WORKSPACE
+# =============================================================================
+# Exclude all files in parent directories
+../../*
+../../../*
+../../../../*
+
+# Exclude everything at repo root level except scratchpad/
+/*.md
+/*.py
+/*.txt
+/*.sh
+/*.json
+/*.yaml
+/*.yml
+/*.cfg
+/*.ini
+/*.log
+/*.tmp
+/*.cache
+/data/
+/Data/
+/results/
+/Results/
+/experiments/
+/Experiments/
+/models/
+/Models/
+/plots/
+/Plots/
+/figures/
+/logs/
+/tmp/
+/cache/
+/build/
+/dist/
+
+# Exclude other workspace directories
+/core/
+/archive/
+/legacy/
+/backup/
+
+# =============================================================================
+# PYTHON CACHE & COMPILED FILES
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# =============================================================================
+# DATA DIRECTORIES (ABSOLUTE EXCLUSIONS)
+# =============================================================================
+# ANY data directory regardless of location
+**/data/
+**/Data/
+**/datasets/
+**/Datasets/
+**/experiments/
+**/Experiments/
+**/results/
+**/Results/
+**/outputs/
+**/Outputs/
+
+# Include specific results that should be tracked (if any)
+!small_results/
+!test_results/
+
+# Plots and analysis outputs (any location)
+**/Plots and Data/
+**/plots/
+**/figures/
+**/figs/
+**/analysis/
+
+# Google QEC datasets (any location pattern)
+**/google_qec*/
+**/google_*_experiment_data/
+**/surface_code_*/
+**/repetition_code_*/
+
+# =============================================================================
+# LARGE FILES & BINARY DATA
+# =============================================================================
+# NumPy data files
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+
+# Images and plots
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+*.eps
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# =============================================================================
+# LOGS & TEMPORARY FILES
+# =============================================================================
+*.log
+logs/
+*.tmp
+*.temp
+temp/
+tmp/
+*.cache
+.cache/
+
+# Training outputs
+wandb/
+mlruns/
+tensorboard/
+runs/
+
+# =============================================================================
+# JUPYTER & NOTEBOOKS
+# =============================================================================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints
+
+# =============================================================================
+# IDE & EDITOR FILES
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# =============================================================================
+# SERVER-SPECIFIC EXCLUSIONS
+# =============================================================================
+# Job outputs from SLURM/PBS
+*.out
+*.err
+slurm-*.out
+job_*.log
+
+# SSH/SSHFS mount points
+.sshfs/
+.fuse_hidden*
+
+# Backup files from editors
+*~
+*.bak
+*.backup
+
+# =============================================================================
+# ENVIRONMENT & CONFIGURATION
+# =============================================================================
+.env
+.env.*
+*.env
+config/local.py
+config/secrets.py
+
+# Conda environments (if accidentally created locally)
+miniconda3/
+anaconda3/
+envs/
+
+# =============================================================================
+# PROJECT-SPECIFIC RECOVERY FILES
+# =============================================================================
+# Recovery attempt files (from your recent experience)
+*.recovered.py
+*.decompyle3.py
+*.uncompyle6.py
+*.pyc.recovered
+pycdc-*/
+
+# Backup files
+*_backup_*
+*.rec*
+__pycache_backup*
+
+# =============================================================================
+# DOCUMENTATION FILES TO EXCLUDE
+# =============================================================================
+# Specific documentation files that should not be pushed
+docs/IMPLEMENTATION_SUMMARY.md
+docs/Agents.md
+
+# =============================================================================
+# EXCEPTIONS (files to keep even if they match patterns above)
+# =============================================================================
+# Keep small test data in THIS workspace
+!**/test_data/*.npy
+!**/examples/*.npz
+
+# Keep documentation images (small ones) in THIS workspace
+!docs/*.png
+!README*.png
+
+# Keep configuration templates in THIS workspace
+!config/template.*
+!config/example.*
+
+# =============================================================================
+# WORKSPACE-SPECIFIC INCLUSIONS
+# =============================================================================
+# Explicitly include source code directories in this workspace
+!mghd_public/
+!mghd_public/**
+!mghd_clustered/
+!mghd_clustered/**
+!cudaq_backend/
+!cudaq_backend/**
+!teachers/
+!teachers/**
+!tools/
+!tools/**
+!tests/
+!tests/**
+!color_cache/
+!color_cache/*.npz
+!training/
+!training/**
+
+# Include documentation (except excluded ones)
+!docs/
+!docs/**
+# But still exclude specific docs (re-declare after inclusion)
+docs/IMPLEMENTATION_SUMMARY.md
+docs/Agents.md
+
+# Include important project files in THIS workspace (but respect root exclusions)
+!*.py
+!*.txt
+!*.json
+!*.yaml
+!*.yml
+!requirements.txt
+!setup.py
+!pyproject.toml
+!README*
+!LICENSE*
+
+# Include markdown files EXCEPT the excluded docs
+!*.md
+# Re-exclude specific documentation files
+docs/IMPLEMENTATION_SUMMARY.md
+docs/Agents.md
