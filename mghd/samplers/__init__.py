@@ -21,14 +21,15 @@ class SampleBatch:
 
     dets: np.ndarray     # uint8 [B, D]
     obs: np.ndarray      # uint8 [B, K]
-    meta: Dict[str, Any]
-    erase_data_mask: Optional[np.ndarray] = None  # uint8/bool [B, n]
-    erase_det_mask: Optional[np.ndarray] = None   # uint8/bool [B, D]
-    p_erase_data: Optional[np.ndarray] = None     # float [B, n]
+    meta: dict[str, Any]
+    erase_data_mask: np.ndarray | None = None  # uint8/bool [B, n]
+    erase_det_mask: np.ndarray | None = None   # uint8/bool [B, D]
+    p_erase_data: np.ndarray | None = None     # float [B, n]
 
 
-from .registry import get_sampler, register_sampler
 from .cudaq_sampler import CudaQSampler  # ensures availability
+from .registry import get_sampler, register_sampler
+
 try:
     from .stim_sampler import StimSampler  # optional
 except Exception:

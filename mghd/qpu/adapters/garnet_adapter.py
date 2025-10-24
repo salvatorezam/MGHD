@@ -1,15 +1,25 @@
 from __future__ import annotations
-import os, numpy as np
-from typing import Dict, Any, List
-# Lazy CUDA-Q backend hooks; imported only when sampling is invoked
-from mghd.samplers.cudaq_backend.garnet_noise import FOUNDATION_DEFAULTS  # single source of truth for noise
+
+import os
+from typing import Any
+
+import numpy as np
+
 from mghd.samplers.cudaq_backend.backend_api import cudaq_sample_surface_wrapper
-from mghd.samplers.cudaq_backend.circuits import make_surface_layout_general, build_H_rotated_general
+from mghd.samplers.cudaq_backend.circuits import (
+    build_H_rotated_general,
+    make_surface_layout_general,
+)
+
+# Lazy CUDA-Q backend hooks; imported only when sampling is invoked
+from mghd.samplers.cudaq_backend.garnet_noise import (
+    FOUNDATION_DEFAULTS,  # single source of truth for noise
+)
 
 _USE_SYNTH = os.getenv("MGHD_SYNTHETIC","0") == "1"
 _MODE = os.getenv("MGHD_MODE","foundation")  # {"foundation","student"}
 
-def sample_round(d: int, p: float, seed: int) -> Dict[str, Any]:
+def sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
     """
     Returns dict with keys:
       Hx, Hz: (uint8) parity-check matrices
@@ -28,10 +38,6 @@ def sample_round(d: int, p: float, seed: int) -> Dict[str, Any]:
     layout = make_surface_layout_general(d)
     Hx, Hz = build_H_rotated_general(d)
     
-    # Sample using CUDA-Q backend - convert logical p to noise scaling
-    # For now, use a simple scaling factor to approximate logical error rate
-    noise_scale = min(10.0, max(0.1, p * 100.0))  # Heuristic scaling
-    
     try:
         # Sample syndrome data 
         result = cudaq_sample_surface_wrapper(
@@ -48,8 +54,6 @@ def sample_round(d: int, p: float, seed: int) -> Dict[str, Any]:
         # Format: [X_syndrome, 2*Z_syndrome, X_error + 2*Z_error]
         n_x_checks = len(layout['ancilla_x'])
         n_z_checks = len(layout['ancilla_z'])
-        n_data = len(layout['data'])
-        
         synX = result[0, :n_x_checks].astype(np.uint8)
         synZ = result[0, n_x_checks:n_x_checks + n_z_checks].astype(np.uint8)
         
@@ -86,7 +90,7 @@ def sample_round(d: int, p: float, seed: int) -> Dict[str, Any]:
         print("Falling back to synthetic sampling")
         return _synthetic_sample_round(d, p, seed)
 
-def _synthetic_sample_round(d: int, p: float, seed: int) -> Dict[str, Any]:
+def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
     """
     Synthetic fallback when CUDA-Q unavailable or MGHD_SYNTHETIC=1.
     Higher effective error rate than real code for differentiation.
@@ -152,7 +156,7 @@ def _generate_check_coords(d: int) -> np.ndarray:
 def split_components_for_side(
     *, side: str, Hx: np.ndarray, Hz: np.ndarray, synZ: np.ndarray, synX: np.ndarray,
     coords_q: np.ndarray, coords_c: np.ndarray
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Build connected components + 1-hop halo for the chosen side ('Z' or 'X').
     Output list entries contain fields the crop packer expects:
@@ -160,8 +164,9 @@ def split_components_for_side(
     Uses your existing `mghd_clustered/cluster_core.py` clustering.
     """
     try:
-        from . import cluster_core as cc
         import scipy.sparse as sp
+
+        from . import cluster_core as cc
         
         # Select appropriate matrices and syndromes based on side
         if side == 'Z':
@@ -238,7 +243,7 @@ def split_components_for_side(
 def _fallback_split_components(
     *, side: str, Hx: np.ndarray, Hz: np.ndarray, synZ: np.ndarray, synX: np.ndarray,
     coords_q: np.ndarray, coords_c: np.ndarray
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Fallback component splitting when cluster_core not available"""
     
     # Select appropriate matrices and syndromes

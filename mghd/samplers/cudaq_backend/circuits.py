@@ -12,12 +12,13 @@ Implements circuit construction for:
 All circuits are constructed as CUDA-Q kernels with proper noise application.
 """
 
-from typing import Dict, List, Tuple, Any, Optional
-import numpy as np
 from collections import defaultdict
+from typing import Any
+
+import numpy as np
 
 try:
-    import cudaq
+    import cudaq  # noqa: F401
     CUDAQ_AVAILABLE = True
 except ImportError:
     CUDAQ_AVAILABLE = False
@@ -27,7 +28,7 @@ except ImportError:
 class CudaQKernel:
     """CUDA-Q kernel wrapper for circuit construction."""
     
-    def __init__(self, name: str, operations: List[Dict[str, Any]]):
+    def __init__(self, name: str, operations: list[dict[str, Any]]):
         self.name = name
         self.operations = operations
         self.layers = []
@@ -36,7 +37,7 @@ class CudaQKernel:
             # Real CUDA-Q kernel construction would go here
             self._cudaq_kernel = None  # Placeholder for actual kernel
         
-    def add_layer(self, layer_ops: List[Dict[str, Any]], layer_type: str):
+    def add_layer(self, layer_ops: list[dict[str, Any]], layer_type: str):
         """Add a parallel layer of operations."""
         self.layers.append({
             'type': layer_type,
@@ -44,7 +45,7 @@ class CudaQKernel:
             'duration_ns': layer_ops[0].get('duration_ns', 20.0) if layer_ops else 0.0
         })
     
-    def get_layer_schedule(self) -> List[Dict[str, Any]]:
+    def get_layer_schedule(self) -> list[dict[str, Any]]:
         """Return the layered schedule for idle time calculation."""
         return self.layers
     
@@ -58,7 +59,7 @@ class CudaQKernel:
         return None
 
 
-def build_H_rotated_general(d: int) -> Tuple[np.ndarray, np.ndarray]:
+def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Build rotated planar surface code parity-check matrices for arbitrary distance d.
 
@@ -113,7 +114,7 @@ def build_H_rotated_general(d: int) -> Tuple[np.ndarray, np.ndarray]:
         return Hz, Hx
 
 
-def build_H_rotated_d3() -> Tuple[np.ndarray, np.ndarray]:
+def build_H_rotated_d3() -> tuple[np.ndarray, np.ndarray]:
     """
     Build rotated planar surface code (d=3) parity-check matrices.
     Backward compatibility wrapper for the general function.
@@ -134,7 +135,7 @@ def _canonicalize_sector_rows(H: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     perm = np.array([i for i, _ in sorted(enumerate(keys), key=lambda x: x[1])])
     return H8[perm], perm
 
-def build_H_rotated_d3_from_cfg(cfg) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def build_H_rotated_d3_from_cfg(cfg) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """
     Returns (Hx, Hz, meta) consistent with the CUDA-Q rotated layout used for sampling.
     Hx is (#X-stabilizers, #data-qubits), Hz is (#Z-stabilizers, #data-qubits).
@@ -176,7 +177,7 @@ def build_H_rotated_d3_from_cfg(cfg) -> Tuple[np.ndarray, np.ndarray, Dict[str, 
     return Hx, Hz, meta
 
 
-def logical_reps_rotated_d3() -> Dict[str, np.ndarray]:
+def logical_reps_rotated_d3() -> dict[str, np.ndarray]:
     """
     Return logical operator representatives for rotated d=3 surface code.
     
@@ -197,7 +198,8 @@ def logical_reps_rotated_d3() -> Dict[str, np.ndarray]:
             pr = None
             for rr in range(r, m):
                 if A[rr, c] & 1:
-                    pr = rr; break
+                    pr = rr
+                    break
             if pr is None:
                 continue
             if pr != r:
@@ -219,15 +221,17 @@ def logical_reps_rotated_d3() -> Dict[str, np.ndarray]:
         free = [j for j in range(n) if j not in pivset]
         basis = []
         for f in free:
-            v = np.zeros(n, dtype=np.uint8); v[f] = 1
+            v = np.zeros(n, dtype=np.uint8)
+            v[f] = 1
             for i, pc in enumerate(pivots):
                 row = R[i, :n]
                 v[pc] = (row[f] & 1)
-        basis.append(v)
+            basis.append(v)
         return basis
 
     def _pick_min_weight(vecs):
-        if not vecs: return np.zeros(0, dtype=np.uint8)
+        if not vecs:
+            return np.zeros(0, dtype=np.uint8)
         weights = [int(v.sum()) for v in vecs]
         minw = min(weights)
         cand = [v for v, w in zip(vecs, weights) if w == minw]
@@ -317,7 +321,7 @@ def build_stim_circuit_rotated_d3_from_cfg(cudaq_cfg) -> Any:
     return circuit
 
 
-def build_stim_dem_rotated_d3(cudaq_cfg) -> Tuple[Any, List[int]]:
+def build_stim_dem_rotated_d3(cudaq_cfg) -> tuple[Any, list[int]]:
     """
     Build Stim DetectorErrorModel for rotated d=3 surface code matching CUDA-Q circuit.
     
@@ -353,7 +357,7 @@ def build_stim_dem_rotated_d3(cudaq_cfg) -> Tuple[Any, List[int]]:
     return dem, map_bit_to_obs
 
 
-def rotated_d3_cz_colors() -> Dict[str, List[List[Tuple[int, int]]]]:
+def rotated_d3_cz_colors() -> dict[str, list[list[tuple[int, int]]]]:
     """
     Provide a 2-color CZ schedule per basis for rotated d=3 (logical indices).
 
@@ -382,7 +386,7 @@ def rotated_d3_cz_colors() -> Dict[str, List[List[Tuple[int, int]]]]:
     return colors
 
 
-def place_rotated_d3_on_garnet(calib: Dict[str, Any], avoid_edges: set = {(10, 11)}):
+def place_rotated_d3_on_garnet(calib: dict[str, Any], avoid_edges: set = {(10, 11)}):
     """
     Place rotated d=3 (9 data + 8 ancilla) onto Garnet device avoiding bad couplers.
 
@@ -443,7 +447,7 @@ def place_rotated_d3_on_garnet(calib: Dict[str, Any], avoid_edges: set = {(10, 1
 
     return data_map, anc_map, cz_layers_phys
 
-def make_surface_layout_d3_include_edge(edge: Tuple[int, int] = (10, 11)) -> Dict[str, Any]:
+def make_surface_layout_d3_include_edge(edge: tuple[int, int] = (10, 11)) -> dict[str, Any]:
     """
     Create a d=3 surface code layout that INCLUDES the specified edge (e.g., bad (10,11) coupler).
     
@@ -485,7 +489,7 @@ def make_surface_layout_d3_include_edge(edge: Tuple[int, int] = (10, 11)) -> Dic
 
 
 
-def make_surface_layout_general(d: int) -> Dict[str, Any]:
+def make_surface_layout_general(d: int) -> dict[str, Any]:
     """
     Create a general surface code layout for arbitrary distance d.
     
@@ -549,7 +553,7 @@ def make_surface_layout_general(d: int) -> Dict[str, Any]:
     }
 
 
-def make_surface_layout_d3_avoid_bad_edges() -> Dict[str, Any]:
+def make_surface_layout_d3_avoid_bad_edges() -> dict[str, Any]:
     """
     Create a d=3 surface code layout that avoids the bad (10,11) coupler.
     
@@ -601,7 +605,7 @@ def make_surface_layout_d3_avoid_bad_edges() -> Dict[str, Any]:
     }
 
 
-def build_round_repetition(layout: Dict[str, Any], round_idx: int) -> CudaQKernel:
+def build_round_repetition(layout: dict[str, Any], round_idx: int) -> CudaQKernel:
     """
     Build a repetition code syndrome extraction round.
     
@@ -616,7 +620,6 @@ def build_round_repetition(layout: Dict[str, Any], round_idx: int) -> CudaQKerne
     kernel = CudaQKernel(f"rep_round_{round_idx}", operations)
     
     # For repetition code: CZ between adjacent data qubits and ancilla
-    n_data = len(layout.get('data', []))
     ancillas = layout.get('ancilla', [])
     
     if not ancillas or not layout.get('data'):
@@ -649,7 +652,7 @@ def build_round_repetition(layout: Dict[str, Any], round_idx: int) -> CudaQKerne
     return kernel
 
 
-def build_round_surface(layout: Dict[str, Any], round_idx: int) -> CudaQKernel:
+def build_round_surface(layout: dict[str, Any], round_idx: int) -> CudaQKernel:
     """
     Build a surface code syndrome extraction round.
     
@@ -745,7 +748,7 @@ def build_round_surface(layout: Dict[str, Any], round_idx: int) -> CudaQKernel:
     return kernel
 
 
-def build_round_bb(hx: np.ndarray, hz: np.ndarray, mapping: Dict[int, int], round_idx: int) -> CudaQKernel:
+def build_round_bb(hx: np.ndarray, hz: np.ndarray, mapping: dict[int, int], round_idx: int) -> CudaQKernel:
     """
     Build a BB/qLDPC code syndrome extraction round.
     
@@ -769,10 +772,8 @@ def build_round_bb(hx: np.ndarray, hz: np.ndarray, mapping: Dict[int, int], roun
     
     if is_x_round:
         check_matrix = hx
-        check_type = 'X'
     else:
-        check_matrix = hz  
-        check_type = 'Z'
+        check_matrix = hz
     
     num_checks, num_qubits = check_matrix.shape
     
@@ -854,7 +855,7 @@ def build_round_bb(hx: np.ndarray, hz: np.ndarray, mapping: Dict[int, int], roun
     return kernel
 
 
-def analyze_idle_qubits(kernel: CudaQKernel, total_qubits: int) -> Dict[int, List[Tuple[int, float]]]:
+def analyze_idle_qubits(kernel: CudaQKernel, total_qubits: int) -> dict[int, list[tuple[int, float]]]:
     """
     Analyze which qubits are idle during each layer and for how long.
     
@@ -892,8 +893,8 @@ def analyze_idle_qubits(kernel: CudaQKernel, total_qubits: int) -> Dict[int, Lis
     return idle_analysis
 
 
-def optimize_layout_for_device(code_distance: int, device_couplers: List[Tuple[int, int]], 
-                              coupler_fidelities: Dict[Tuple[int, int], float]) -> Dict[str, Any]:
+def optimize_layout_for_device(code_distance: int, device_couplers: list[tuple[int, int]], 
+                              coupler_fidelities: dict[tuple[int, int], float]) -> dict[str, Any]:
     """
     Optimize qubit layout for a given code distance and device topology.
     
@@ -915,4 +916,3 @@ def optimize_layout_for_device(code_distance: int, device_couplers: List[Tuple[i
     else:
         # Fallback for other distances
         raise NotImplementedError(f"Layout optimization for d={code_distance} not implemented")
-

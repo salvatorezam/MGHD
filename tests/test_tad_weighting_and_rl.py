@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import types
-import numpy as np
-
 from mghd.codes.qpu_profile import GateError, QPUProfile
-from mghd.tad.weighting import schedule_to_weight_maps, feature_vector
 from mghd.tad.context import context_vector
 from mghd.tad.rl.lin_ts import LinTSBandit
+from mghd.tad.weighting import feature_vector, schedule_to_weight_maps
 
 
 def test_weight_maps_and_bandit_update():

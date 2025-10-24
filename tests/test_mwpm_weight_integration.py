@@ -3,9 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-pm = pytest.importorskip("pymatching", reason="PyMatching not installed")
-
 from mghd.decoders.mwpm_fallback import MWPMFallback, _coerce_weights_to_float
+
+pm = pytest.importorskip("pymatching", reason="PyMatching not installed")
 
 
 class _DummyCode:

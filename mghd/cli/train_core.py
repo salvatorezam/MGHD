@@ -21,23 +21,19 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 import time
 import warnings
 from dataclasses import asdict
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT / "src"
-if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from mghd.utils.graphlike import is_graphlike
-
-from mghd.samplers.registry import get_sampler
 from mghd.decoders.mix import MixConfig, TeacherMix
+from mghd.samplers.registry import get_sampler
+from mghd.utils.graphlike import is_graphlike
+from mghd.utils.metrics import LEResult, logical_error_rate, summary_line
 
 try:
     from .code_loader import load_code  # optional; may not exist after reorg
@@ -50,7 +46,6 @@ def parse_distances(spec: str) -> list[int]:
     """
     Accept forms like '5', '3,5,7', '3-31:2'. Returns list of ints.
     """
-    import re
     spec = spec.strip()
     if re.fullmatch(r"\d+", spec):
         return [int(spec)]
@@ -59,11 +54,8 @@ def parse_distances(spec: str) -> list[int]:
     m = re.fullmatch(r"(\d+)-(\d+):(\d+)", spec)
     if m:
         lo, hi, step = map(int, m.groups())
-        return list(range(lo, hi+1, step))
+        return list(range(lo, hi + 1, step))
     raise ValueError(f"Bad distance spec: {spec}")
-
-
-from mghd.utils.metrics import LEResult, logical_error_rate, summary_line
 
 
 def _resolve_syndromes(code_obj, dets):
@@ -104,7 +96,7 @@ def _infer_data_qubits(code_obj: Any) -> int:
     return 0
 
 
-def _maybe_get_native_circuit(code_obj: Any) -> Optional[Any]:
+def _maybe_get_native_circuit(code_obj: Any) -> Any | None:
     for attr in ("native_circuit", "reference_circuit", "circuit", "qc", "quantum_circuit"):
         if hasattr(code_obj, attr):
             circuit = getattr(code_obj, attr)
@@ -153,7 +145,7 @@ def _build_schedule_ir(context_source: str, code_obj: Any) -> Any:
     return []
 
 
-def _base_overrides_from_maps(weight_maps: Dict[str, Any], n_qubits: int) -> Dict[str, Any]:
+def _base_overrides_from_maps(weight_maps: dict[str, Any], n_qubits: int) -> dict[str, Any]:
     llr = np.zeros(int(n_qubits), dtype=np.float32)
     w_qubit = weight_maps.get("w_qubit", {}) or {}
     for layer in w_qubit.values():
@@ -183,10 +175,10 @@ def _base_overrides_from_maps(weight_maps: Dict[str, Any], n_qubits: int) -> Dic
     return override
 
 
-def _materialize_overrides(base: Dict[str, Any], scale: float) -> Dict[str, Any]:
+def _materialize_overrides(base: dict[str, Any], scale: float) -> dict[str, Any]:
     if not base:
         return {}
-    overrides: Dict[str, Any] = {}
+    overrides: dict[str, Any] = {}
     if base.get("llr") is not None:
         overrides["llr_per_qubit"] = np.asarray(base["llr"], dtype=np.float32) * float(scale)
     if base.get("mwpm") is not None:
@@ -200,7 +192,7 @@ def _materialize_overrides(base: Dict[str, Any], scale: float) -> Dict[str, Any]
     return overrides
 
 
-def _load_bandit_state(path: pathlib.Path) -> Optional[Dict[str, Any]]:
+def _load_bandit_state(path: pathlib.Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
@@ -209,7 +201,7 @@ def _load_bandit_state(path: pathlib.Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _dump_bandit_state(path: pathlib.Path, state: Dict[str, Any]) -> None:
+def _dump_bandit_state(path: pathlib.Path, state: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state))
@@ -312,7 +304,8 @@ def main() -> None:
             pymatching_ok = args.dem_enable or graph_ok
             if sampler_name == "cudaq" and not pymatching_ok:
                 warnings.warn(
-                    f"PyMatching disabled (sampler=cudaq, graphlike={graph_ok}, dem={args.dem_enable})",
+                    "PyMatching disabled (sampler=cudaq, "
+                    f"graphlike={graph_ok}, dem={args.dem_enable})",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -335,11 +328,11 @@ def main() -> None:
                 ),
                 mwpm_graphlike_only=mwpm_guard,
             )
-            context_payload: Optional[Dict[str, Any]] = None
-            base_overrides: Dict[str, Any] = {}
+            context_payload: dict[str, Any] | None = None
+            base_overrides: dict[str, Any] = {}
             ctx_vec = None
             profile = None
-            profile_dict: Dict[str, Any] = {}
+            profile_dict: dict[str, Any] = {}
             if args.qpu_profile and args.context_source != "none":
                 try:
                     from mghd.codes.qpu_profile import load_qpu_profile
@@ -355,8 +348,8 @@ def main() -> None:
                 if profile is not None:
                     schedule_ir = _build_schedule_ir(args.context_source, code)
                     try:
-                        from mghd.tad import weighting as tad_weighting
                         from mghd.tad import context as tad_context
+                        from mghd.tad import weighting as tad_weighting
                     except Exception as exc:
                         warnings.warn(
                             f"TAD weighting/context unavailable: {exc}",
@@ -375,7 +368,8 @@ def main() -> None:
                         )
                         base_overrides = _base_overrides_from_maps(weight_maps, n_qubits)
                         features = tad_weighting.feature_vector(schedule_ir)
-                        gate_vocab = {gate: idx for idx, gate in enumerate(sorted(features.get("gate_hist", {}).keys()))}
+                        sorted_gates = sorted(features.get("gate_hist", {}).keys())
+                        gate_vocab = {gate: idx for idx, gate in enumerate(sorted_gates)}
                         ctx_vec = tad_context.context_vector(features, gate_vocab)
                         context_payload = {
                             "features": features,
@@ -389,7 +383,8 @@ def main() -> None:
                 target_family = args.dem_family or family
                 if target_family not in {"surface"}:
                     warnings.warn(
-                        f"DEM build currently supported for {{'surface'}}; skipping for family='{target_family}'.",
+                        "DEM build currently supported for {'surface'}; "
+                        f"skipping family='{target_family}'.",
                         RuntimeWarning,
                         stacklevel=2,
                     )
@@ -403,7 +398,7 @@ def main() -> None:
                             stacklevel=2,
                         )
                     else:
-                        from mghd.decoders.dem_utils import dem_cache_path, build_surface_memory_dem
+                        from mghd.decoders.dem_utils import build_surface_memory_dem, dem_cache_path
                         try:
                             from mghd.decoders.dem_matching import DEMMatchingTeacher
                         except Exception as exc:
@@ -447,7 +442,7 @@ def main() -> None:
                                     stacklevel=2,
                                 )
 
-            sampler_kwargs: Dict[str, Any] = {}
+            sampler_kwargs: dict[str, Any] = {}
             if sampler_name == "stim":
                 dep_value = None
                 if profile_dict:
@@ -501,22 +496,25 @@ def main() -> None:
             if ctx_vec is None:
                 ctx_vec = np.ones(1, dtype=np.float32)
 
-            for batch_idx in range(args.batches):
+            for _ in range(args.batches):
                 batch = sampler.sample(
                     code,
                     n_shots=args.shots_per_batch,
                     seed=int(rng.integers(1 << 32) - 1),
                 )
 
-                if args.dem_enable and not missing_obs_warned:
-                    if batch.obs is None or batch.obs.size == 0:
-                        warnings.warn(
-                            "Sampler did not return logical observables; LER will be NA. "
-                            "Use --sampler stim for DEM validation or extend the sampler to emit obs.",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                        missing_obs_warned = True
+                if (
+                    args.dem_enable
+                    and not missing_obs_warned
+                    and (batch.obs is None or batch.obs.size == 0)
+                ):
+                    warnings.warn(
+                        "Sampler did not return logical observables; LER will be NA. "
+                        "Use --sampler stim for DEM validation or extend the sampler to emit obs.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    missing_obs_warned = True
 
                 if (
                     dem_teacher is not None
@@ -524,8 +522,9 @@ def main() -> None:
                     and batch.dets.shape[1] != dem_teacher.num_detectors
                 ):
                     warnings.warn(
-                        "DEM teacher detector count mismatch. Ensure the sampler mirrors the Stim generator "
-                        "(--sampler stim) or align detectors (e.g., --dem-align).",
+                        "DEM teacher detector count mismatch. Ensure the sampler mirrors "
+                        "the Stim generator (--sampler stim) or align detectors "
+                        "(e.g., --dem-align).",
                         RuntimeWarning,
                         stacklevel=2,
                     )
@@ -590,15 +589,24 @@ def main() -> None:
                         dem_arr = dem_arr[np.newaxis, :]
                     dem_pred_chunks.append(dem_arr)
 
-                if bandit is not None and bandit_ctx is not None and true_arr is not None and pred_arr is not None:
-                    if true_arr.shape == pred_arr.shape:
-                        reward = 1.0 if np.all(true_arr == pred_arr) else 0.0
-                        bandit.update(bandit_ctx, reward)
+                if (
+                    bandit is not None
+                    and bandit_ctx is not None
+                    and true_arr is not None
+                    and pred_arr is not None
+                    and true_arr.shape == pred_arr.shape
+                ):
+                    reward = 1.0 if np.all(true_arr == pred_arr) else 0.0
+                    bandit.update(bandit_ctx, reward)
 
             dt = time.time() - t0
             true_accum = np.concatenate(true_chunks, axis=0) if true_chunks else None
             pred_accum = np.concatenate(pred_chunks, axis=0) if pred_chunks else None
-            if true_accum is not None and pred_accum is not None and true_accum.shape == pred_accum.shape:
+            if (
+                true_accum is not None
+                and pred_accum is not None
+                and true_accum.shape == pred_accum.shape
+            ):
                 ler = logical_error_rate(true_accum, pred_accum)
             else:
                 samples = int(true_accum.shape[0]) if true_accum is not None else 0

@@ -6,20 +6,17 @@ training pipeline. It exposes wrapped versions of sample functions that preserve
 exact output shapes and formats expected by the GNN model.
 """
 
-from typing import Dict, Any, Optional
+from typing import Any
+
 import numpy as np
 
-from .syndrome_gen import (
-    sample_surface_cudaq,
-    sample_bb_cudaq, 
-    sample_repetition_cudaq
-)
 from .circuits import make_surface_layout_d3_avoid_bad_edges
+from .syndrome_gen import sample_bb_cudaq, sample_repetition_cudaq, sample_surface_cudaq
 
 
 def cudaq_sample_surface_wrapper(mode: str, batch_size: int, T: int = 3, d: int = 3,
-                                layout: Optional[Dict[str, Any]] = None,
-                                rng: Optional[np.random.Generator] = None, 
+                                layout: dict[str, Any] | None = None,
+                                rng: np.random.Generator | None = None, 
                                 bitpack: bool = False,
                                 surface_layout: str = "planar") -> np.ndarray:
     """
@@ -86,8 +83,8 @@ def cudaq_sample_surface_wrapper(mode: str, batch_size: int, T: int = 3, d: int 
 
 
 def cudaq_sample_bb_wrapper(mode: str, batch_size: int, hx: np.ndarray, hz: np.ndarray,
-                           T: int = 3, mapping: Optional[Dict[int, int]] = None,
-                           rng: Optional[np.random.Generator] = None,
+                           T: int = 3, mapping: dict[int, int] | None = None,
+                           rng: np.random.Generator | None = None,
                            bitpack: bool = False) -> np.ndarray:
     """
     Wrapper for BB/qLDPC code sampling that matches the existing bb_panq_functions interface.
@@ -151,8 +148,8 @@ def cudaq_sample_bb_wrapper(mode: str, batch_size: int, hx: np.ndarray, hz: np.n
 
 
 def cudaq_sample_repetition_wrapper(mode: str, batch_size: int, n_data: int = 5,
-                                   T: int = 3, layout: Optional[Dict[str, Any]] = None,
-                                   rng: Optional[np.random.Generator] = None,
+                                   T: int = 3, layout: dict[str, Any] | None = None,
+                                   rng: np.random.Generator | None = None,
                                    bitpack: bool = False) -> np.ndarray:
     """
     Wrapper for repetition code sampling that matches the existing interface.
@@ -211,7 +208,7 @@ def cudaq_sample_repetition_wrapper(mode: str, batch_size: int, n_data: int = 5,
     return result.astype(np.uint8)
 
 
-def get_backend_info() -> Dict[str, Any]:
+def get_backend_info() -> dict[str, Any]:
     """
     Get information about the CUDA-Q backend configuration.
     
@@ -281,9 +278,25 @@ def validate_backend_installation() -> bool:
 
 
 # Backward compatibility aliases
-sample_surface_foundation = lambda *args, **kwargs: cudaq_sample_surface_wrapper("foundation", *args, **kwargs)
-sample_surface_student = lambda *args, **kwargs: cudaq_sample_surface_wrapper("student", *args, **kwargs)
-sample_bb_foundation = lambda *args, **kwargs: cudaq_sample_bb_wrapper("foundation", *args, **kwargs)
-sample_bb_student = lambda *args, **kwargs: cudaq_sample_bb_wrapper("student", *args, **kwargs)
-sample_repetition_foundation = lambda *args, **kwargs: cudaq_sample_repetition_wrapper("foundation", *args, **kwargs)
-sample_repetition_student = lambda *args, **kwargs: cudaq_sample_repetition_wrapper("student", *args, **kwargs)
+def sample_surface_foundation(*args, **kwargs):
+    return cudaq_sample_surface_wrapper("foundation", *args, **kwargs)
+
+
+def sample_surface_student(*args, **kwargs):
+    return cudaq_sample_surface_wrapper("student", *args, **kwargs)
+
+
+def sample_bb_foundation(*args, **kwargs):
+    return cudaq_sample_bb_wrapper("foundation", *args, **kwargs)
+
+
+def sample_bb_student(*args, **kwargs):
+    return cudaq_sample_bb_wrapper("student", *args, **kwargs)
+
+
+def sample_repetition_foundation(*args, **kwargs):
+    return cudaq_sample_repetition_wrapper("foundation", *args, **kwargs)
+
+
+def sample_repetition_student(*args, **kwargs):
+    return cudaq_sample_repetition_wrapper("student", *args, **kwargs)

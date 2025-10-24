@@ -1,11 +1,11 @@
 import numpy as np
 import pytest
 
-stim = pytest.importorskip("stim")
-pytest.importorskip("pymatching")
-
-from mghd.samplers.stim_sampler import sample_surface_memory
 from mghd.decoders.dem_utils import build_surface_memory_dem
+from mghd.samplers.stim_sampler import sample_surface_memory
+
+pytest.importorskip("stim")
+pytest.importorskip("pymatching")
 
 
 def test_stim_sampler_matches_dem():

@@ -1,8 +1,10 @@
 # NOTE: No CUDA/CUDA-Q initialization at import.
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Tuple, Dict, Any, Optional, Sequence
+
 import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 
@@ -12,7 +14,7 @@ import torch
 class CropMeta:
     k: int                   # |C| data qubits in crop
     r: int                   # nullity (kernel dimension)
-    bbox_xywh: Tuple[int,int,int,int]   # (x0,y0,w,h) in lattice coords
+    bbox_xywh: tuple[int,int,int,int]   # (x0,y0,w,h) in lattice coords
     side: str                # 'Z' or 'X'
     d: int
     p: float
@@ -57,7 +59,7 @@ def _degree_from_Hsub(H_sub: np.ndarray) -> np.ndarray:
     deg_check = H_sub.sum(axis=1).astype(np.int32)
     return deg_data, deg_check
 
-def _normalize_xy(xy: np.ndarray, bbox_xywh: Tuple[int,int,int,int]) -> np.ndarray:
+def _normalize_xy(xy: np.ndarray, bbox_xywh: tuple[int,int,int,int]) -> np.ndarray:
     x0, y0, w, h = bbox_xywh
     # map to [0,1] via Δx/w, Δy/h; avoid division by zero
     w = max(w, 1)
@@ -78,7 +80,8 @@ def _hilbert_index_2d(qxy: np.ndarray, levels: int = 64) -> np.ndarray:
     n = qxy.shape[0]
     idx = np.zeros(n, dtype=np.int64)
     for i in range(n):
-        x = int(qxy[i, 0]); y = int(qxy[i, 1])
+        x = int(qxy[i, 0])
+        y = int(qxy[i, 1])
         idx[i] = _hilbert_xy_to_d(levels, x, y)
     return idx
 
@@ -107,7 +110,7 @@ def _rot(n, x, y, rx, ry):
         x, y = y, x
     return x, y
 
-def hilbert_order_within_bbox(check_xy: np.ndarray, bbox_xywh: Tuple[int,int,int,int]) -> np.ndarray:
+def hilbert_order_within_bbox(check_xy: np.ndarray, bbox_xywh: tuple[int,int,int,int]) -> np.ndarray:
     xy01 = _normalize_xy(check_xy, bbox_xywh)
     qxy = _quantize_xy01(xy01, levels=64)
     h = _hilbert_index_2d(qxy, levels=64)
@@ -115,7 +118,7 @@ def hilbert_order_within_bbox(check_xy: np.ndarray, bbox_xywh: Tuple[int,int,int
 
 # ---- Public packer ----------------------------------------------------------
 
-def infer_bucket_id(n_nodes: int, n_edges: int, n_seq: int, bucket_spec: Sequence[Tuple[int, int, int]]) -> int:
+def infer_bucket_id(n_nodes: int, n_edges: int, n_seq: int, bucket_spec: Sequence[tuple[int, int, int]]) -> int:
     for idx, (node_cap, edge_cap, seq_cap) in enumerate(bucket_spec):
         if n_nodes <= node_cap and n_edges <= edge_cap and n_seq <= seq_cap:
             return idx
@@ -132,17 +135,17 @@ def pack_cluster(
     *,
     k: int,
     r: int,
-    bbox_xywh: Tuple[int,int,int,int],
-    kappa_stats: Dict[str, float],
+    bbox_xywh: tuple[int,int,int,int],
+    kappa_stats: dict[str, float],
     y_bits_local: np.ndarray,
     side: str,
     d: int,
     p: float,
     seed: int,
-    N_max: Optional[int],
-    E_max: Optional[int],
-    S_max: Optional[int],
-    bucket_spec: Optional[Sequence[Tuple[int, int, int]]] = None,
+    N_max: int | None,
+    E_max: int | None,
+    S_max: int | None,
+    bucket_spec: Sequence[tuple[int, int, int]] | None = None,
     add_jump_edges: bool = True,
     jump_k: int = 2,
 ) -> PackedCrop:
@@ -236,7 +239,7 @@ def pack_cluster(
         if N_max is None or E_max is None or S_max is None:
             raise ValueError("N_max, E_max, S_max must be provided when bucket_spec is None")
 
-    assert N <= N_max and E_tot <= E_max and S <= S_max, "Increase pad limits."
+    assert N_max >= N and E_tot <= E_max and S_max >= S, "Increase pad limits."
 
     x_nodes = torch.zeros((N_max, base_nodes.shape[1]), dtype=torch.float32)
     node_mask = torch.zeros((N_max,), dtype=torch.bool)

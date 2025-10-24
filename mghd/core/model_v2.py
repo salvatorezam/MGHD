@@ -1,15 +1,16 @@
 # NOTE: No CUDA/CUDA-Q initialization at import.
 from __future__ import annotations
+
+from collections.abc import Sequence
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Sequence, Dict, List
-from types import SimpleNamespace
 
 ## ---- REQUIRED building blocks from your stack (fail-fast if missing) ----
 try:
-    from .blocks import ChannelSE as _ChannelSE  # Channel squeeze-excitation
     from .blocks import AstraGNN as _AstraGNN  # Astra message passing
+    from .blocks import ChannelSE as _ChannelSE  # Channel squeeze-excitation
 except ImportError:
     # blocks.py requires panq_functions; provide stub fallbacks
     _ChannelSE = None
@@ -47,7 +48,9 @@ class AstraMambaWrapper(nn.Module):
             lambda: _AstraMamba(),
         ):
             try:
-                self.core = ctor(); ok = True; break
+                self.core = ctor()
+                ok = True
+                break
             except TypeError:
                 continue
         if not ok:
@@ -248,12 +251,12 @@ class MGHDv2(nn.Module):
     def scatter_outputs(
         self,
         logits: torch.Tensor,
-        cluster_infos: Sequence[Dict[str, torch.Tensor]],
+        cluster_infos: Sequence[dict[str, torch.Tensor]],
         *,
         temp: float = 1.0,
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         probs_all = torch.sigmoid((logits[:, 1] - logits[:, 0]) / float(temp)).clamp(1e-6, 1 - 1e-6)
-        out: List[torch.Tensor] = []
+        out: list[torch.Tensor] = []
         for info in cluster_infos:
             data_idx = info["data_idx"].to(probs_all.device)
             out.append(probs_all.index_select(0, data_idx))

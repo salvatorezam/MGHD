@@ -3,11 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from mghd.cli.train_core import _base_overrides_from_maps, _materialize_overrides
 from mghd.codes.qpu_profile import GateError, QPUProfile
-from mghd.tad.weighting import feature_vector, schedule_to_weight_maps
 from mghd.tad.context import context_vector
 from mghd.tad.rl.lin_ts import LinTSBandit
-from mghd.cli.train_core import _base_overrides_from_maps, _materialize_overrides
+from mghd.tad.weighting import feature_vector, schedule_to_weight_maps
 
 
 def _toy_schedule_ir() -> list[tuple[int, str, tuple[int, ...], None]]:
