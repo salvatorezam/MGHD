@@ -320,6 +320,8 @@ scratchpad/initial-test/models
 scratchpad/initial-test/plots
 scratchpad/initial-test/tmp
 
+# Preflight artifacts
+mghd/artifacts/
 
 # Quick access symlinks (read-only, not for git)
 scratchpad/initial-test/home-quick

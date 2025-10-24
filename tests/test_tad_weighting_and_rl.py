@@ -3,9 +3,9 @@ from __future__ import annotations
 import types
 import numpy as np
 
-from mghd.core.qpu_profile import GateError, QPUProfile
-from tad.weighting import schedule_to_weight_maps, feature_vector
-from tad.context import context_vector
+from mghd.codes.qpu_profile import GateError, QPUProfile
+from mghd.tad.weighting import schedule_to_weight_maps, feature_vector
+from mghd.tad.context import context_vector
 from mghd.tad.rl.lin_ts import LinTSBandit
 
 

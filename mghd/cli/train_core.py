@@ -124,15 +124,24 @@ def _build_schedule_ir(context_source: str, code_obj: Any) -> Any:
         return []
     try:
         if context_source == "qiskit" and "qiskit" in sys.modules:
-            from adapters import qiskit_adapter
+            try:
+                from adapters import qiskit_adapter
+            except ImportError:
+                from mghd.qpu.adapters import qiskit_adapter
 
             return qiskit_adapter.to_schedule_ir(native)
         if context_source == "cirq" and "cirq" in sys.modules:
-            from adapters import cirq_adapter  # type: ignore
+            try:
+                from adapters import cirq_adapter  # type: ignore
+            except ImportError:
+                from mghd.qpu.adapters import cirq_adapter  # type: ignore
 
             return cirq_adapter.to_schedule_ir(native)
         if context_source == "cudaq" and "cudaq" in sys.modules:
-            from adapters import cudaq_adapter  # type: ignore
+            try:
+                from adapters import cudaq_adapter  # type: ignore
+            except ImportError:
+                from mghd.qpu.adapters import cudaq_adapter  # type: ignore
 
             return cudaq_adapter.to_schedule_ir(native)
     except Exception as exc:  # pragma: no cover - best-effort optional deps
@@ -333,7 +342,7 @@ def main() -> None:
             profile_dict: Dict[str, Any] = {}
             if args.qpu_profile and args.context_source != "none":
                 try:
-                    from mghd.core.qpu_profile import load_qpu_profile
+                    from mghd.codes.qpu_profile import load_qpu_profile
 
                     profile = load_qpu_profile(args.qpu_profile)
                 except Exception as exc:
@@ -346,8 +355,8 @@ def main() -> None:
                 if profile is not None:
                     schedule_ir = _build_schedule_ir(args.context_source, code)
                     try:
-                        from tad import weighting as tad_weighting
-                        from tad import context as tad_context
+                        from mghd.tad import weighting as tad_weighting
+                        from mghd.tad import context as tad_context
                     except Exception as exc:
                         warnings.warn(
                             f"TAD weighting/context unavailable: {exc}",

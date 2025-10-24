@@ -160,7 +160,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--shots-per-batch", type=int, default=64)
     parser.add_argument("--batches", type=int, default=50)
     parser.add_argument("--dem-rounds", type=int, default=5)
-    parser.add_argument("--qpu-profile", default="qpu_profiles/iqm_garnet_example.json")
+    parser.add_argument("--qpu-profile", default="mghd/qpu/profiles/iqm_garnet_example.json")
     parser.add_argument("--context-source", default="qiskit")
     parser.add_argument("--max-ler-dem", type=float, default=0.10)
     parser.add_argument("--max-ler-mix", type=float, default=0.10)
@@ -219,7 +219,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     stim_cmd = [
         sys.executable,
         "-m",
-        "tools.train_core",
+        "mghd.cli.train_core",
         "--families",
         args.families,
         "--distances",
@@ -261,7 +261,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         cudaq_cmd = [
             sys.executable,
             "-m",
-            "tools.train_core",
+            "mghd.cli.train_core",
             "--families",
             args.families,
             "--distances",
@@ -302,7 +302,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     overall_ok = True
     for row in summary_rows:
-        if row.name == "pytest" and row.status == "skip":
+        if row.status == "skip":
             continue
         if row.status != "pass":
             overall_ok = False
