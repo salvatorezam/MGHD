@@ -8,12 +8,63 @@ version = "0.0.0"
 description = "Mamba-GNN Hybrid Decoder"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Proprietary"}
-authors = [{name = "MGHD Team"}]
-dependencies = []
+license = { text = "Proprietary" }
+authors = [{ name = "MGHD Team" }]
+
+# Keep base deps minimal and portable; GPU/teacher stacks are extras below.
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "torch>=2.2",               # install the right CUDA build separately if needed
+  "networkx>=3.1",
+  "tqdm>=4.66",
+  "rich>=13.7",
+  "packaging>=23.2",
+  "typing_extensions>=4.9",
+  "mamba-ssm>=2.2",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-cov", "ruff", "mypy", "black"]
+# Dev & QA
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "pytest-xdist>=3",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "black>=24.8",
+]
+
+# Quantum error-correction baselines & DEM tooling (no GPU)
+qec = [
+  "pymatching>=2.3",
+  "stim>=1.13",
+  "sinter>=1.13",
+]
+
+# Hyperparameter tuning
+tuning = [
+  "optuna>=3.6",
+]
+
+# Inference engines (optional; only install if you plan to export/benchmark engines)
+engines = [
+  "onnx>=1.16",
+  "onnxruntime>=1.18",        # use onnxruntime-gpu if you want GPU EP
+  # "onnxruntime-gpu>=1.18",   # uncomment to prefer GPU EP on supported systems
+]
+
+# CUDA-Q / circuit-level simulation (install manually if you use CUDA-Q)
+# Keep empty by default to avoid resolver failures on unsupported platforms.
+cudaq = [
+  # "cuda-quantum>=0.7",
+]
+
+
+[project.scripts]
+mghd-preflight = "mghd.cli.preflight_mghd:main"
+mghd-train = "mghd.cli.train_core:main"
+mghd-bench = "mghd.cli.bench_decode:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -21,15 +72,47 @@ include = ["mghd*"]
 exclude = ["tests*", "docs*", "examples*", "scratchpad*", "tools/dev*"]
 
 [tool.setuptools.package-data]
-mghd = ["qpu/profiles/*.json", "**/*.yaml"]
+mghd = [
+  "qpu/profiles/*.json",
+  "**/*.yaml",
+  "**/*.yml",
+  "**/*.npz",
+]
 
-[project.scripts]
-mghd-preflight = "mghd.cli.preflight_mghd:main"
-mghd-train = "mghd.cli.train_core:main"
-mghd-bench = "mghd.cli.bench_decode:main"
+# ------------------------------
+# Tooling configuration
+# ------------------------------
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --disable-warnings"
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+markers = [
+  "gpu: tests requiring a CUDA-enabled environment",
+  "slow: long-running tests",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["mghd"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = [
+  "build",
+  "dist",
+  ".venv",
+  "venv",
+  "logs",
+  "scratchpad",
+  "docs",
+]
 
 [tool.ruff.lint]
 select = ["F", "E"]
@@ -50,3 +133,12 @@ ignore = [
   "F405",
   "F811",
 ]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+exclude = "(?x)(\n  ^build/|\n  ^dist/|\n  ^docs/|\n  ^scratchpad/\n)"
