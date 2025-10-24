@@ -103,12 +103,12 @@ class AstraGNNWrapper(nn.Module):
         self.core = _AstraGNN(
             n_iters=n_iters,
             n_node_inputs=hidden_dim,
-            n_node_outputs=2,           # binary head (2 logits/qubit)
+            n_node_outputs=2,
             n_edge_features=edge_feat_dim,
-            msg_net_size=max(96, hidden_dim),  # Use at least hidden_dim for message net
+            msg_net_size=max(96, hidden_dim),
         )
         self.iter_override: int | None = None
-    
+
     def forward(self, x_nodes, edge_index, edge_attr, node_mask, edge_mask):
         # Convert edge_index format to src_ids, dst_ids that GNNDecoder expects
         src_ids = edge_index[0]  # [E]
@@ -119,10 +119,8 @@ class AstraGNNWrapper(nn.Module):
             valid_edges = edge_mask
             src_ids = src_ids[valid_edges]
             dst_ids = dst_ids[valid_edges]
-        
-        # Call the core GNNDecoder with expected interface
-        # GNNDecoder returns [n_iters, N, C], we want the final iteration
-        output = self.core(x_nodes, src_ids, dst_ids)  # [n_iters, N, C]
+
+        output = self.core(x_nodes, src_ids, dst_ids)
         idx = output.shape[0] - 1
         if self.iter_override is not None:
             idx = max(0, min(self.iter_override - 1, output.shape[0] - 1))
@@ -149,7 +147,7 @@ class MGHDv2(nn.Module):
         # 2) Channel-SE (your implementation)
         if _ChannelSE is None:
             raise ImportError("ChannelSE requires panq_functions module which is not available")
-        self.se          = _ChannelSE(channels=d_model)
+        self.se = _ChannelSE(channels=d_model)
         # 3) Astra GNN (your implementation)
         self.gnn         = AstraGNNWrapper(hidden_dim=d_model, edge_feat_dim=edge_feat_dim, n_iters=n_iters)
         # IO with adaptive projections

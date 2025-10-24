@@ -16,9 +16,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from mghd_clustered import cluster_core as cc  # uses projector functions
-from mghd_public.features_v2 import PackedCrop
-from mghd_public.model_v2 import MGHDv2
+from mghd.decoders.lsd import cluster_core as cc  # uses projector functions
+from mghd.core.features_v2 import PackedCrop
+from mghd.core.model_v2 import MGHDv2
 from torch.utils.data import Dataset, Sampler
 
 
@@ -364,7 +364,7 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
         print(f"Training completed, result: {result_path}")
         
         # Return the trained model for inspection
-        from mghd_public.model_v2 import MGHDv2
+        from mghd.core.model_v2 import MGHDv2
         model = MGHDv2(profile=ns.profile)
         if torch.cuda.is_available():
             model = model.cuda()

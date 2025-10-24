@@ -68,6 +68,8 @@ cudaq = [
 [project.scripts]
 mghd-preflight = "mghd.cli.preflight_mghd:main"
 mghd-train = "mghd.cli.train_core:main"
+mghd-train-crops = "mghd.cli.cluster_crops_train:main"
+mghd-make-crops = "mghd.cli.make_cluster_crops:main"
 mghd-bench = "mghd.cli.bench_decode:main"
 
 [tool.setuptools.packages.find]

@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from panq_functions import GNNDecoder
+from .panq_functions import GNNDecoder
 
 
 class ChannelSE(nn.Module):

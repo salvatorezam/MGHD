@@ -17,7 +17,7 @@ from .cluster_core import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - hints only
-    from mghd_public.infer import MGHDDecoderPublic
+    from mghd.core.infer import MGHDDecoderPublic
 
 
 class MGHDPrimaryClustered:

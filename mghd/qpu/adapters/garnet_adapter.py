@@ -226,7 +226,9 @@ def split_components_for_side(
                 'bbox_xywh': bbox_xywh,
                 'k': k,
                 'r': r,
-                'kappa_stats': kappa_stats
+                'kappa_stats': kappa_stats,
+                'qubit_indices': np.asarray(qubit_indices, dtype=np.int32),
+                'check_indices': np.asarray(check_indices, dtype=np.int32),
             }
             
             components.append(component)
@@ -310,7 +312,9 @@ def _fallback_split_components(
         'bbox_xywh': bbox_xywh,
         'k': k,
         'r': r,
-        'kappa_stats': kappa_stats
+        'kappa_stats': kappa_stats,
+        'qubit_indices': np.asarray(involved_qubits, dtype=np.int32),
+        'check_indices': np.asarray(active_checks, dtype=np.int32),
     }
     
     return [component]

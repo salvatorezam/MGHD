@@ -10,10 +10,10 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import scipy.sparse as sp
 
-from mghd_clustered.garnet_adapter import sample_round
-from mghd_clustered.pcm_real import rotated_surface_pcm
-from mghd_clustered.clustered_primary import MGHDPrimaryClustered
-from mghd_public.infer import MGHDDecoderPublic
+from mghd.qpu.adapters.garnet_adapter import sample_round
+from mghd.codes.pcm_real import rotated_surface_pcm
+from mghd.decoders.lsd.clustered_primary import MGHDPrimaryClustered
+from mghd.core.infer import MGHDDecoderPublic
 
 
 # ---------------------------------------------------------------------------

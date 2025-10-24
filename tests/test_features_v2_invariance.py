@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from mghd_public.features_v2 import pack_cluster
+from mghd.core.features_v2 import pack_cluster
 
 torch = pytest.importorskip("torch")
 
