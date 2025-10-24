@@ -25,10 +25,10 @@ except Exception:
         try:
             from poc_my_models import Mamba as _AstraMamba
         except Exception:
-            try:
-                from mamba_ssm import Mamba as _AstraMamba
-            except Exception as _e:
-                raise ImportError("A Mamba encoder is required (MambaEncoder/MambaStack/Mamba).") from _e
+        try:
+            from mamba_ssm import Mamba as _AstraMamba
+        except Exception:
+            _AstraMamba = None
 
 class AstraMambaWrapper(nn.Module):
     """
@@ -39,6 +39,11 @@ class AstraMambaWrapper(nn.Module):
     """
     def __init__(self, d_model: int, d_state: int):
         super().__init__()
+        if _AstraMamba is None:
+            raise ImportError(
+                "Mamba encoder backend not available. Install 'mamba-ssm' or provide "
+                "poc_my_models.Mamba*."
+            )
         # Construct your Mamba encoder. Try common ctor signatures.
         ok = False
         for ctor in (

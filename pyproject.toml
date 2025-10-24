@@ -21,7 +21,6 @@ dependencies = [
   "rich>=13.7",
   "packaging>=23.2",
   "typing_extensions>=4.9",
-  "mamba-ssm>=2.2",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +44,11 @@ qec = [
 # Hyperparameter tuning
 tuning = [
   "optuna>=3.6",
+]
+
+# Sequence/state-space models (optional for GPU builds with nvcc available)
+ssm = [
+  "mamba-ssm>=2.2",
 ]
 
 # Inference engines (optional; only install if you plan to export/benchmark engines)
