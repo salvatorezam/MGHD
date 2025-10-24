@@ -25,10 +25,10 @@ except Exception:
         try:
             from poc_my_models import Mamba as _AstraMamba
         except Exception:
-        try:
-            from mamba_ssm import Mamba as _AstraMamba
-        except Exception:
-            _AstraMamba = None
+            try:
+                from mamba_ssm import Mamba as _AstraMamba
+            except Exception:
+                _AstraMamba = None
 
 class AstraMambaWrapper(nn.Module):
     """
