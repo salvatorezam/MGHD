@@ -265,7 +265,13 @@ def ml_parity_project(
     return best_e.astype(np.uint8)
 
 
-def active_components(H: sp.csr_matrix, s: np.ndarray, *, halo: int = 0) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+def active_components(
+    H: sp.csr_matrix | np.ndarray,
+    s: np.ndarray,
+    *,
+    halo: int = 0,
+    basis: str | None = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray]] | List[Cluster]:
     """
     Build clusters from active checks (rows where s==1).
     Returns (list_of_check_idx_arrays, list_of_qubit_idx_arrays) in GLOBAL indices.
@@ -275,7 +281,8 @@ def active_components(H: sp.csr_matrix, s: np.ndarray, *, halo: int = 0) -> Tupl
     if rows.size == 0:
         return [], []
 
-    H_act = H[rows, :]
+    Hc = H if sp.issparse(H) else sp.csr_matrix(np.asarray(H, dtype=np.uint8))
+    H_act = Hc[rows, :]
     A = (H_act.T @ H_act).tocsr()
     A.data[:] = 1
     A.setdiag(0)
@@ -301,7 +308,7 @@ def active_components(H: sp.csr_matrix, s: np.ndarray, *, halo: int = 0) -> Tupl
                     dq.append(v)
         qubit_comps.append(np.array(comp, dtype=np.int64))
 
-    Hc = H.tocsr()
+    Hc = Hc.tocsr()
     check_comps: List[np.ndarray] = []
     for i, comp in enumerate(qubit_comps):
         sub = Hc[:, comp]
@@ -313,6 +320,36 @@ def active_components(H: sp.csr_matrix, s: np.ndarray, *, halo: int = 0) -> Tupl
             qubit_comps[i] = comp
         check_comps.append(checks)
 
+    # Legacy compatibility: when a 'basis' kwarg is supplied (as in older tests),
+    # return a list of Cluster objects with only check_indices populated using
+    # adjacency among active checks via shared qubits.
+    if basis is not None:
+        # Build check-level adjacency among active rows
+        # share[i,j] = number of shared data qubits between checks i and j
+        share = (Hc @ Hc.T).tocsr()
+        share.data[:] = 1
+        share.setdiag(0); share.eliminate_zeros()
+        active = set(map(int, rows.tolist()))
+        seen: set[int] = set()
+        clusters: list[Cluster] = []
+        for r0 in rows:
+            r0i = int(r0)
+            if r0i in seen:
+                continue
+            comp = []
+            dq = deque([r0i])
+            seen.add(r0i)
+            while dq:
+                u = dq.popleft()
+                comp.append(u)
+                lo, hi = share.indptr[u], share.indptr[u+1]
+                for v in share.indices[lo:hi]:
+                    vi = int(v)
+                    if vi in active and vi not in seen:
+                        seen.add(vi)
+                        dq.append(vi)
+            clusters.append(Cluster(check_indices=np.array(sorted(comp), dtype=np.int64)))
+        return clusters
     return check_comps, qubit_comps
 
 
@@ -590,4 +627,3 @@ __all__ = [
     "infer_clusters_batched",
     "MGHDPrimaryClustered",
 ]
-

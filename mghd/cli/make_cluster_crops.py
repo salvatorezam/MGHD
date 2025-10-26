@@ -20,6 +20,7 @@ from mghd.codes.qpu_profile import load_qpu_profile
 from mghd.decoders.ensemble import _check_parity_coset_valid
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_ctx import MWPFContext
+from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
 from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_side
 
@@ -153,7 +154,6 @@ def run(args) -> None:
         raise ValueError("No physical error rates provided via --ps")
 
     # MWPF teacher will be initialized per distance with code context
-    mwpf_ctx = None  # deprecated; using MWPFTeacher per code distance
     mwpm_ctx = MWPMatchingContext()
 
     shots_per = args.shots_per_grid

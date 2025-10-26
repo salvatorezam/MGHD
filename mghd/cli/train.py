@@ -20,7 +20,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, Sampler, DataLoader
 
 from mghd.decoders.lsd import clustered as cc  # uses projector functions
-from mghd.core.core import MGHDv2, PackedCrop
+from mghd.core.core import MGHDv2, PackedCrop, pack_cluster
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
@@ -228,6 +228,7 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--qpu-profile", type=str, default=None)
     parser.add_argument("--context-source", type=str, default="none", choices=["none","qiskit","cirq","cudaq"]) 
     parser.add_argument("--shots-per-epoch", type=int, default=256)
+    parser.add_argument("--erasure-frac", type=float, default=0.0, help="Optional erasure injection fraction for online sampling")
     parser.add_argument("--teacher-mix", type=str, default="mwpf=1.0,mwpm=0.0,lsd=0.0")
     parser.add_argument("--online-rl", action="store_true", help="Enable LinTS scaling of TAD overrides in online mode")
     parser.add_argument("--profile", type=str, default="S")
@@ -403,6 +404,7 @@ def train_inprocess(ns) -> str:
             batch_buf: list[PackedCrop] = []
             shots_target = int(getattr(args, "shots_per_epoch", args.batch))
             shots_done = 0
+            erase_data_mask = None  # optional per-batch erasure mask; None by default
             while shots_done < shots_target:
                 seed = int(rng.integers(0, 2**31 - 1))
                 sample = sample_round(d=args.distance, p=args.p, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)

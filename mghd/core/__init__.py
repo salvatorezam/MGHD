@@ -1,10 +1,7 @@
-"""Core MGHD v2 implementation.
+"""Core MGHD v2 package.
 
-This package exposes the consolidated runtime from `core.py`. Other legacy
-modules remain available as separate imports but are not pulled in here to
-avoid unnecessary dependencies.
+Import submodules explicitly when needed, e.g. `from mghd.core.core import MGHDv2`.
+Avoid importing heavy deps at package import time to keep smoke tests lightweight.
 """
 
-from .core import *  # noqa: F401,F403
-
-__all__ = [name for name in dir() if not name.startswith("_")]
+__all__: list[str] = []
