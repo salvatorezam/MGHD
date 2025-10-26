@@ -231,6 +231,7 @@ def pack_cluster(
     add_jump_edges: bool = True,
     jump_k: int = 2,
     g_extra: Optional[np.ndarray] = None,
+    erase_local: Optional[np.ndarray] = None,
 ) -> PackedCrop:
     assert side in ("Z", "X")
     nC, nQ = H_sub.shape
@@ -259,6 +260,17 @@ def pack_cluster(
             pass
     g_token = torch.tensor(g_list, dtype=torch.float32)
 
+    # Optional per-node erasure feature (data-qubits only)
+    if erase_local is not None:
+        try:
+            er = np.asarray(erase_local, dtype=np.float32).ravel()
+            if er.size != nQ:
+                er = None
+        except Exception:
+            er = None
+    else:
+        er = None
+
     base_nodes = np.concatenate([
         xy01,
         node_type[:, None].astype(np.float32),
@@ -267,6 +279,7 @@ def pack_cluster(
         np.full((nQ + nC, 1), float(r), dtype=np.float32),
         np.full((nQ + nC, 1), float(bw), dtype=np.float32),
         np.full((nQ + nC, 1), float(bh), dtype=np.float32),
+        (np.concatenate([er if er is not None else np.zeros(nQ, dtype=np.float32), np.zeros(nC, dtype=np.float32)])[:, None]),
     ], axis=1)
 
     ci, qi = np.nonzero(H_sub)

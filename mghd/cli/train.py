@@ -270,6 +270,9 @@ def train_inprocess(ns) -> str:
             m_kwargs["gnn_gru_dropout"] = float(hp_model["gru_dropout_p"])  # type: ignore[assignment]
     if hp_attn and "se_reduction" in hp_attn:
         m_kwargs["se_reduction"] = int(hp_attn["se_reduction"])  # type: ignore[assignment]
+    # If online with erasures, expand node features by 1 (erasure flag)
+    if bool(getattr(args, "online", False)) and float(getattr(args, "erasure_frac", 0.0)) > 0.0:
+        m_kwargs["node_feat_dim"] = 9
     model = MGHDv2(profile=args.profile, **m_kwargs).to(device)
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -496,6 +499,7 @@ def train_inprocess(ns) -> str:
                             E_max=args.E_max if hasattr(args,"E_max") else 4096,
                             S_max=args.S_max if hasattr(args,"S_max") else 512,
                             g_extra=ctx_vec,
+                            erase_local=(erase_data_mask[qubit_indices] if erase_data_mask is not None and qubit_indices.size else None),
                         )
                         batch_buf.append(move_to(pack, device))
                         if len(batch_buf) >= args.batch:
