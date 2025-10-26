@@ -7,8 +7,7 @@ pytest.importorskip("torch")
 
 import tools.bench_clustered_sweep_surface as bench
 from mghd.codes.pcm_real import rotated_surface_pcm
-from mghd.core.infer import MGHDDecoderPublic
-from mghd.core.model_v2 import MGHDv2
+from mghd.core.core import MGHDDecoderPublic, MGHDv2
 
 
 @pytest.fixture

@@ -14,7 +14,7 @@ import warnings
 import numpy as np
 import scipy.sparse as sp
 
-from mghd.decoders.lsd.cluster_core import ml_parity_project
+from mghd.decoders.lsd.clustered import ml_parity_project
 from mghd.utils.graphlike import is_graphlike
 
 try:  # pragma: no cover - optional dependency

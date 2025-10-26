@@ -41,7 +41,7 @@ def test_cli_multifamily_smoke(monkeypatch, tmp_path):
     cmd = [
         sys.executable,
         "-m",
-        "mghd.cli.train_core",
+        "mghd.tools.teacher_eval",
         "--families",
         "surface,steane,repetition",
         "--distances",

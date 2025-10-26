@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONPATH="/u/home/kulp/MGHD:${PYTHONPATH:-}"
+
 
 # Foundation training driver for MGHD v2.
 # Configure via environment variables to match your cluster setup.
@@ -15,9 +17,12 @@ OUT_CROPS=${OUT_CROPS:-data/crops_fm}
 TRAIN_SAVE_DIR=${TRAIN_SAVE_DIR:-checkpoints/foundation_s}
 BATCH_SIZE=${BATCH_SIZE:-1024}
 EPOCHS=${EPOCHS:-20}
-LR=${LR:-6e-5}
-WEIGHT_DECAY=${WEIGHT_DECAY:-7e-5}
+LR=${LR:-5.952925899948483e-05}
+WEIGHT_DECAY=${WEIGHT_DECAY:-6.65850238574699e-05}
 EMA=${EMA:-0.999}
+LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.13831652882929857}
+NOISE_INJECTION=${NOISE_INJECTION:-0.009883059279379016}
+GRAD_CLIP=${GRAD_CLIP:-0.8545326095750816}
 PARITY_LAMBDA=${PARITY_LAMBDA:-0.1}
 SEED=${SEED:-42}
 
@@ -43,5 +48,6 @@ python -m mghd.cli.cluster_crops_train \
   --save "${TRAIN_SAVE_DIR}" \
   --seed "${SEED}" \
   --projection-aware 1 \
-  --rl-online \
-  --rl-state "${TRAIN_SAVE_DIR}/bandit_state.json"
+  --label-smoothing "${LABEL_SMOOTHING}" \
+  --noise-injection "${NOISE_INJECTION}" \
+  --grad-clip "${GRAD_CLIP}"

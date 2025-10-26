@@ -8,6 +8,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -16,10 +17,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from mghd.decoders.lsd import cluster_core as cc  # uses projector functions
-from mghd.core.features_v2 import PackedCrop
-from mghd.core.model_v2 import MGHDv2
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset, Sampler, DataLoader
+
+from mghd.decoders.lsd import clustered as cc  # uses projector functions
+from mghd.core.core import MGHDv2, PackedCrop
 
 
 class CropShardDataset(Dataset):
@@ -129,6 +130,7 @@ def bce_binary_head_loss(
     y_bits: torch.Tensor,
     *,
     sample_weight: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     # Use only data-qubit nodes (type==0) and valid mask
     is_data = (node_type == 0) & node_mask
@@ -136,7 +138,8 @@ def bce_binary_head_loss(
         return torch.tensor(0.0, device=logits.device)
     # logits: [N_max, 2]; target bit in {0,1}
     target = y_bits.clamp_min(0).clamp_max(1).long()
-    ce = nn.CrossEntropyLoss(reduction="none")  # on 2-logits
+    smoothing = float(max(0.0, min(0.5, label_smoothing)))
+    ce = nn.CrossEntropyLoss(reduction="none", label_smoothing=smoothing)
     loss_all = ce(logits[is_data], target[is_data])
     if sample_weight is not None:
         weight = sample_weight.to(logits.device).clamp_min(0.5).clamp_max(3.0)
@@ -208,119 +211,153 @@ def train_inprocess(ns) -> str:
     In-process entry that mirrors CLI `main()`.
     Returns path to best checkpoint.
     """
-    # ns: argparse.Namespace with fields matching CLI flags
     args = ns
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, required=False)
     parser.add_argument("--profile", type=str, default="S")
     parser.add_argument("--ema", type=float, default=0.999)
-    parser.add_argument("--lr", type=float, default=6e-5)
-    parser.add_argument("--wd", type=float, default=7e-5)
+    parser.add_argument("--lr", type=float, default=5.952925899948483e-05)
+    parser.add_argument("--wd", type=float, default=6.65850238574699e-05)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--parity-lambda", type=float, default=0.03)
     parser.add_argument("--projection-aware", type=int, default=1)
+    parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
+    parser.add_argument("--noise-injection", type=float, default=0.009883059279379016)
+    parser.add_argument("--grad-clip", type=float, default=0.8545326095750816)
     parser.add_argument("--save", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
-    
-    # If called in-process, args already populated. If missing fields, parse CLI.
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MGHDv2(profile=args.profile).to(device)
+    # Build model with optional hyperparameters from JSON
+    hp_model = getattr(args, "_hp_model", {})
+    hp_mamba = getattr(args, "_hp_mamba", {})
+    hp_attn = getattr(args, "_hp_attn", {})
+    m_kwargs = {}
+    if hp_mamba:
+        if "d_model" in hp_mamba:
+            m_kwargs["d_model"] = int(hp_mamba["d_model"])  # type: ignore[assignment]
+        if "d_state" in hp_mamba:
+            m_kwargs["d_state"] = int(hp_mamba["d_state"])  # type: ignore[assignment]
+    if hp_model:
+        if "n_iters" in hp_model:
+            m_kwargs["n_iters"] = int(hp_model["n_iters"])  # type: ignore[assignment]
+        if "msg_net_size" in hp_model:
+            m_kwargs["gnn_msg_net_size"] = int(hp_model["msg_net_size"])  # type: ignore[assignment]
+        if "msg_net_dropout_p" in hp_model:
+            m_kwargs["gnn_msg_dropout"] = float(hp_model["msg_net_dropout_p"])  # type: ignore[assignment]
+        if "gru_dropout_p" in hp_model:
+            m_kwargs["gnn_gru_dropout"] = float(hp_model["gru_dropout_p"])  # type: ignore[assignment]
+    if hp_attn and "se_reduction" in hp_attn:
+        m_kwargs["se_reduction"] = int(hp_attn["se_reduction"])  # type: ignore[assignment]
+    model = MGHDv2(profile=args.profile, **m_kwargs).to(device)
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     ds = CropShardDataset(args.data_root)
     sampler = make_bucket_sampler(ds, stage="stage1", seed=args.seed)
-    # iterate items one by one to keep padding/masks simple; sampler controls curriculum
-    os.makedirs(args.save, exist_ok=True)
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch,
+        sampler=sampler,
+        collate_fn=lambda batch: batch,
+    )
+
+    save_dir = Path(args.save)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     best_loss = float("inf")
-    for epoch in range(1, args.epochs+1):
+    history: list[dict[str, Any]] = []
+    for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
         total_loss = 0.0
         n_items = 0
-        for idx in sampler:
-            packed = ds[idx]
-            logits, node_mask = model(packed=move_to(packed, device))
-            # BCE on data-qubits
-            # hard-case upweighting: when MWPF!=MWPM or !teacher_valid -> upweight
-            hard = (0.5 if packed.teacher_valid else 1.5) + (
-                0.5 if packed.teacher_matched_local_ml else 1.0
-            )
-            sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
-            loss_bce = bce_binary_head_loss(
-                logits,
-                packed.node_mask.to(device),
-                packed.node_type.to(device),
-                packed.y_bits.to(device),
-                sample_weight=sample_weight,
-            )
-            # Parity aux
-            loss_par = args.parity_lambda * parity_auxiliary_loss(
-                logits,
-                packed.node_mask.to(device),
-                packed.node_type.to(device),
-                H_sub=packed.H_sub,
-            )
-            # Projection-aware term
-            loss_proj = torch.tensor(0.0, device=device)
-            if args.projection_aware:
-                data_mask = (packed.node_type.to(device) == 0) & packed.node_mask.to(device)
-                proj_bits = projection_aware_logits_to_bits(
-                    logits,
-                    projector_kwargs={
-                        "H_sub": packed.H_sub,
-                        "side": getattr(packed.meta, "side", "Z"),
-                    },
-                    data_mask=data_mask,
-                )
-                with torch.no_grad():
-                    # Extract target bits for data qubits only
-                    mask_data = (packed.node_type.to(device) == 0) & packed.node_mask.to(device)
-                    target_full = (
-                        packed.y_bits.cpu().numpy().clip(0, 1)
-                    ).astype(np.uint8)
-                    target_data = target_full[mask_data.cpu().numpy()]  # Extract data qubit targets
-
-                # proj_bits and target_data both have length = number of data qubits
-                proj_target = torch.from_numpy(target_data).to(device)
-                proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
-
-                # Penalize projection flips against the raw threshold on data-qubits
-                raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
-                loss_proj = 0.5 * F.l1_loss(
-                    proj_pred.float(),
-                    proj_target.float(),
-                ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
-
-            loss = loss_bce + loss_par + 0.5*loss_proj
+        for batch in loader:
+            if not batch:
+                continue
+            moved = [move_to(packed, device) for packed in batch]
+            if args.noise_injection > 0.0:
+                std = float(args.noise_injection)
+                for packed in moved:
+                    packed.x_nodes = packed.x_nodes + torch.randn_like(packed.x_nodes) * std
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            batch_loss = torch.zeros((), device=device)
+            for packed in moved:
+                logits, node_mask = model(packed=packed)
+                logits = logits.squeeze(0)
+                node_mask = node_mask.squeeze(0)
+
+                hard = (0.5 if packed.teacher_valid else 1.5) + (0.5 if packed.teacher_matched_local_ml else 1.0)
+                sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
+
+                loss_bce = bce_binary_head_loss(
+                    logits,
+                    node_mask,
+                    packed.node_type,
+                    packed.y_bits,
+                    sample_weight=sample_weight,
+                    label_smoothing=args.label_smoothing,
+                )
+
+                loss_par = args.parity_lambda * parity_auxiliary_loss(
+                    logits,
+                    node_mask,
+                    packed.node_type,
+                    H_sub=packed.H_sub,
+                )
+
+                loss_proj = torch.tensor(0.0, device=device)
+                if args.projection_aware:
+                    data_mask = (packed.node_type == 0) & node_mask
+                    proj_bits = projection_aware_logits_to_bits(
+                        logits,
+                        projector_kwargs={"H_sub": packed.H_sub, "side": getattr(packed.meta, "side", "Z")},
+                        data_mask=data_mask,
+                    )
+                    with torch.no_grad():
+                        mask_data = data_mask.detach().cpu().numpy()
+                        target_full = packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
+                        target_data = target_full[mask_data]
+
+                    proj_target = torch.from_numpy(target_data).to(device)
+                    proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
+
+                    raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
+                    loss_proj = 0.5 * F.l1_loss(proj_pred.float(), proj_target.float()) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+
+                sample_loss = loss_bce + loss_par + 0.5 * loss_proj
+                batch_loss = batch_loss + sample_loss
+
+            batch_size = len(moved)
+            batch_loss = batch_loss / batch_size
+            batch_loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
             opt.step()
-            total_loss += loss.item()
-            n_items += 1
+
+            total_loss += batch_loss.item() * batch_size
+            n_items += batch_size
+
         sched.step()
-        dt = (time.time()-t0)
-        avg = total_loss/max(n_items,1)
-        ck = f"{args.save}/epoch{epoch:03d}.pt"
-        torch.save({"model":model.state_dict(),"epoch":epoch,"loss":avg}, ck)
+        dt = time.time() - t0
+        avg = total_loss / max(n_items, 1)
+        history.append({"epoch": epoch, "loss": avg, "count": n_items, "secs": dt})
+
+        torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
         if avg < best_loss:
             best_loss = avg
-            torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "loss": avg},
-                os.path.join(args.save, "best.pt"),
-            )
-        # Telemetry (teacher fractions, simple LER proxy vs teacher after projection)
-        print(json.dumps({"epoch":epoch,"loss":avg,"secs":dt}, separators=(",",":")))
-    return os.path.join(args.save,"best.pt")
+            torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt")
 
+        print(json.dumps({"epoch": epoch, "loss": avg, "secs": dt}, separators=(",", ":")))
+
+    (save_dir / "train_log.json").write_text(json.dumps(history, indent=2))
+
+    return os.path.join(args.save, "best.pt")
 def move_to(p: PackedCrop, device):
     p.x_nodes = p.x_nodes.to(device)
     p.node_mask = p.node_mask.to(device)
@@ -351,6 +388,9 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
     ns.parity_lambda = 0.03
     ns.projection_aware = 1
     ns.seed = 42
+    ns.label_smoothing = 0.13831652882929857
+    ns.noise_injection = 0.009883059279379016
+    ns.grad_clip = 0.8545326095750816
     
     # Create temporary directory for save path
     temp_dir = tempfile.mkdtemp()
@@ -364,7 +404,7 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
         print(f"Training completed, result: {result_path}")
         
         # Return the trained model for inspection
-        from mghd.core.model_v2 import MGHDv2
+        from mghd.core.core import MGHDv2
         model = MGHDv2(profile=ns.profile)
         if torch.cuda.is_available():
             model = model.cuda()
@@ -381,15 +421,38 @@ def main():
     parser.add_argument("--data-root", type=str, required=True)
     parser.add_argument("--profile", type=str, default="S")
     parser.add_argument("--ema", type=float, default=0.999)
-    parser.add_argument("--lr", type=float, default=6e-5)
-    parser.add_argument("--wd", type=float, default=7e-5)
+    parser.add_argument("--lr", type=float, default=5.952925899948483e-05)
+    parser.add_argument("--wd", type=float, default=6.65850238574699e-05)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--parity-lambda", type=float, default=0.03)
     parser.add_argument("--projection-aware", type=int, default=1)
+    parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
+    parser.add_argument("--noise-injection", type=float, default=0.009883059279379016)
+    parser.add_argument("--grad-clip", type=float, default=0.8545326095750816)
     parser.add_argument("--save", type=str, required=True)
+    parser.add_argument("--hparams", type=str, default=None, help="Path to JSON hyperparameters file")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    # Optionally load hyperparameters and apply to args
+    if args.hparams:
+        try:
+            with open(args.hparams, "r", encoding="utf-8") as fh:
+                hp = json.load(fh)
+        except Exception:
+            hp = None
+        if isinstance(hp, dict):
+            tp = hp.get("training_parameters", {}) or {}
+            args.lr = float(tp.get("lr", args.lr))
+            args.wd = float(tp.get("weight_decay", args.wd))
+            args.label_smoothing = float(tp.get("label_smoothing", args.label_smoothing))
+            args.grad_clip = float(tp.get("gradient_clip", args.grad_clip))
+            args.noise_injection = float(tp.get("noise_injection", args.noise_injection))
+            args.epochs = int(tp.get("epochs", args.epochs))
+            args.batch = int(tp.get("batch_size", args.batch))
+            setattr(args, "_hp_model", hp.get("model_architecture", {}) or {})
+            setattr(args, "_hp_mamba", hp.get("mamba_parameters", {}) or {})
+            setattr(args, "_hp_attn", hp.get("attention_mechanism", {}) or {})
     # Delegate
     train_inprocess(args)
 

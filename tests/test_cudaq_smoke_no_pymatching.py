@@ -17,10 +17,10 @@ def test_cudaq_smoke_runs_without_pymatching(monkeypatch):
     monkeypatch.setitem(sys.modules, "pymatching", stub)
     monkeypatch.setitem(sys.modules, "PyMatching", stub)
 
-    from tools import train_core
+    from mghd.tools import teacher_eval as train_core
 
     argv = [
-        "train_core",
+        "teacher_eval",
         "--families",
         "surface",
         "--distances",

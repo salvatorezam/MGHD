@@ -161,12 +161,12 @@ def split_components_for_side(
     Build connected components + 1-hop halo for the chosen side ('Z' or 'X').
     Output list entries contain fields the crop packer expects:
       H_sub, xy_qubit, xy_check, synd_bits, bbox_xywh, k, r, kappa_stats
-    Uses your existing `mghd_clustered/cluster_core.py` clustering.
+    Uses the in-repo clustering utilities (mghd.decoders.lsd.clustered).
     """
     try:
         import scipy.sparse as sp
 
-        from . import cluster_core as cc
+        from . import clustered as cc
         
         # Select appropriate matrices and syndromes based on side
         if side == 'Z':
@@ -180,10 +180,10 @@ def split_components_for_side(
         else:
             raise ValueError(f"Unknown side: {side}")
         
-        # Convert to sparse for cluster_core functions
+        # Convert to sparse for clustering functions
         H_sparse = sp.csr_matrix(H)
         
-        # Use active_components from cluster_core to find connected components
+        # Use active_components to find connected components
         check_groups, qubit_groups = cc.active_components(H_sparse, synd_bits, halo=1)
         
         components = []
@@ -246,7 +246,7 @@ def _fallback_split_components(
     *, side: str, Hx: np.ndarray, Hz: np.ndarray, synZ: np.ndarray, synX: np.ndarray,
     coords_q: np.ndarray, coords_c: np.ndarray
 ) -> list[dict[str, Any]]:
-    """Fallback component splitting when cluster_core not available"""
+    """Fallback component splitting when clustering module not available"""
     
     # Select appropriate matrices and syndromes
     if side == 'Z':

@@ -219,7 +219,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     stim_cmd = [
         sys.executable,
         "-m",
-        "mghd.cli.train_core",
+        "mghd.tools.teacher_eval",
         "--families",
         args.families,
         "--distances",
@@ -261,7 +261,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         cudaq_cmd = [
             sys.executable,
             "-m",
-            "mghd.cli.train_core",
+            "mghd.tools.teacher_eval",
             "--families",
             args.families,
             "--distances",

@@ -13,7 +13,7 @@ from typing import Dict, List
 import numpy as np
 
 from mghd.codes.registry import get_code
-from mghd.core.features_v2 import pack_cluster
+from mghd.core.core import pack_cluster
 from mghd.decoders.ensemble import _check_parity_coset_valid
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_ctx import MWPFContext

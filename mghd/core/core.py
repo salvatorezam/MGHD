@@ -481,14 +481,25 @@ class SequenceEncoder(nn.Module):
 class GraphDecoderAdapter(nn.Module):
     """Adapter over the graph decoder for v2 crops."""
 
-    def __init__(self, hidden_dim: int, edge_feat_dim: int, n_iters: int):
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_feat_dim: int,
+        n_iters: int,
+        *,
+        msg_net_size: Optional[int] = None,
+        msg_net_dropout_p: float = 0.0,
+        gru_dropout_p: float = 0.0,
+    ):
         super().__init__()
         self.core = GraphDecoder(
             n_iters=n_iters,
             n_node_inputs=hidden_dim,
             n_node_outputs=2,
             n_edge_features=edge_feat_dim,
-            msg_net_size=max(96, hidden_dim),
+            msg_net_size=max(96, hidden_dim) if msg_net_size is None else int(msg_net_size),
+            msg_net_dropout_p=float(msg_net_dropout_p),
+            gru_dropout_p=float(gru_dropout_p),
         )
         self.iter_override: Optional[int] = None
 
@@ -534,13 +545,24 @@ class MGHDv2(nn.Module):
         node_feat_dim: int = 8,
         edge_feat_dim: int = 3,
         g_dim: Optional[int] = None,
+        se_reduction: int = 4,
+        gnn_msg_net_size: Optional[int] = None,
+        gnn_msg_dropout: float = 0.0,
+        gnn_gru_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if g_dim is None:
             g_dim = max(8, node_feat_dim)
         self.seq_encoder = SequenceEncoder(d_model=d_model, d_state=d_state)
-        self.se = ChannelSE(channels=d_model)
-        self.gnn = GraphDecoderAdapter(hidden_dim=d_model, edge_feat_dim=edge_feat_dim, n_iters=n_iters)
+        self.se = ChannelSE(channels=d_model, reduction=int(se_reduction))
+        self.gnn = GraphDecoderAdapter(
+            hidden_dim=d_model,
+            edge_feat_dim=edge_feat_dim,
+            n_iters=n_iters,
+            msg_net_size=gnn_msg_net_size,
+            msg_net_dropout_p=gnn_msg_dropout,
+            gru_dropout_p=gnn_gru_dropout,
+        )
         self.node_in = nn.Linear(node_feat_dim, d_model)
         self.edge_in = nn.Linear(edge_feat_dim, d_model)
         self.g_proj: Optional[nn.Linear] = None

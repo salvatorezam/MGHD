@@ -14,7 +14,7 @@ import warnings
 
 import numpy as np
 
-from mghd.decoders.lsd.cluster_core import ml_parity_project
+from mghd.decoders.lsd.clustered import ml_parity_project
 
 try:  # pragma: no cover - optional dependency
     # ldpc 0.1.x has bposd_decoder, not bplsd_decoder

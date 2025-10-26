@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mghd.cli.train_core import _base_overrides_from_maps, _materialize_overrides
+from mghd.tools.teacher_eval import _base_overrides_from_maps, _materialize_overrides
 from mghd.codes.qpu_profile import GateError, QPUProfile
 from mghd.tad.context import context_vector
 from mghd.tad.rl.lin_ts import LinTSBandit

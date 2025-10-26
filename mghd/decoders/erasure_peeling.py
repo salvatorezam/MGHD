@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from mghd.decoders.lsd.cluster_core import solve_on_erasure
+from mghd.decoders.lsd.clustered import solve_on_erasure
 
 
 def _peeling(

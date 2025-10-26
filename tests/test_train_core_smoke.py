@@ -8,7 +8,7 @@ def test_train_core_smoke():
     cmd = [
         sys.executable,
         "-m",
-        "mghd.cli.train_core",
+        "mghd.tools.teacher_eval",
         "--family",
         "surface",
         "--distances",
