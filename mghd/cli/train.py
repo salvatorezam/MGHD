@@ -189,7 +189,7 @@ def projection_aware_logits_to_bits(
     # restrict to data-qubits only to match H_sub columns
     probs1_full = torch.sigmoid(logits[:, 1] - logits[:, 0])
     probs1 = probs1_full[data_mask].detach().cpu().numpy()
-    # Adapter to cluster_core projector (discover exact signature and adapt)
+    # Adapter to clustered projector (discover exact signature and adapt)
     if hasattr(cc, "ml_parity_project"):
         H_sub = projector_kwargs.get("H_sub")
         s_sub_default = (

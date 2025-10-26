@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import numpy as np
-from typing import Dict
+from typing import Dict, Any
 
 
-def context_vector(features: Dict[str, any], gate_vocab: Dict[str, int]) -> np.ndarray:
+def context_vector(features: Dict[str, Any], gate_vocab: Dict[str, int]) -> np.ndarray:
     vec = np.zeros(len(gate_vocab) + 1, dtype=np.float32)
     for gate, count in features.get("gate_hist", {}).items():
         if gate in gate_vocab:

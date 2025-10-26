@@ -74,7 +74,7 @@ def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
       Columns correspond to data-qubit order 0..(d²-1) in row-major order.
     """
     try:
-        from codes_q import create_rotated_surface_codes  # reuse Astra helper
+        from codes_q import create_rotated_surface_codes  # optional external helper
         css = create_rotated_surface_codes(d, name=f"rotated_d{d}")
         Hx = css.hx.astype(int)
         Hz = css.hz.astype(int)

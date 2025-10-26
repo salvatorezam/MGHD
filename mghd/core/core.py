@@ -29,8 +29,73 @@ class MGHDConfig:
     n_node_inputs: int = 9
     n_node_outputs: int = 2  # binary head for rotated d=3
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+def to_dict(self) -> Dict[str, Any]:
+    return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Minimal CSS helpers (moved from codes.pcm_real for consolidation)
+# ---------------------------------------------------------------------------
+
+
+def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
+    """Return rotated surface code parity-check matrix for odd distance d.
+
+    This constructs a simple rotated surface code adjacency where each check
+    touches up to 5 data qubits (center + 4-neighbors) depending on lattice
+    bounds. It matches the previous helper in mghd.codes.pcm_real.
+    """
+    if d % 2 == 0 or d < 1:
+        raise ValueError("rotated_surface_pcm requires odd d >= 1")
+
+    side = side.upper()
+    if side not in {"X", "Z"}:
+        raise ValueError("side must be 'X' or 'Z'")
+
+    n_qubits = d * d
+    n_checks = (d * d - 1) // 2
+
+    rows: List[int] = []
+    cols: List[int] = []
+    row_idx = 0
+
+    def q_index(r: int, c: int) -> int:
+        return r * d + c
+
+    center = d // 2
+
+    for r in range(d):
+        for c in range(d):
+            parity = (r + c) % 2
+            include = False
+            if side == "Z":
+                include = (parity == 1)
+            else:  # side == 'X'
+                include = (parity == 0) and not (r == center and c == center)
+            if not include:
+                continue
+
+            qubits = {q_index(r, c)}
+            if r - 1 >= 0:
+                qubits.add(q_index(r - 1, c))
+            if r + 1 < d:
+                qubits.add(q_index(r + 1, c))
+            if c - 1 >= 0:
+                qubits.add(q_index(r, c - 1))
+            if c + 1 < d:
+                qubits.add(q_index(r, c + 1))
+
+            for q in sorted(qubits):
+                rows.append(row_idx)
+                cols.append(q)
+            row_idx += 1
+
+    if row_idx != n_checks:
+        raise AssertionError(f"Constructed {row_idx} checks, expected {n_checks}")
+
+    data = np.ones(len(rows), dtype=np.uint8)
+    H = sp.coo_matrix((data, (rows, cols)), shape=(n_checks, n_qubits)).tocsr()
+    return H
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +230,7 @@ def pack_cluster(
     bucket_spec: Optional[Sequence[Tuple[int, int, int]]] = None,
     add_jump_edges: bool = True,
     jump_k: int = 2,
+    g_extra: Optional[np.ndarray] = None,
 ) -> PackedCrop:
     assert side in ("Z", "X")
     nC, nQ = H_sub.shape
@@ -184,6 +250,13 @@ def pack_cluster(
     for key in ("size", "radius", "ecc", "bdensity"):
         if key in kappa_stats:
             g_list.append(float(kappa_stats[key]))
+    # Optional global context features (e.g., TAD schedule/context vector)
+    if g_extra is not None:
+        try:
+            extra = np.asarray(g_extra, dtype=np.float32).ravel().tolist()
+            g_list.extend(extra)
+        except Exception:
+            pass
     g_token = torch.tensor(g_list, dtype=torch.float32)
 
     base_nodes = np.concatenate([

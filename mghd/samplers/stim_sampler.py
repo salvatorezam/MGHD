@@ -6,7 +6,7 @@ from typing import Any, Optional, Tuple
 import numpy as np
 
 from . import SampleBatch
-from .registry import register_sampler
+from . import register_sampler
 
 
 def sample_surface_memory(

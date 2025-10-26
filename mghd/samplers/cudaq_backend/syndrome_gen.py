@@ -450,7 +450,7 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: dict[str, A
         bitpack: Whether to pack bits into bytes (currently ignored)
         
     Returns:
-        Packed syndrome + error array matching panq_functions format
+        Packed syndrome + error array matching the legacy training format
     """
     # Initialize noise model based on mode
     if mode == "foundation":
@@ -592,7 +592,7 @@ def sample_bb_cudaq(mode: str, batch_size: int, T: int, hx: np.ndarray, hz: np.n
         bitpack: Whether to pack bits into bytes (currently ignored)
         
     Returns:
-        Packed syndrome + error array matching bb_panq_functions format
+        Packed syndrome + error array matching the legacy training format
     """
     # Initialize noise model
     if mode == "foundation":

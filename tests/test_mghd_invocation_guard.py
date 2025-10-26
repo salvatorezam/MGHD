@@ -3,7 +3,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from mghd.codes.pcm_real import rotated_surface_pcm
+from mghd.core.core import rotated_surface_pcm
 from mghd.decoders.lsd.clustered import MGHDPrimaryClustered
 from mghd.core.core import MGHDDecoderPublic, MGHDv2
 

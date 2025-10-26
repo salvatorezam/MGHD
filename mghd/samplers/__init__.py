@@ -10,7 +10,7 @@ Note:
   Stim's fast path assumes Pauli channels + stabilizer ops; use only for A/B checks.
 """
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 
 import numpy as np
 
@@ -27,8 +27,20 @@ class SampleBatch:
     p_erase_data: np.ndarray | None = None     # float [B, n]
 
 
-from .cudaq_sampler import CudaQSampler  # ensures availability
-from .registry import get_sampler, register_sampler
+_REGISTRY: Dict[str, Callable[..., object]] = {}
+
+
+def register_sampler(name: str, factory: Callable[..., object]) -> None:
+    _REGISTRY[name] = factory
+
+
+def get_sampler(name: str, **kwargs):
+    if name not in _REGISTRY:
+        raise KeyError(f"Unknown sampler '{name}'. Available: {list(_REGISTRY)}")
+    return _REGISTRY[name](**kwargs)
+
+
+from .cudaq_sampler import CudaQSampler  # ensures availability and registers itself
 
 try:
     from .stim_sampler import StimSampler  # optional

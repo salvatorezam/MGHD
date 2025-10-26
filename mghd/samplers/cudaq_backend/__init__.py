@@ -27,19 +27,7 @@ from .syndrome_gen import (
     sample_repetition_cudaq
 )
 
-from .backend_api import (
-    cudaq_sample_surface_wrapper,
-    cudaq_sample_bb_wrapper,
-    cudaq_sample_repetition_wrapper,
-    get_backend_info,
-    validate_backend_installation,
-    sample_surface_foundation,
-    sample_surface_student,
-    sample_bb_foundation,
-    sample_bb_student,
-    sample_repetition_foundation,
-    sample_repetition_student
-)
+# Wrapper functions are exposed via mghd.samplers.cudaq_sampler to reduce coupling.
 
 __all__ = [
     "FOUNDATION_DEFAULTS",
@@ -54,15 +42,4 @@ __all__ = [
     "sample_surface_cudaq",
     "sample_bb_cudaq",
     "sample_repetition_cudaq",
-    "cudaq_sample_surface_wrapper",
-    "cudaq_sample_bb_wrapper", 
-    "cudaq_sample_repetition_wrapper",
-    "get_backend_info",
-    "validate_backend_installation",
-    "sample_surface_foundation",
-    "sample_surface_student",
-    "sample_bb_foundation",
-    "sample_bb_student",
-    "sample_repetition_foundation",
-    "sample_repetition_student"
 ]

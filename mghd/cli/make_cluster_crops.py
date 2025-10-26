@@ -14,6 +14,9 @@ import numpy as np
 
 from mghd.codes.registry import get_code
 from mghd.core.core import pack_cluster
+from mghd.tad import weighting as tad_weighting
+from mghd.tad import context as tad_context
+from mghd.codes.qpu_profile import load_qpu_profile
 from mghd.decoders.ensemble import _check_parity_coset_valid
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_ctx import MWPFContext
@@ -39,6 +42,31 @@ def short_sha(*objs) -> str:
         else:
             h.update(repr(o).encode())
     return h.hexdigest()[:8]
+
+
+def _build_schedule_ir(context_source: str, code_obj: object):
+    import sys
+    native = None
+    for attr in ("native_circuit", "reference_circuit", "circuit", "qc", "quantum_circuit"):
+        if hasattr(code_obj, attr):
+            native = getattr(code_obj, attr)
+            if native is not None:
+                break
+    if native is None:
+        return []
+    try:
+        if context_source == "qiskit" and "qiskit" in sys.modules:
+            from mghd.qpu.adapters import qiskit_adapter
+            return qiskit_adapter.to_schedule_ir(native)
+        if context_source == "cirq" and "cirq" in sys.modules:
+            from mghd.qpu.adapters import cirq_adapter  # type: ignore
+            return cirq_adapter.to_schedule_ir(native)
+        if context_source == "cudaq" and "cudaq" in sys.modules:
+            from mghd.qpu.adapters import cudaq_adapter  # type: ignore
+            return cudaq_adapter.to_schedule_ir(native)
+    except Exception:
+        pass
+    return []
 
 
 def parse_families(spec: str) -> List[str]:
@@ -133,6 +161,16 @@ def run(args) -> None:
 
     print(f"Generating crops with MGHD_SYNTHETIC={os.getenv('MGHD_SYNTHETIC', '0')}")
 
+    # Optionally compute TAD context and overrides per family/d using QPU profile
+    qpu_profile = None
+    ctx_vec: np.ndarray | None = None
+    llr_overrides: np.ndarray | None = None
+    if args.qpu_profile and args.context_source != "none":
+        try:
+            qpu_profile = load_qpu_profile(args.qpu_profile)
+        except Exception:
+            qpu_profile = None
+
     for family in families:
         if family != "surface":
             raise NotImplementedError(
@@ -141,6 +179,32 @@ def run(args) -> None:
 
         for d in distances:
             code = get_code(family, distance=d)
+            # Build schedule IR and TAD features once per code distance
+            ctx_vec = None
+            llr_overrides = None
+            if qpu_profile is not None:
+                schedule_ir = _build_schedule_ir(args.context_source, code)
+                try:
+                    n_qubits = getattr(code, "n", None) or int(code.Hx.shape[1])
+                except Exception:
+                    n_qubits = 0
+                try:
+                    weight_maps = tad_weighting.schedule_to_weight_maps(schedule_ir, qpu_profile, n_qubits)
+                    feats = tad_weighting.feature_vector(schedule_ir)
+                    sorted_gates = sorted(feats.get("gate_hist", {}).keys())
+                    gate_vocab = {gate: idx for idx, gate in enumerate(sorted_gates)}
+                    ctx_vec = tad_context.context_vector(feats, gate_vocab)
+                    # Base LLR override per qubit (use unit scale)
+                    llr = np.zeros(int(n_qubits), dtype=np.float32)
+                    for layer in (weight_maps.get("w_qubit", {}) or {}).values():
+                        for q, w in layer.items():
+                            idx = int(q)
+                            if 0 <= idx < llr.size:
+                                llr[idx] += float(w)
+                    llr_overrides = llr if llr.size else None
+                except Exception:
+                    ctx_vec = None
+                    llr_overrides = None
             lsd_teacher = None
             if teacher_mix.get("lsd", 0.0) > 0:
                 try:
@@ -163,6 +227,7 @@ def run(args) -> None:
                             ex_glob, ez_glob = lsd_teacher.decode_batch_xz(
                                 syndromes_x=sample["synX"][np.newaxis, :],
                                 syndromes_z=sample["synZ"][np.newaxis, :],
+                                llr_overrides=llr_overrides,
                             )
                             lsd_preds["X"] = ex_glob[0].astype(np.uint8)
                             lsd_preds["Z"] = ez_glob[0].astype(np.uint8)
@@ -238,6 +303,7 @@ def run(args) -> None:
                                 N_max=padN,
                                 E_max=padE,
                                 S_max=padS,
+                                g_extra=ctx_vec,
                             )
 
                             item = {

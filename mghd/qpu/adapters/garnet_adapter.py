@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from mghd.samplers.cudaq_backend.backend_api import cudaq_sample_surface_wrapper
+from mghd.samplers.cudaq_sampler import cudaq_sample_surface_wrapper
 from mghd.samplers.cudaq_backend.circuits import (
     build_H_rotated_general,
     make_surface_layout_general,
@@ -236,7 +236,7 @@ def split_components_for_side(
         return components
         
     except ImportError:
-        # Fallback if cluster_core not available
+        # Fallback if clustering module not available
         return _fallback_split_components(
             side=side, Hx=Hx, Hz=Hz, synZ=synZ, synX=synX,
             coords_q=coords_q, coords_c=coords_c

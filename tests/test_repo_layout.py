@@ -8,7 +8,7 @@ def test_imports_smoke():
 
 
 def test_sampler_registry_defaults():
-    from mghd.samplers.registry import get_sampler
+    from mghd.samplers import get_sampler
     from mghd.samplers.cudaq_sampler import CudaQSampler
     cudaq = get_sampler("cudaq")
     assert isinstance(cudaq, CudaQSampler)

@@ -31,7 +31,7 @@ from typing import Any
 import numpy as np
 
 from mghd.decoders.mix import MixConfig, TeacherMix
-from mghd.samplers.registry import get_sampler
+from mghd.samplers import get_sampler
 from mghd.utils.graphlike import is_graphlike
 from mghd.utils.metrics import LEResult, logical_error_rate, summary_line
 
