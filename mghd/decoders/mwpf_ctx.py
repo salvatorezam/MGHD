@@ -14,7 +14,15 @@ class MWPFContext:
         # ... build decoder graph / weights from dem_meta or self._tmpl ...
         self._ready = True
         
-    def decode(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str, dem_meta=None):
+    def decode(
+        self,
+        H_sub: np.ndarray,
+        synd_bits: np.ndarray,
+        side: str,
+        dem_meta=None,
+        *,
+        mwpf_qubit_scale: np.ndarray | None = None,
+    ):
         """
         Return (bits_uint8[length = #data-qubits in crop], weight_int).
         Must enforce local conventions consistent with crop index order.
@@ -25,7 +33,7 @@ class MWPFContext:
             return self._decode_mwpf(H_sub, synd_bits, side, dem_meta)
         except (ImportError, NotImplementedError):
             # Fallback to a simple implementation  
-            return self._decode_fallback(H_sub, synd_bits, side)
+            return self._decode_fallback(H_sub, synd_bits, side, qubit_scale=mwpf_qubit_scale)
     
     def _decode_mwpf(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str, dem_meta=None):
         """Actual MWPF implementation - to be replaced with real MWPF call"""
@@ -35,7 +43,14 @@ class MWPFContext:
         # For now, implement a simple greedy decoder as placeholder
         return self._decode_fallback(H_sub, synd_bits, side)
     
-    def _decode_fallback(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str):
+    def _decode_fallback(
+        self,
+        H_sub: np.ndarray,
+        synd_bits: np.ndarray,
+        side: str,
+        *,
+        qubit_scale: np.ndarray | None = None,
+    ):
         """Simple fallback decoder for when MWPF is not available"""
         n_qubits = H_sub.shape[1]
         
@@ -56,6 +71,17 @@ class MWPFContext:
         remaining_syndrome = synd_bits.copy()
         weight = 0
         
+        # Normalize optional per-qubit scaling
+        if qubit_scale is not None:
+            try:
+                scale = np.asarray(qubit_scale, dtype=float).ravel()
+                if scale.size != n_qubits:
+                    scale = None
+            except Exception:
+                scale = None
+        else:
+            scale = None
+
         while np.any(remaining_syndrome > 0) and weight < n_qubits:
             # Find qubit that would fix most remaining violations
             scores = np.zeros(n_qubits)
@@ -64,7 +90,10 @@ class MWPFContext:
                     # Count how many remaining violations this qubit would fix
                     participating_checks = np.where(H_sub[:, q] > 0)[0]
                     fixes = np.sum(remaining_syndrome[participating_checks])
-                    scores[q] = fixes
+                    s = float(fixes)
+                    if scale is not None:
+                        s *= float(np.clip(scale[q], 0.1, 10.0))
+                    scores[q] = s
             
             if scores.max() == 0:
                 break

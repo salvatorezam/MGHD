@@ -19,7 +19,7 @@ from mghd.samplers.cudaq_backend.garnet_noise import (
 _USE_SYNTH = os.getenv("MGHD_SYNTHETIC","0") == "1"
 _MODE = os.getenv("MGHD_MODE","foundation")  # {"foundation","student"}
 
-def sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
+def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -> dict[str, Any]:
     """
     Returns dict with keys:
       Hx, Hz: (uint8) parity-check matrices
@@ -47,7 +47,8 @@ def sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
             d=d,
             layout=layout,
             rng=rng,
-            bitpack=False
+            bitpack=False,
+            profile_json=profile_path,
         )
         
         # Extract syndrome components from packed result

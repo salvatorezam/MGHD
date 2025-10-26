@@ -152,7 +152,8 @@ def run(args) -> None:
     if not args.ps:
         raise ValueError("No physical error rates provided via --ps")
 
-    mwpf_ctx = MWPFContext()
+    # MWPF teacher will be initialized per distance with code context
+    mwpf_ctx = None  # deprecated; using MWPFTeacher per code distance
     mwpm_ctx = MWPMatchingContext()
 
     shots_per = args.shots_per_grid
@@ -179,6 +180,15 @@ def run(args) -> None:
 
         for d in distances:
             code = get_code(family, distance=d)
+            # Initialize MWPF teacher for this code distance if requested
+            mwpf_teacher = None
+            if teacher_mix.get("mwpf", 0.0) > 0:
+                try:
+                    mwpf_teacher = MWPFTeacher(code)
+                except Exception as exc:
+                    print(f"Warning: MWPFTeacher unavailable ({exc}); disabling MWPF mix")
+                    teacher_mix["mwpf"] = 0.0
+                    mwpf_teacher = None
             # Build schedule IR and TAD features once per code distance
             ctx_vec = None
             llr_overrides = None
@@ -219,7 +229,7 @@ def run(args) -> None:
                 shard_items: List[Dict[str, object]] = []
                 for _ in range(shots_per):
                     seed = int(rng.integers(0, 2**31 - 1))
-                    sample = sample_round(d=d, p=p, seed=seed)
+                    sample = sample_round(d=d, p=p, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
 
                     lsd_preds: Dict[str, np.ndarray] = {}
                     if lsd_teacher is not None:
@@ -255,15 +265,38 @@ def run(args) -> None:
 
                             outputs: Dict[str, TeacherOutput] = {}
 
-                            bits_pf, w_pf = mwpf_ctx.decode(
-                                H_sub, synd_bits, side, dem_meta=sample.get("dem_meta")
-                            )
-                            outputs["mwpf"] = TeacherOutput(
-                                bits=bits_pf.astype(np.uint8),
-                                weight=int(w_pf),
-                                teacher="mwpf",
-                                valid=_parity_valid(bits_pf, synd_bits, H_sub),
-                            )
+                            if mwpf_teacher is not None:
+                                # Use global MWPF fault_ids and map to local bits
+                                dets_global = np.concatenate([
+                                    sample["synX"][np.newaxis, :].astype(np.uint8),
+                                    sample["synZ"][np.newaxis, :].astype(np.uint8),
+                                ], axis=1)
+                                # Per-fault scaling from LLR overrides if available
+                                mwpf_scale = None
+                                if llr_overrides is not None:
+                                    try:
+                                        probs = 1.0 / (1.0 + np.exp(llr_overrides))
+                                        scale_full = np.clip(probs / 0.5, 0.1, 10.0)
+                                        mwpf_scale = {int(i): float(s) for i, s in enumerate(scale_full)}
+                                    except Exception:
+                                        mwpf_scale = None
+                                try:
+                                    out_mwpf = mwpf_teacher.decode_batch(dets_global, mwpf_scale=mwpf_scale)
+                                    fid_arr = np.asarray(out_mwpf.get("fault_ids"), dtype=np.int32)
+                                    bits_pf_local = np.zeros(H_sub.shape[1], dtype=np.uint8)
+                                    if fid_arr.ndim == 2 and fid_arr.shape[0] >= 1:
+                                        valid_ids = fid_arr[0][fid_arr[0] >= 0]
+                                        if valid_ids.size:
+                                            mask = np.isin(qubit_indices, valid_ids)
+                                            bits_pf_local[mask] = 1
+                                    outputs["mwpf"] = TeacherOutput(
+                                        bits=bits_pf_local,
+                                        weight=int(bits_pf_local.sum()),
+                                        teacher="mwpf",
+                                        valid=_parity_valid(bits_pf_local, synd_bits, H_sub),
+                                    )
+                                except Exception:
+                                    pass
 
                             bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
                             outputs["mwpm"] = TeacherOutput(

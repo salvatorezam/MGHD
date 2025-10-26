@@ -353,3 +353,5 @@ mghd.egg-info/
 # Cache directories
 color_cache/
 dem_cache/
+# Cache and generated data
+color_cache/

@@ -434,10 +434,53 @@ def pack_syndrome_and_errors(syndrome: np.ndarray, x_errors: np.ndarray, z_error
     return np.concatenate([syndrome, errorxz], axis=1).astype(np.uint8)
 
 
+def _params_from_qpu_profile_json(path: str, n_qubits_fallback: int = 20) -> dict:
+    """Build noise-model params dict from a QPUProfile JSON (approximate mapping)."""
+    from mghd.codes.qpu_profile import load_qpu_profile
+    prof = load_qpu_profile(path)
+    ge = prof.gate_error
+    n = int(getattr(prof, "n_qubits", n_qubits_fallback) or n_qubits_fallback)
+    # 1Q fidelities from chosen gate (rx90), F = 1 - p
+    p1 = float(ge.p_1q.get("rx90", next(iter(ge.p_1q.values()), 0.001))) if ge.p_1q else 0.001
+    F1Q = {q: float(1.0 - p1) for q in range(n)}
+    # 2Q fidelities per coupler from 'cx' map if present, otherwise default
+    F2Q = {}
+    p2_src = ge.p_2q.get("cx") if ge.p_2q else None
+    p2_default = float(p2_src.get("default", 0.01)) if isinstance(p2_src, dict) else 0.01
+    for (i, j) in getattr(prof, "coupling", []):
+        key = str((int(i), int(j)))
+        p_pair = float(p2_src.get(key, p2_default)) if isinstance(p2_src, dict) else p2_default
+        F2Q[(int(i), int(j))] = float(1.0 - p_pair)
+    # T1/T2 per qubit, default to medians
+    T1_us = {q: float(ge.t1_us.get(str(q), 43.1)) for q in range(n)}
+    T2_us = {q: float(ge.t2_us.get(str(q), 2.8)) for q in range(n)}
+    # Measurement assignment error (use symmetric for eps0, eps1)
+    eps0 = {q: float(ge.p_meas) for q in range(n)}
+    eps1 = {q: float(ge.p_meas) for q in range(n)}
+    # Gate durations
+    t_prx_ns = 20.0
+    t_cz_ns = 40.0
+    durations = getattr(prof, "meta", {}).get("durations_ns", {})
+    if isinstance(durations, dict):
+        t_prx_ns = float(durations.get("prx", t_prx_ns))
+        t_cz_ns = float(durations.get("cz", t_cz_ns))
+    return {
+        'F1Q': F1Q,
+        'F2Q': F2Q,
+        'T1_us': T1_us,
+        'T2_us': T2_us,
+        'eps0': eps0,
+        'eps1': eps1,
+        't_prx_ns': t_prx_ns,
+        't_cz_ns': t_cz_ns,
+    }
+
+
 def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: dict[str, Any],
                         rng: np.random.Generator, bitpack: bool = False,
                         surface_layout: str = "planar",
-                        phys_p: float = None, noise_scale: float = None) -> np.ndarray:
+                        phys_p: float = None, noise_scale: float = None,
+                        profile_json: str | None = None) -> np.ndarray:
     """
     Sample surface code syndromes using CUDA-Q with circuit-level noise.
     
@@ -453,14 +496,17 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: dict[str, A
         Packed syndrome + error array matching the legacy training format
     """
     # Initialize noise model based on mode
-    if mode == "foundation":
-        priors = GarnetFoundationPriors()
-        params = priors.sample_pseudo_device(rng, n_qubits=20)
-    elif mode == "student":
-        calibration = GarnetStudentCalibration(n_qubits=20)
-        params = calibration.to_dict()
+    if profile_json:
+        params = _params_from_qpu_profile_json(profile_json)
     else:
-        raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
+        if mode == "foundation":
+            priors = GarnetFoundationPriors()
+            params = priors.sample_pseudo_device(rng, n_qubits=20)
+        elif mode == "student":
+            calibration = GarnetStudentCalibration(n_qubits=20)
+            params = calibration.to_dict()
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
     
     # Determine noise scaling from requested phys_p or explicit noise_scale
     scale = 1.0

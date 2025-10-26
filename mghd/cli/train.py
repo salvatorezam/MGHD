@@ -21,6 +21,13 @@ from torch.utils.data import Dataset, Sampler, DataLoader
 
 from mghd.decoders.lsd import clustered as cc  # uses projector functions
 from mghd.core.core import MGHDv2, PackedCrop
+from mghd.decoders.lsd_teacher import LSDTeacher
+from mghd.decoders.mwpf_teacher import MWPFTeacher
+from mghd.decoders.mwpm_ctx import MWPMatchingContext
+from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_side
+from mghd.tad import weighting as tad_weighting
+from mghd.tad import context as tad_context
+from mghd.codes.qpu_profile import load_qpu_profile
 
 
 class CropShardDataset(Dataset):
@@ -214,6 +221,15 @@ def train_inprocess(ns) -> str:
     args = ns
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, required=False)
+    parser.add_argument("--online", action="store_true", help="Enable on-the-fly CUDA-Q sampling")
+    parser.add_argument("--family", type=str, default="surface")
+    parser.add_argument("--distance", type=int, default=3)
+    parser.add_argument("--p", type=float, default=0.005, help="Physical error rate for online sampling")
+    parser.add_argument("--qpu-profile", type=str, default=None)
+    parser.add_argument("--context-source", type=str, default="none", choices=["none","qiskit","cirq","cudaq"]) 
+    parser.add_argument("--shots-per-epoch", type=int, default=256)
+    parser.add_argument("--teacher-mix", type=str, default="mwpf=1.0,mwpm=0.0,lsd=0.0")
+    parser.add_argument("--online-rl", action="store_true", help="Enable LinTS scaling of TAD overrides in online mode")
     parser.add_argument("--profile", type=str, default="S")
     parser.add_argument("--ema", type=float, default=0.999)
     parser.add_argument("--lr", type=float, default=5.952925899948483e-05)
@@ -258,34 +274,295 @@ def train_inprocess(ns) -> str:
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
-    ds = CropShardDataset(args.data_root)
-    sampler = make_bucket_sampler(ds, stage="stage1", seed=args.seed)
-    loader = DataLoader(
-        ds,
-        batch_size=args.batch,
-        sampler=sampler,
-        collate_fn=lambda batch: batch,
-    )
+    loader = None
+    use_online = bool(getattr(args, "online", False))
+    if not use_online:
+        ds = CropShardDataset(args.data_root)
+        sampler = make_bucket_sampler(ds, stage="stage1", seed=args.seed)
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch,
+            sampler=sampler,
+            collate_fn=lambda batch: batch,
+        )
 
     save_dir = Path(args.save)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     best_loss = float("inf")
     history: list[dict[str, Any]] = []
+    def _build_tad_for_code(code_obj):
+        qpu_prof = None
+        ctx_vec = None
+        llr_overrides = None
+        if args.qpu_profile and args.context_source != "none":
+            try:
+                qpu_prof = load_qpu_profile(args.qpu_profile)
+            except Exception:
+                qpu_prof = None
+        if qpu_prof is not None:
+            # Attempt schedule IR extraction via adapters if native circuit present
+            try:
+                native = None
+                for attr in ("native_circuit","reference_circuit","circuit","qc","quantum_circuit"):
+                    if hasattr(code_obj, attr):
+                        native = getattr(code_obj, attr)
+                        if native is not None:
+                            break
+                schedule_ir = []
+                if native is not None:
+                    import sys as _sys
+                    if args.context_source == "qiskit" and "qiskit" in _sys.modules:
+                        from mghd.qpu.adapters import qiskit_adapter
+                        schedule_ir = qiskit_adapter.to_schedule_ir(native)
+                    elif args.context_source == "cirq" and "cirq" in _sys.modules:
+                        from mghd.qpu.adapters import cirq_adapter  # type: ignore
+                        schedule_ir = cirq_adapter.to_schedule_ir(native)
+                    elif args.context_source == "cudaq" and "cudaq" in _sys.modules:
+                        from mghd.qpu.adapters import cudaq_adapter  # type: ignore
+                        schedule_ir = cudaq_adapter.to_schedule_ir(native)
+                n_qubits = getattr(code_obj, "n", None) or int(code_obj.Hx.shape[1])
+                maps = tad_weighting.schedule_to_weight_maps(schedule_ir, qpu_prof, n_qubits)
+                feats = tad_weighting.feature_vector(schedule_ir)
+                gate_vocab = {g:i for i,g in enumerate(sorted(feats.get("gate_hist",{}).keys()))}
+                ctx_vec = tad_context.context_vector(feats, gate_vocab)
+                # Build per-qubit LLR override
+                import numpy as _np
+                llr = _np.zeros(int(n_qubits), dtype=_np.float32)
+                for layer in (maps.get("w_qubit",{}) or {}).values():
+                    for q, w in layer.items():
+                        idx = int(q)
+                        if 0 <= idx < llr.size:
+                            llr[idx] += float(w)
+                llr_overrides = llr if llr.size else None
+            except Exception:
+                ctx_vec = None
+                llr_overrides = None
+        return qpu_prof, ctx_vec, llr_overrides
+
+    def _parse_teacher_mix(spec: str):
+        weights = {"mwpf": 1.0, "mwpm": 0.0, "lsd": 0.0}
+        if not spec:
+            return weights
+        for chunk in spec.split(","):
+            if "=" not in chunk:
+                continue
+            name, value = chunk.split("=", 1)
+            try:
+                weights[name.strip().lower()] = float(value)
+            except ValueError:
+                continue
+        for k in weights:
+            weights[k] = max(0.0, weights[k])
+        if sum(weights.values()) == 0.0:
+            weights["mwpf"] = 1.0
+        return weights
+
+    bandit = None
+    prev_epoch_loss = None
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
         total_loss = 0.0
         n_items = 0
-        for batch in loader:
-            if not batch:
-                continue
-            moved = [move_to(packed, device) for packed in batch]
-            if args.noise_injection > 0.0:
-                std = float(args.noise_injection)
-                for packed in moved:
-                    packed.x_nodes = packed.x_nodes + torch.randn_like(packed.x_nodes) * std
-            opt.zero_grad(set_to_none=True)
+        if use_online:
+            # Teacher setup per epoch
+            family = args.family
+            if family != "surface":
+                raise NotImplementedError("Online training currently supports family='surface'")
+            # Build code object
+            from mghd.codes.registry import get_code
+            code = get_code(family, distance=args.distance)
+            # Initialize MWPFTeacher once per epoch
+            mwpf_teacher = None
+            try:
+                mwpf_teacher = MWPFTeacher(code)
+            except Exception:
+                mwpf_teacher = None
+            mwpm_ctx = MWPMatchingContext()
+            lsd_teacher = None
+            try:
+                lsd_teacher = LSDTeacher(code.Hx, code.Hz)
+            except Exception:
+                lsd_teacher = None
+            teacher_mix = _parse_teacher_mix(getattr(args, "teacher_mix", "mwpf=1.0,mwpm=0.0,lsd=0.0"))
+            # TAD context/overrides
+            qpu_prof, ctx_vec, llr_overrides = _build_tad_for_code(code)
+            # Initialize bandit once if requested and context available
+            if args.online_rl and ctx_vec is not None and bandit is None:
+                try:
+                    from mghd.tad.rl.lin_ts import LinTSBandit
+                    bandit = LinTSBandit(d=ctx_vec.size, prior_var=5.0, noise_var=0.5)
+                except Exception:
+                    bandit = None
+            import numpy as _np
+            rng = _np.random.default_rng(args.seed + epoch)
+            batch_buf: list[PackedCrop] = []
+            shots_target = int(getattr(args, "shots_per_epoch", args.batch))
+            shots_done = 0
+            while shots_done < shots_target:
+                seed = int(rng.integers(0, 2**31 - 1))
+                sample = sample_round(d=args.distance, p=args.p, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
+                # Build global detector stream [X then Z] for MWPFTeacher
+                dets_global = np.concatenate([
+                    sample["synX"][np.newaxis, :].astype(np.uint8),
+                    sample["synZ"][np.newaxis, :].astype(np.uint8),
+                ], axis=1)
+                # Global per-fault scaling dict
+                mwpf_scale = None
+                if llr_overrides is not None:
+                    probs = 1.0/(1.0+_np.exp(llr_overrides))
+                    scale_full = _np.clip(probs/0.5, 0.1, 10.0)
+                    mwpf_scale = {int(i): float(s) for i, s in enumerate(scale_full)}
+                fault_ids_global = None
+                if mwpf_teacher is not None:
+                    try:
+                        out_mwpf = mwpf_teacher.decode_batch(dets_global, mwpf_scale=mwpf_scale)
+                        fid_arr = _np.asarray(out_mwpf.get("fault_ids"), dtype=_np.int32)
+                        if fid_arr.ndim == 2 and fid_arr.shape[0] >= 1:
+                            fault_ids_global = fid_arr[0]
+                    except Exception:
+                        fault_ids_global = None
+                for side in ("Z","X"):
+                    comps = split_components_for_side(
+                        side=side,
+                        Hx=sample["Hx"], Hz=sample["Hz"],
+                        synZ=sample["synZ"], synX=sample["synX"],
+                        coords_q=sample["coords_q"], coords_c=sample["coords_c"],
+                    )
+                    for comp in comps:
+                        H_sub = comp["H_sub"]
+                        synd_bits = comp["synd_bits"]
+                        qubit_indices = comp["qubit_indices"]
+                        # Candidate outputs
+                        outputs = {}
+                        # MWPFTeacher fault_ids mapped to local bits
+                        if fault_ids_global is not None:
+                            local_bits = _np.zeros(H_sub.shape[1], dtype=_np.uint8)
+                            valid_ids = fault_ids_global[fault_ids_global >= 0]
+                            if valid_ids.size:
+                                mask = _np.isin(qubit_indices, valid_ids)
+                                local_bits[mask] = 1
+                            outputs["mwpf"] = (local_bits, int(local_bits.sum()))
+                        # MWPM fallback
+                        bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
+                        outputs["mwpm"] = (bits_pm.astype(_np.uint8), int(w_pm))
+                        # LSD global converted to local
+                        if lsd_teacher is not None:
+                            try:
+                                ex_glob, ez_glob = lsd_teacher.decode_batch_xz(
+                                    syndromes_x=sample["synX"][None,:],
+                                    syndromes_z=sample["synZ"][None,:],
+                                    llr_overrides=llr_overrides,
+                                )
+                                bits_global = ex_glob[0] if side=="Z" else ez_glob[0]
+                                if qubit_indices.size and bits_global.size > qubit_indices.max():
+                                    bits_local = bits_global[qubit_indices].astype(_np.uint8)
+                                    outputs["lsd"] = (bits_local, int(bits_local.sum()))
+                            except Exception:
+                                pass
+                        # choose teacher by weighted random among valid
+                        weighted = []
+                        for name,(bits, w) in outputs.items():
+                            if teacher_mix.get(name,0.0) > 0:
+                                weighted.append((name, bits, w, teacher_mix[name]))
+                        chosen_bits = None
+                        if weighted:
+                            total_w = sum(w for *_, w in weighted)
+                            r = float(rng.random() * max(total_w,1e-9))
+                            acc=0.0
+                            for name,bits,w,tw in weighted:
+                                acc += tw
+                                if r <= acc:
+                                    chosen_bits = bits
+                                    break
+                        if chosen_bits is None:
+                            continue
+                        pack = pack_cluster(
+                            H_sub=H_sub,
+                            xy_qubit=comp["xy_qubit"],
+                            xy_check=comp["xy_check"],
+                            synd_Z_then_X_bits=synd_bits,
+                            k=int(comp["k"]),
+                            r=int(comp["r"]),
+                            bbox_xywh=tuple(int(v) for v in comp["bbox_xywh"]),
+                            kappa_stats=comp.get("kappa_stats", {}),
+                            y_bits_local=chosen_bits,
+                            side=side,
+                            d=args.distance,
+                            p=args.p,
+                            seed=seed,
+                            N_max=args.N_max if hasattr(args,"N_max") else 512,
+                            E_max=args.E_max if hasattr(args,"E_max") else 4096,
+                            S_max=args.S_max if hasattr(args,"S_max") else 512,
+                            g_extra=ctx_vec,
+                        )
+                        batch_buf.append(move_to(pack, device))
+                        if len(batch_buf) >= args.batch:
+                            # run a step
+                            moved = batch_buf
+                            batch_buf = []
+                            batch_loss = torch.zeros((), device=device)
+                            for packed in moved:
+                                logits, node_mask = model(packed=packed)
+                                logits = logits.squeeze(0)
+                                node_mask = node_mask.squeeze(0)
+                                hard = 1.0
+                                sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
+                                loss_bce = bce_binary_head_loss(
+                                    logits,
+                                    node_mask,
+                                    packed.node_type,
+                                    packed.y_bits,
+                                    sample_weight=sample_weight,
+                                    label_smoothing=args.label_smoothing,
+                                )
+                                loss_par = args.parity_lambda * parity_auxiliary_loss(
+                                    logits,
+                                    node_mask,
+                                    packed.node_type,
+                                    H_sub=packed.H_sub,
+                                )
+                                loss_proj = torch.tensor(0.0, device=device)
+                                if args.projection_aware:
+                                    data_mask = (packed.node_type == 0) & node_mask
+                                    proj_bits = projection_aware_logits_to_bits(
+                                        logits,
+                                        projector_kwargs={"H_sub": packed.H_sub, "side": getattr(packed.meta, "side", "Z")},
+                                        data_mask=data_mask,
+                                    )
+                                    with torch.no_grad():
+                                        mask_data = data_mask.detach().cpu().numpy()
+                                        target_full = packed.y_bits.detach().cpu().numpy().clip(0,1).astype(_np.uint8)
+                                        target_data = target_full[mask_data]
+                                    proj_target = torch.from_numpy(target_data).to(device)
+                                    proj_pred = torch.from_numpy(proj_bits.astype(_np.int64)).to(device)
+                                    raw_bits = (torch.sigmoid(logits[:,1]-logits[:,0])[data_mask] > 0.5).long()
+                                    loss_proj = 0.5*F.l1_loss(proj_pred.float(), proj_target.float()) + 0.2*F.l1_loss(proj_pred.float(), raw_bits.float())
+                                sample_loss = loss_bce + loss_par + 0.5*loss_proj
+                                batch_loss = batch_loss + sample_loss
+                            batch_size = len(moved)
+                            batch_loss = batch_loss / batch_size
+                            batch_loss.backward()
+                            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+                            opt.step(); opt.zero_grad(set_to_none=True)
+                            total_loss += batch_loss.item() * batch_size
+                            n_items += batch_size
+                            shots_done += 1
+                            if shots_done >= shots_target:
+                                break
+                if shots_done >= shots_target:
+                    break
+        else:
+            for batch in loader:
+                if not batch:
+                    continue
+                moved = [move_to(packed, device) for packed in batch]
+                if args.noise_injection > 0.0:
+                    std = float(args.noise_injection)
+                    for packed in moved:
+                        packed.x_nodes = packed.x_nodes + torch.randn_like(packed.x_nodes) * std
+                opt.zero_grad(set_to_none=True)
 
             batch_loss = torch.zeros((), device=device)
             for packed in moved:
@@ -347,6 +624,11 @@ def train_inprocess(ns) -> str:
         dt = time.time() - t0
         avg = total_loss / max(n_items, 1)
         history.append({"epoch": epoch, "loss": avg, "count": n_items, "secs": dt})
+        # Bandit posterior update with simple reward: 1.0 if loss decreased, else 0.0
+        if bandit is not None and prev_epoch_loss is not None and ctx_vec is not None:
+            reward = 1.0 if avg < prev_epoch_loss else 0.0
+            bandit.update(ctx_vec, reward)
+        prev_epoch_loss = avg
 
         torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
         if avg < best_loss:

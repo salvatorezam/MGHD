@@ -33,6 +33,7 @@ def cudaq_sample_surface_wrapper(
     rng: np.random.Generator | None = None,
     bitpack: bool = False,
     surface_layout: str = "planar",
+    profile_json: str | None = None,
 ) -> np.ndarray:
     if mode not in ["foundation", "student"]:
         raise ValueError("Invalid mode: must be 'foundation' or 'student'")
@@ -52,6 +53,7 @@ def cudaq_sample_surface_wrapper(
         rng=rng,
         bitpack=bitpack,
         surface_layout=surface_layout,
+        profile_json=profile_json,
     )
     expected_x = len(layout.get("ancilla_x", []))
     expected_z = len(layout.get("ancilla_z", []))
