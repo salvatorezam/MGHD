@@ -35,6 +35,57 @@ The decoder is designed for real-time performance while maintaining high accurac
 
 ---
 
+## How MGHD Works
+
+- Data Flow
+  - Codes: `mghd.codes.registry.get_code()` yields CSS-style codes (Hx/Hz, coordinates, metadata).
+  - Sampling: CUDA‑Q (`mghd.samplers.cudaq_sampler.CudaQSampler`) or Stim (`mghd.samplers.stim_sampler.StimSampler`) generates detection events and metadata per round.
+  - Teachers: MWPF, LSD, and MWPM produce supervision labels; a weighted mix selects the target.
+  - Packing: `mghd.core.core.pack_cluster` converts each local cluster into tensors for the model.
+  - Model: `mghd.core.core.MGHDv2` consumes packed crops and predicts data‑qubit corrections.
+
+- Sampling Backends
+  - CUDA‑Q (trajectories): Circuit‑level noise driven by the QPU profile JSON; used for online training via `--online`.
+  - Stim (Pauli): Fast Pauli/twirled approximation for A/B checks and smoke tests.
+
+- Teachers and Labels
+  - MWPFTeacher (`mghd.decoders.mwpf_teacher`): Hypergraph decoder on detector streams; accepts optional `mwpf_scale` (per‑fault scaling derived from TAD LLRs).
+  - LSDTeacher (`mghd.decoders.lsd_teacher`): BP+OSD on CSS parity checks; supports LLR overrides from TAD.
+  - MWPMFallback (`mghd.decoders.mwpm_fallback`): Classical matching from H, used as fallback or in teacher mixes.
+  - Mix selection (`--teacher-mix`): Weighted random choice per crop among available teachers.
+
+- TAD and RL
+  - QPU profile JSON (`mghd/qpu/profiles/*.json`) and optional schedule IR (qiskit/cirq/cudaq) yield per‑qubit weight maps and a compact context vector.
+  - LLR overrides bias teacher decisions; also converted to `mwpf_scale` for MWPF.
+  - Optional online RL (`--online-rl`) applies LinTS to adapt TAD scaling per epoch from context features.
+
+- Packing and Features
+  - `pack_cluster` builds per‑node features: normalized coordinates, node type (data/check), degree, crop stats, and optional erasure flag for data qubits.
+  - Global context (`g_token`) appends crop stats and TAD context features to condition the model.
+  - Sequence indices order checks by a 2D Hilbert curve to supply a stable temporal structure to the sequence encoder.
+
+- MGHD Model
+  - Sequence encoder: Mamba‑family encoder processes node features in sequence space with masks.
+  - ChannelSE: Channel squeeze‑and‑excitation reweights feature channels (configurable `se_reduction`).
+  - GraphDecoder: Iterative message passing (n_iters), GRU‑based updates, and an MLP message network; outputs a 2‑logit binary head per node; only data nodes are supervised.
+
+- Training Losses
+  - BCE/CE on data‑node logits with optional label smoothing and example weighting.
+  - Parity auxiliary loss: encourages parity consistency with the local H submatrix.
+  - Projection‑aware loss: projects probabilities via exact GF(2) projector (LSD clustered util) and aligns thresholded bits with targets.
+
+- Modes and Loops
+  - Offline: Train from pre‑packed crops (`mghd-make-crops` → `.npz` shards) using `mghd-train --data-root`.
+  - Online: On‑the‑fly CUDA‑Q sampling (`--online`) with teachers, TAD, and optional RL; erasure injection supported via `--erasure-frac`.
+
+- Erasure Awareness
+  - Samplers can provide or inject erasure masks; `pack_cluster` adds a per‑data‑qubit erasure feature; teachers consume masks when available.
+  - The node feature dimension increases by 1 when erasures are used; not tied to code distance or family.
+
+- Inference
+  - The wrapper collates per‑crop tensors, applies the model, and scatters per‑data‑qubit probabilities back to the code’s local index set for metric computation.
+
+
 ## Installation
 
 ### Requirements
@@ -61,40 +112,42 @@ pip install -e ".[dev]"
 
 ## Quick Start
 
-### Training a Model
+### Training
 
-Train on surface codes with distances 3-31, using CUDA-Q sampler:
-
-```bash
-mghd-train \
-    --family surface \
-    --distances 3-31:2 \
-    --sampler cudaq \
-    --shots-per-batch 128 \
-    --batches 10 \
-    --seed 0
-```
-
-Train across multiple code families:
+Offline (pre-packed crops):
 
 ```bash
 mghd-train \
-    --families "surface,color_666,steane,repetition" \
-    --distances 3-11:2 \
-    --sampler stim \
-    --shots-per-batch 64 \
-    --batches 5
+  --data-root MGHD-data/crops \
+  --save checkpoints/run1 \
+  --epochs 30 --batch 512
 ```
 
-### Running Benchmarks
-
-Benchmark the trained decoder:
+Online (on-the-fly CUDA‑Q trajectories) with TAD + optional RL scaling and erasure awareness:
 
 ```bash
-mghd-bench \
-    --family surface \
-    --distance 5 \
-    --model-path checkpoints/mghd_best.pt
+mghd-train \
+  --online \
+  --family surface --distance 3 \
+  --p 0.005 \
+  --qpu-profile mghd/qpu/profiles/iqm_garnet_example.json \
+  --context-source qiskit \
+  --teacher-mix "mwpf=0.7,mwpm=0.2,lsd=0.1" \
+  --online-rl \
+  --erasure-frac 0.05 \
+  --shots-per-epoch 256 \
+  --save checkpoints/online
+```
+
+Teacher evaluation (LER, DEM A/B, TAD weighting):
+
+```bash
+mghd-teacher-eval \
+  --families surface \
+  --distances 3 \
+  --sampler stim \
+  --shots-per-batch 8 \
+  --batches 2
 ```
 
 ### Validation & Preflight Checks
@@ -117,16 +170,12 @@ mghd-preflight \
 ```
 mghd/
 ├── cli/                    # Command-line tools
-│   ├── train_core.py      # Training entrypoint
-│   ├── bench_decode.py    # Benchmarking tool
-│   └── preflight_mghd.py  # System validation
+│   ├── train.py               # Training (offline + online)
+│   ├── make_cluster_crops.py  # Crop dataset generator
+│   └── preflight_mghd.py      # System validation
 │
 ├── core/                   # Neural network implementation
-│   ├── model_v2.py        # Hybrid Mamba-GNN architecture
-│   ├── blocks.py          # Building blocks (ChannelSE, AstraGNN)
-│   ├── features_v2.py     # Feature extraction from syndromes
-│   ├── infer.py           # Inference engine
-│   └── config.py          # Model configuration
+│   └── core.py               # MGHDv2 model + packers + inference wrapper
 │
 ├── codes/                  # Quantum error correction codes
 │   ├── registry.py        # Code family registry and builders
@@ -134,16 +183,17 @@ mghd/
 │   └── qpu_profile.py     # QPU-specific code profiles
 │
 ├── samplers/               # Error sampling backends
-│   ├── cudaq_sampler.py   # CUDA-Q circuit-level sampler
-│   ├── stim_sampler.py    # Stim Pauli-channel sampler
-│   └── cudaq_backend/     # CUDA-Q integration
+│   ├── cudaq_sampler.py      # CUDA-Q circuit-level sampler
+│   ├── stim_sampler.py       # Stim Pauli-channel sampler
+│   └── cudaq_backend/        # CUDA-Q kernels + noise model
 │
 ├── decoders/               # Teacher decoders and baselines
 │   ├── mwpf_teacher.py    # MWPF hypergraph decoder
 │   ├── lsd_teacher.py     # LSD (BP+OSD) decoder
 │   ├── mwpm_fallback.py   # Classical MWPM decoder
-│   ├── dem_matching.py    # DEM-based matching
-│   └── ensemble.py        # Teacher ensemble
+│   ├── dem_matching.py       # DEM-based matching
+│   └── ensemble.py           # Teacher ensemble helpers
+│   └── lsd/clustered.py      # Projector + clustered decoder
 │
 ├── tad/                    # Teacher-Assisted Decoding
 │   ├── weighting.py       # Adaptive teacher weighting
@@ -157,15 +207,12 @@ mghd/
     └── graphlike.py       # Graph structure validation
 ```
 
-### Model Architecture
+### Model + Training Features
 
-The MGHD decoder processes syndrome measurements through:
-
-1. **Feature Extraction**: Converts raw syndromes to node/edge features
-2. **Mamba Encoder**: Captures temporal/sequential patterns in syndrome sequences
-3. **GNN Layers**: Propagates information across qubit connectivity graph
-4. **Channel SE**: Attention-based feature refinement
-5. **Decoder Head**: Predicts logical error corrections
+- MGHDv2: Mamba (sequence) + ChannelSE + GNN (graph message passing)
+- TAD: schedule-aware priors (LLR) + context features from QPU JSON (qiskit/cirq/cudaq adapters)
+- Online RL: optional LinTS scaling of TAD priors per epoch (--online-rl)
+- Erasure-aware: sampler can inject erasures (--erasure-frac); teachers consume masks; model sees per-qubit erasure flags in node features
 
 ---
 
@@ -197,8 +244,29 @@ Main training interface with teacher-supervised learning.
 - `--context-source`: Context injection source (qiskit, cirq, cudaq)
 - `--rl-online`: Enable online reinforcement learning
 
-### `mghd-bench`
-Benchmarking and evaluation tool for trained models.
+### `mghd-teacher-eval`
+Teacher evaluation, LER estimation, and DEM A/B checks across families.
+
+### `mghd-make-crops`
+Generate offline crop datasets (packed subgraphs + labels) using teacher supervision. Useful for fast offline training or sharing reproducible corpora.
+
+Example:
+
+```bash
+mghd-make-crops \
+  --families surface \
+  --distances 3-9:2 \
+  --ps 0.003 0.006 0.01 \
+  --teacher-mix "mwpf=0.7,mwpm=0.2,lsd=0.1" \
+  --qpu-profile mghd/qpu/profiles/iqm_garnet_example.json \
+  --context-source qiskit \
+  --shots-per-grid 256 \
+  --out MGHD-data/crops
+```
+
+Notes:
+- Produces `.npz` shards containing `packed` items (tensors + metadata) compatible with offline `mghd-train`.
+- TAD context and LLR overrides are derived from the QPU profile and optional schedule IR when `--context-source` is provided.
 
 ### `mghd-preflight`
 Comprehensive validation suite checking:
@@ -209,6 +277,26 @@ Comprehensive validation suite checking:
 - Logical error rate validation
 
 ---
+
+## Hyperparameters
+
+- Provide a JSON hyperparameter file via `--hparams` to control model, Mamba, attention, and training settings. Example: `mghd/config/hparams.json`.
+- Keys supported by the trainer:
+  - `model_architecture`: `n_iters`, `msg_net_size`, `msg_net_dropout_p`, `gru_dropout_p`
+  - `mamba_parameters`: `d_model`, `d_state`
+  - `attention_mechanism`: `se_reduction`
+  - `training_parameters`: `lr`, `weight_decay`, `label_smoothing`, `gradient_clip`, `noise_injection`, `epochs`, `batch_size`
+
+Example:
+
+```bash
+mghd-train \
+  --online \
+  --family surface --distance 3 \
+  --qpu-profile mghd/qpu/profiles/iqm_garnet_example.json \
+  --hparams mghd/config/hparams.json \
+  --save checkpoints/online
+```
 
 ## Development
 
@@ -302,7 +390,6 @@ This is a research project. For questions or collaboration inquiries, please ope
 ## Acknowledgments
 
 - Built on top of CUDA-Q for quantum circuit simulation
-- Uses Stim for efficient Pauli error sampling  
+- Uses Stim for efficient Pauli error sampling
 - Integrates PyMatching for classical MWPM baseline
 - Leverages MWPF for hypergraph-based decoding
-- Inspired by Astra GNN architecture for quantum decoding

@@ -1,9 +1,8 @@
 import numpy as np
 import pytest
+from mghd.core.core import pack_cluster
 
 torch = pytest.importorskip("torch")
-
-from mghd_public.features_v2 import pack_cluster
 
 
 def build_sample_cluster():

@@ -88,7 +88,7 @@ def test_route_batch_passes_mwpf_scale(monkeypatch):
             captured_scale["scale"] = mwpf_scale
             return {"fault_ids": np.zeros((1, 1), dtype=np.int32), "weights": np.zeros(1, dtype=np.float32)}
 
-    monkeypatch.setattr("teachers.mix.MWPFTeacher", StubMWPF)
+    monkeypatch.setattr("mghd.decoders.mix.MWPFTeacher", StubMWPF)
 
     mix = TeacherMix(code, code.Hx, code.Hz, mix_cfg=MixConfig(p_mwpf=1.0, p_lsd=0.0, p_mwpm=0.0))
 
@@ -109,9 +109,9 @@ def test_route_batch_passes_mwpf_scale(monkeypatch):
 
 
 def test_weighting_modules_importable():
-    mix = importlib.import_module("teachers.mix")
-    lsd = importlib.import_module("teachers.lsd_teacher")
-    mwpm = importlib.import_module("teachers.mwpm_fallback")
+    mix = importlib.import_module("mghd.decoders.mix")
+    lsd = importlib.import_module("mghd.decoders.lsd_teacher")
+    mwpm = importlib.import_module("mghd.decoders.mwpm_fallback")
     assert hasattr(mix, "TeacherMix")
     assert hasattr(lsd, "LSDTeacher")
     assert hasattr(mwpm, "MWPMFallback")

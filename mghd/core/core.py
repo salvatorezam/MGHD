@@ -29,8 +29,73 @@ class MGHDConfig:
     n_node_inputs: int = 9
     n_node_outputs: int = 2  # binary head for rotated d=3
 
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+def to_dict(self) -> Dict[str, Any]:
+    return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Minimal CSS helpers (moved from codes.pcm_real for consolidation)
+# ---------------------------------------------------------------------------
+
+
+def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
+    """Return rotated surface code parity-check matrix for odd distance d.
+
+    This constructs a simple rotated surface code adjacency where each check
+    touches up to 5 data qubits (center + 4-neighbors) depending on lattice
+    bounds. It matches the previous helper in mghd.codes.pcm_real.
+    """
+    if d % 2 == 0 or d < 1:
+        raise ValueError("rotated_surface_pcm requires odd d >= 1")
+
+    side = side.upper()
+    if side not in {"X", "Z"}:
+        raise ValueError("side must be 'X' or 'Z'")
+
+    n_qubits = d * d
+    n_checks = (d * d - 1) // 2
+
+    rows: List[int] = []
+    cols: List[int] = []
+    row_idx = 0
+
+    def q_index(r: int, c: int) -> int:
+        return r * d + c
+
+    center = d // 2
+
+    for r in range(d):
+        for c in range(d):
+            parity = (r + c) % 2
+            include = False
+            if side == "Z":
+                include = (parity == 1)
+            else:  # side == 'X'
+                include = (parity == 0) and not (r == center and c == center)
+            if not include:
+                continue
+
+            qubits = {q_index(r, c)}
+            if r - 1 >= 0:
+                qubits.add(q_index(r - 1, c))
+            if r + 1 < d:
+                qubits.add(q_index(r + 1, c))
+            if c - 1 >= 0:
+                qubits.add(q_index(r, c - 1))
+            if c + 1 < d:
+                qubits.add(q_index(r, c + 1))
+
+            for q in sorted(qubits):
+                rows.append(row_idx)
+                cols.append(q)
+            row_idx += 1
+
+    if row_idx != n_checks:
+        raise AssertionError(f"Constructed {row_idx} checks, expected {n_checks}")
+
+    data = np.ones(len(rows), dtype=np.uint8)
+    H = sp.coo_matrix((data, (rows, cols)), shape=(n_checks, n_qubits)).tocsr()
+    return H
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +230,8 @@ def pack_cluster(
     bucket_spec: Optional[Sequence[Tuple[int, int, int]]] = None,
     add_jump_edges: bool = True,
     jump_k: int = 2,
+    g_extra: Optional[np.ndarray] = None,
+    erase_local: Optional[np.ndarray] = None,
 ) -> PackedCrop:
     assert side in ("Z", "X")
     nC, nQ = H_sub.shape
@@ -184,7 +251,25 @@ def pack_cluster(
     for key in ("size", "radius", "ecc", "bdensity"):
         if key in kappa_stats:
             g_list.append(float(kappa_stats[key]))
+    # Optional global context features (e.g., TAD schedule/context vector)
+    if g_extra is not None:
+        try:
+            extra = np.asarray(g_extra, dtype=np.float32).ravel().tolist()
+            g_list.extend(extra)
+        except Exception:
+            pass
     g_token = torch.tensor(g_list, dtype=torch.float32)
+
+    # Optional per-node erasure feature (data-qubits only)
+    if erase_local is not None:
+        try:
+            er = np.asarray(erase_local, dtype=np.float32).ravel()
+            if er.size != nQ:
+                er = None
+        except Exception:
+            er = None
+    else:
+        er = None
 
     base_nodes = np.concatenate([
         xy01,
@@ -194,6 +279,7 @@ def pack_cluster(
         np.full((nQ + nC, 1), float(r), dtype=np.float32),
         np.full((nQ + nC, 1), float(bw), dtype=np.float32),
         np.full((nQ + nC, 1), float(bh), dtype=np.float32),
+        (np.concatenate([er if er is not None else np.zeros(nQ, dtype=np.float32), np.zeros(nC, dtype=np.float32)])[:, None]),
     ], axis=1)
 
     ci, qi = np.nonzero(H_sub)
@@ -481,14 +567,25 @@ class SequenceEncoder(nn.Module):
 class GraphDecoderAdapter(nn.Module):
     """Adapter over the graph decoder for v2 crops."""
 
-    def __init__(self, hidden_dim: int, edge_feat_dim: int, n_iters: int):
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_feat_dim: int,
+        n_iters: int,
+        *,
+        msg_net_size: Optional[int] = None,
+        msg_net_dropout_p: float = 0.0,
+        gru_dropout_p: float = 0.0,
+    ):
         super().__init__()
         self.core = GraphDecoder(
             n_iters=n_iters,
             n_node_inputs=hidden_dim,
             n_node_outputs=2,
             n_edge_features=edge_feat_dim,
-            msg_net_size=max(96, hidden_dim),
+            msg_net_size=max(96, hidden_dim) if msg_net_size is None else int(msg_net_size),
+            msg_net_dropout_p=float(msg_net_dropout_p),
+            gru_dropout_p=float(gru_dropout_p),
         )
         self.iter_override: Optional[int] = None
 
@@ -534,13 +631,24 @@ class MGHDv2(nn.Module):
         node_feat_dim: int = 8,
         edge_feat_dim: int = 3,
         g_dim: Optional[int] = None,
+        se_reduction: int = 4,
+        gnn_msg_net_size: Optional[int] = None,
+        gnn_msg_dropout: float = 0.0,
+        gnn_gru_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if g_dim is None:
             g_dim = max(8, node_feat_dim)
         self.seq_encoder = SequenceEncoder(d_model=d_model, d_state=d_state)
-        self.se = ChannelSE(channels=d_model)
-        self.gnn = GraphDecoderAdapter(hidden_dim=d_model, edge_feat_dim=edge_feat_dim, n_iters=n_iters)
+        self.se = ChannelSE(channels=d_model, reduction=int(se_reduction))
+        self.gnn = GraphDecoderAdapter(
+            hidden_dim=d_model,
+            edge_feat_dim=edge_feat_dim,
+            n_iters=n_iters,
+            msg_net_size=gnn_msg_net_size,
+            msg_net_dropout_p=gnn_msg_dropout,
+            gru_dropout_p=gnn_gru_dropout,
+        )
         self.node_in = nn.Linear(node_feat_dim, d_model)
         self.edge_in = nn.Linear(edge_feat_dim, d_model)
         self.g_proj: Optional[nn.Linear] = None

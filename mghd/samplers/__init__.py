@@ -10,7 +10,7 @@ Note:
   Stim's fast path assumes Pauli channels + stabilizer ops; use only for A/B checks.
 """
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable
 
 import numpy as np
 
@@ -21,14 +21,27 @@ class SampleBatch:
 
     dets: np.ndarray     # uint8 [B, D]
     obs: np.ndarray      # uint8 [B, K]
-    meta: Dict[str, Any]
-    erase_data_mask: Optional[np.ndarray] = None  # uint8/bool [B, n]
-    erase_det_mask: Optional[np.ndarray] = None   # uint8/bool [B, D]
-    p_erase_data: Optional[np.ndarray] = None     # float [B, n]
+    meta: dict[str, Any]
+    erase_data_mask: np.ndarray | None = None  # uint8/bool [B, n]
+    erase_det_mask: np.ndarray | None = None   # uint8/bool [B, D]
+    p_erase_data: np.ndarray | None = None     # float [B, n]
 
 
-from .registry import get_sampler, register_sampler
-from .cudaq_sampler import CudaQSampler  # ensures availability
+_REGISTRY: Dict[str, Callable[..., object]] = {}
+
+
+def register_sampler(name: str, factory: Callable[..., object]) -> None:
+    _REGISTRY[name] = factory
+
+
+def get_sampler(name: str, **kwargs):
+    if name not in _REGISTRY:
+        raise KeyError(f"Unknown sampler '{name}'. Available: {list(_REGISTRY)}")
+    return _REGISTRY[name](**kwargs)
+
+
+from .cudaq_sampler import CudaQSampler  # ensures availability and registers itself
+
 try:
     from .stim_sampler import StimSampler  # optional
 except Exception:

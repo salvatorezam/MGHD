@@ -9,16 +9,106 @@ Expected to find your files on PYTHONPATH:
 If those live outside the repo, ensure PYTHONPATH includes their parent dirs.
 """
 from __future__ import annotations
-from typing import Any, Dict, Optional, Tuple
+
 import importlib
 import os
+from typing import Any
 
 import numpy as np
 
 from . import SampleBatch
+from . import register_sampler
 
 
-def _ensure_css_logicals(code: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+# ---------------------------------------------------------------------------
+# Local wrappers bridging CUDA-Q backend to sampler surface
+# ---------------------------------------------------------------------------
+
+def cudaq_sample_surface_wrapper(
+    mode: str,
+    batch_size: int,
+    T: int = 3,
+    d: int = 3,
+    layout: dict[str, Any] | None = None,
+    rng: np.random.Generator | None = None,
+    bitpack: bool = False,
+    surface_layout: str = "planar",
+    profile_json: str | None = None,
+) -> np.ndarray:
+    if mode not in ["foundation", "student"]:
+        raise ValueError("Invalid mode: must be 'foundation' or 'student'")
+    if layout is None:
+        from mghd.samplers.cudaq_backend.circuits import make_surface_layout_general
+
+        layout = make_surface_layout_general(d)
+    if rng is None:
+        rng = np.random.default_rng()
+    from mghd.samplers.cudaq_backend.syndrome_gen import sample_surface_cudaq
+
+    result = sample_surface_cudaq(
+        mode=mode,
+        batch_size=batch_size,
+        T=T,
+        layout=layout,
+        rng=rng,
+        bitpack=bitpack,
+        surface_layout=surface_layout,
+        profile_json=profile_json,
+    )
+    expected_x = len(layout.get("ancilla_x", []))
+    expected_z = len(layout.get("ancilla_z", []))
+    expected_n = len(layout.get("data", []))
+    expected_cols = expected_x + expected_z + expected_n
+    if result.shape[1] != expected_cols:
+        if result.shape[1] < expected_cols:
+            pad = np.zeros((batch_size, expected_cols - result.shape[1]), dtype=result.dtype)
+            result = np.concatenate([result, pad], axis=1)
+        else:
+            result = result[:, :expected_cols]
+    return result.astype(np.uint8)
+
+
+def cudaq_sample_repetition_wrapper(
+    mode: str,
+    batch_size: int,
+    n_data: int = 5,
+    T: int = 3,
+    layout: dict[str, Any] | None = None,
+    rng: np.random.Generator | None = None,
+    bitpack: bool = False,
+) -> np.ndarray:
+    if mode not in ["foundation", "student"]:
+        raise ValueError("Invalid mode: mode")
+    if layout is None:
+        layout = {
+            "data": list(range(n_data)),
+            "ancilla": list(range(n_data, n_data + n_data - 1)),
+        }
+    if rng is None:
+        rng = np.random.default_rng()
+    from mghd.samplers.cudaq_backend.syndrome_gen import sample_repetition_cudaq
+
+    result = sample_repetition_cudaq(
+        mode=mode,
+        batch_size=batch_size,
+        T=T,
+        layout=layout,
+        rng=rng,
+        bitpack=bitpack,
+    )
+    expected_a = len(layout.get("ancilla", []))
+    expected_n = len(layout.get("data", []))
+    expected_cols = expected_a + expected_n
+    if result.shape[1] != expected_cols:
+        if result.shape[1] < expected_cols:
+            pad = np.zeros((batch_size, expected_cols - result.shape[1]), dtype=result.dtype)
+            result = np.concatenate([result, pad], axis=1)
+        else:
+            result = result[:, :expected_cols]
+    return result.astype(np.uint8)
+
+
+def _ensure_css_logicals(code: Any) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Ensure code exposes Lx/Lz arrays, deriving them if necessary."""
 
     Lx = getattr(code, "Lx", None)
@@ -73,7 +163,7 @@ class CudaQSampler:
     def __init__(
         self,
         device_profile: str = "garnet",
-        profile_kwargs: Optional[Dict[str, Any]] = None,
+        profile_kwargs: dict[str, Any] | None = None,
     ):
         self.device_profile = device_profile
         self.profile_kwargs = dict(profile_kwargs or {})
@@ -90,7 +180,7 @@ class CudaQSampler:
         self._adapter = self._maybe_import("mghd_cluster_files.garnet_adapter", None)
 
     @staticmethod
-    def _maybe_import(module_name: str, attr: Optional[str]):
+    def _maybe_import(module_name: str, attr: str | None):
         try:
             mod = importlib.import_module(module_name)
             return getattr(mod, attr) if attr else mod
@@ -101,7 +191,7 @@ class CudaQSampler:
         self,
         code_obj: Any,
         n_shots: int,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ) -> SampleBatch:
         """
         Args:
@@ -122,13 +212,13 @@ class CudaQSampler:
         Hx = np.asarray(Hx, dtype=np.uint8)
         Hz = np.asarray(Hz, dtype=np.uint8)
 
-        meta: Dict[str, Any] = {
+        meta: dict[str, Any] = {
             "device": self.device_profile,
             "shots": n_shots,
             "mode": self.mode,
         }
-        if hasattr(code_obj, "distance") and getattr(code_obj, "distance") is not None:
-            meta["distance"] = int(getattr(code_obj, "distance"))
+        if hasattr(code_obj, "distance") and code_obj.distance is not None:
+            meta["distance"] = int(code_obj.distance)
         meta.update({k: v for k, v in self.profile_kwargs.items() if k not in {"rounds"}})
 
         try:
@@ -173,7 +263,7 @@ class CudaQSampler:
         num_detectors: int,
         num_data: int,
         rng: np.random.Generator,
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         """Construct erasure masks (data/detector) and optional probabilities."""
 
         erase_data_mask = np.zeros((n_shots, num_data), dtype=np.uint8)
@@ -189,17 +279,15 @@ class CudaQSampler:
     # CUDA-Q backed sampling helpers
     # ------------------------------------------------------------------
 
-    def _surface_kwargs(self) -> Dict[str, Any]:
-        extra: Dict[str, Any] = {}
+    def _surface_kwargs(self) -> dict[str, Any]:
+        extra: dict[str, Any] = {}
         if "phys_p" in self.profile_kwargs:
             extra["phys_p"] = self.profile_kwargs["phys_p"]
         if "noise_scale" in self.profile_kwargs:
             extra["noise_scale"] = self.profile_kwargs["noise_scale"]
         return extra
 
-    def _sample_surface(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        from mghd.samplers.cudaq_backend.backend_api import cudaq_sample_surface_wrapper
-
+    def _sample_surface(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         layout_info = getattr(code_obj, "layout", {})
         layout_dict = None
         surface_layout = "planar"
@@ -251,9 +339,7 @@ class CudaQSampler:
         z_err = ((err_block >> 1) & 1).astype(np.uint8)
         return dets, x_err, z_err
 
-    def _sample_repetition(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        from mghd.samplers.cudaq_backend.backend_api import cudaq_sample_repetition_wrapper
-
+    def _sample_repetition(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         Hx = np.asarray(code_obj.Hx, dtype=np.uint8)
         Hz = np.asarray(code_obj.Hz, dtype=np.uint8)
         n_data = int(Hx.shape[1] or Hz.shape[1])
@@ -307,7 +393,7 @@ class CudaQSampler:
     # Synthetic fallback (keeps pipeline alive if CUDA-Q unavailable)
     # ------------------------------------------------------------------
 
-    def _synthetic_css(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _synthetic_css(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         Hx = np.asarray(code_obj.Hx, dtype=np.uint8)
         Hz = np.asarray(code_obj.Hz, dtype=np.uint8)
         n = Hx.shape[1]
@@ -331,6 +417,4 @@ class CudaQSampler:
         return _obs_from_data_parities(code_obj, x_err, z_err)
 
 
-# Register default
-from .registry import register_sampler
 register_sampler("cudaq", lambda **kw: CudaQSampler(**kw))

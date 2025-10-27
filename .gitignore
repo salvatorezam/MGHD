@@ -320,6 +320,8 @@ scratchpad/initial-test/models
 scratchpad/initial-test/plots
 scratchpad/initial-test/tmp
 
+# Preflight artifacts
+mghd/artifacts/
 
 # Quick access symlinks (read-only, not for git)
 scratchpad/initial-test/home-quick
@@ -347,3 +349,9 @@ docs/
 # Build artifacts
 mghd.egg-info/
 *.egg-info/
+
+# Cache directories
+color_cache/
+dem_cache/
+# Cache and generated data
+color_cache/

@@ -6,7 +6,7 @@ import pytest
 
 def test_cudaq_sampler_emits_obs_smoke():
     try:
-        sampler_mod = importlib.import_module("samplers.cudaq_sampler")
+        sampler_mod = importlib.import_module("mghd.samplers.cudaq_sampler")
     except Exception:
         pytest.skip("cudaq sampler module unavailable")
 
@@ -14,7 +14,7 @@ def test_cudaq_sampler_emits_obs_smoke():
     if CudaQSampler is None:
         pytest.skip("CudaQSampler not defined")
 
-    codes_registry = importlib.import_module("codes_registry")
+    codes_registry = importlib.import_module("mghd.codes.registry")
     code = codes_registry.get_code("surface", distance=3)
 
     sampler = CudaQSampler()

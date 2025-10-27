@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
 
-from mghd_clustered.cluster_core import ml_parity_project, gf2_nullspace
+from mghd.decoders.lsd.clustered import ml_parity_project, gf2_nullspace
 
 
 def test_ml_projector_satisfies_parity():

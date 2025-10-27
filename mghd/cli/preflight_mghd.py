@@ -7,18 +7,18 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
 
 
 @dataclass
 class StepResult:
     name: str
     status: str
-    details: Dict[str, object]
+    details: dict[str, object]
 
-    def to_summary(self) -> Dict[str, object]:
+    def to_summary(self) -> dict[str, object]:
         data = {"status": self.status}
         data.update(self.details)
         return data
@@ -32,13 +32,13 @@ class PreflightError(RuntimeError):
     """Raised when a blocking preflight error occurs."""
 
 
-def check_deps(log_path: Path) -> Dict[str, object]:
+def check_deps(log_path: Path) -> dict[str, object]:
     import importlib.metadata as im
 
     from packaging.version import Version  # type: ignore
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    versions: Dict[str, object] = {"cudaq_available": False}
+    versions: dict[str, object] = {"cudaq_available": False}
 
     def emit(line: str) -> None:
         print(line)
@@ -117,8 +117,8 @@ def run(cmd: Iterable[str], log_path: Path) -> subprocess.CompletedProcess[str]:
 LER_PATTERN = re.compile(r"LER(?:_(?P<kind>dem|mix))?\s*[:=]\s*(?P<value>[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)")
 
 
-def parse_ler(stdout: str) -> Dict[str, Optional[float]]:
-    results: Dict[str, Optional[float]] = {"dem": None, "mix": None}
+def parse_ler(stdout: str) -> dict[str, float | None]:
+    results: dict[str, float | None] = {"dem": None, "mix": None}
     for match in LER_PATTERN.finditer(stdout):
         kind = match.group("kind") or "mix"
         try:
@@ -153,14 +153,14 @@ def summarize(rows: Iterable[StepResult]) -> None:
         print(f"{row.name:<18}{status:<8}{detail}")
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
+def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser("MGHD preflight and validator")
     parser.add_argument("--families", default="surface")
     parser.add_argument("--distances", default="5")
     parser.add_argument("--shots-per-batch", type=int, default=64)
     parser.add_argument("--batches", type=int, default=50)
     parser.add_argument("--dem-rounds", type=int, default=5)
-    parser.add_argument("--qpu-profile", default="qpu_profiles/iqm_garnet_example.json")
+    parser.add_argument("--qpu-profile", default="mghd/qpu/profiles/iqm_garnet_example.json")
     parser.add_argument("--context-source", default="qiskit")
     parser.add_argument("--max-ler-dem", type=float, default=0.10)
     parser.add_argument("--max-ler-mix", type=float, default=0.10)
@@ -179,7 +179,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     artifact_root.mkdir(parents=True, exist_ok=True)
 
     summary_rows: list[StepResult] = []
-    summary_json: Dict[str, object] = {"arguments": vars(args)}
+    summary_json: dict[str, object] = {"arguments": vars(args)}
 
     # 1) Dependencies
     section("Dependency Check")
@@ -200,12 +200,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     summary_rows.append(StepResult("dependencies", "pass", {"message": "versions ok"}))
 
     # 2) PyTest
-    pytest_result: Optional[subprocess.CompletedProcess[str]] = None
+    pytest_result: subprocess.CompletedProcess[str] | None = None
     if args.run_pytest:
         section("PyTest")
         pytest_result = run([sys.executable, "-m", "pytest", "-q"], artifact_root / "pytest.txt")
         pytest_status = "pass" if pytest_result.returncode == 0 else "fail"
-        pytest_details: Dict[str, object] = {"returncode": pytest_result.returncode}
+        pytest_details: dict[str, object] = {"returncode": pytest_result.returncode}
         if pytest_status == "fail":
             pytest_details["note"] = "pytest failed"
         summary_rows.append(StepResult("pytest", pytest_status, pytest_details))
@@ -219,7 +219,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     stim_cmd = [
         sys.executable,
         "-m",
-        "tools.train_core",
+        "mghd.tools.teacher_eval",
         "--families",
         args.families,
         "--distances",
@@ -261,7 +261,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         cudaq_cmd = [
             sys.executable,
             "-m",
-            "tools.train_core",
+            "mghd.tools.teacher_eval",
             "--families",
             args.families,
             "--distances",
@@ -302,7 +302,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     overall_ok = True
     for row in summary_rows:
-        if row.name == "pytest" and row.status == "skip":
+        if row.status == "skip":
             continue
         if row.status != "pass":
             overall_ok = False

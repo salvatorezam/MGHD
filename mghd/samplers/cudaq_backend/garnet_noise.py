@@ -351,3 +351,4 @@ class GarnetNoiseModel:
         e0s = 1.0 - (1.0 - eps0) ** self.scale
         e1s = 1.0 - (1.0 - eps1) ** self.scale
         return e0s, e1s
+

@@ -45,17 +45,17 @@ def main(argv: List[str] | None = None) -> int:
         for kind in sorted(wanted):
             if kind == "666":
                 try:
-                    from mghd.core import codes_external as cx
+                    # Providers for 6.6.6 live under mghd.codes.external_providers
+                    from mghd.codes import external_providers as cx  # optional provider package(s)
                 except ImportError:
-                    import importlib
-                    cx = importlib.import_module("codes_external")
-                builder = getattr(cx, "build_color_666_qecsim", None)
+                    cx = None
+                builder = getattr(cx, "build_color_666_qecsim", None) if cx else None
             else:
+                # 4.8.8 provider lives under mghd.codes.external_color_488
                 try:
-                    from mghd.core import codes_external_488 as cx488
-                except ImportError:
-                    cx488 = None
-                builder = getattr(cx488, "build_color_488", None) if cx488 else None
+                    from mghd.codes.external_color_488 import build_color_488 as builder  # type: ignore
+                except Exception:
+                    builder = None
             if builder is None:
                 if kind == "488":
                     if not warned_488:
@@ -63,7 +63,7 @@ def main(argv: List[str] | None = None) -> int:
                         failures.append((kind, d, "provider unavailable"))
                         warned_488 = True
                 else:
-                    failures.append((kind, d, "codes_external missing builder"))
+                    failures.append((kind, d, "external_providers missing builder"))
                 continue
             try:
                 Hx, Hz, n, layout = builder(d)

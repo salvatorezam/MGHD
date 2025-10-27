@@ -9,26 +9,17 @@ The implementation follows the IQM Garnet noise model with proper idle noise,
 gate depolarizing noise, and measurement assignment errors.
 """
 
-from typing import Dict, Any, Optional, Tuple, List
-import numpy as np
-import time
-from collections import defaultdict
+from typing import Any
 
-from .garnet_noise import (
-    GarnetFoundationPriors, 
-    GarnetStudentCalibration, 
-    GarnetNoiseModel,
-    FOUNDATION_DEFAULTS
-)
+import numpy as np
+
 from .circuits import (
-    build_round_surface,
-    build_round_bb, 
+    build_round_bb,
     build_round_repetition,
-    analyze_idle_qubits,
-    make_surface_layout_d3_avoid_bad_edges,
-    build_H_rotated_d3,
+    build_round_surface,
     place_rotated_d3_on_garnet,
 )
+from .garnet_noise import GarnetFoundationPriors, GarnetNoiseModel, GarnetStudentCalibration
 
 
 class CudaQSimulator:
@@ -61,7 +52,7 @@ class CudaQSimulator:
         # - Error accumulation (Pauli X and Z errors)
         self.reset_state()
     
-    def reset_state(self, n_qubits: Optional[int] = None):
+    def reset_state(self, n_qubits: int | None = None):
         """Reset all trajectories to |0...0⟩ state."""
         if n_qubits is not None:
             self.n_qubits = n_qubits
@@ -73,7 +64,7 @@ class CudaQSimulator:
         self.pauli_x_errors = np.zeros((self.batch_size, self.n_qubits), dtype=np.int8)
         self.pauli_z_errors = np.zeros((self.batch_size, self.n_qubits), dtype=np.int8)
     
-    def apply_idle_noise(self, qubits: List[int], duration_ns: float):
+    def apply_idle_noise(self, qubits: list[int], duration_ns: float):
         """
         Apply amplitude damping and pure dephasing to idle qubits.
         
@@ -138,8 +129,7 @@ class CudaQSimulator:
             target: Target qubit index
         """
         # Perfect CZ operation: phase flip if both qubits are |1⟩
-        both_excited = (self.qubit_states[:, control] == 1) & (self.qubit_states[:, target] == 1)
-        # CZ is diagonal, so no state change needed (we track phase errors separately)
+        # CZ is diagonal, so no state change needed (phase errors tracked separately)
         
         # Apply 2-qubit depolarizing noise
         edge = (control, target)
@@ -211,7 +201,7 @@ class CudaQSimulator:
         
         return measured_results
     
-    def get_final_errors(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_final_errors(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Get final accumulated Pauli errors.
         
@@ -221,7 +211,7 @@ class CudaQSimulator:
         return self.pauli_x_errors.copy(), self.pauli_z_errors.copy()
 
 
-def simulate_circuit_with_noise(kernel, simulator: CudaQSimulator) -> Dict[str, np.ndarray]:
+def simulate_circuit_with_noise(kernel, simulator: CudaQSimulator) -> dict[str, np.ndarray]:
     """
     Simulate a circuit kernel with the given noise simulator.
     
@@ -236,7 +226,6 @@ def simulate_circuit_with_noise(kernel, simulator: CudaQSimulator) -> Dict[str, 
     measurement_results = {}
     
     for layer_idx, layer in enumerate(layers):
-        layer_type = layer['type']
         operations = layer['operations']
         duration_ns = layer.get('duration_ns', 20.0)
         
@@ -276,8 +265,8 @@ def simulate_circuit_with_noise(kernel, simulator: CudaQSimulator) -> Dict[str, 
     }
 
 
-def extract_syndrome_from_measurements(measurements: Dict[str, np.ndarray], 
-                                     layout: Dict[str, Any],
+def extract_syndrome_from_measurements(measurements: dict[str, np.ndarray], 
+                                     layout: dict[str, Any],
                                      code_type: str) -> np.ndarray:
     """
     Extract syndrome bits from measurement results based on code structure.
@@ -376,7 +365,7 @@ def extract_syndrome_from_measurements(measurements: Dict[str, np.ndarray],
 
 
 def pack_syndrome_and_errors(syndrome: np.ndarray, x_errors: np.ndarray, z_errors: np.ndarray,
-                           layout: Dict[str, Any], code_type: str) -> np.ndarray:
+                           layout: dict[str, Any], code_type: str) -> np.ndarray:
     """
     Pack syndrome and error data to match existing pipeline formats.
     
@@ -445,10 +434,53 @@ def pack_syndrome_and_errors(syndrome: np.ndarray, x_errors: np.ndarray, z_error
     return np.concatenate([syndrome, errorxz], axis=1).astype(np.uint8)
 
 
-def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, Any],
+def _params_from_qpu_profile_json(path: str, n_qubits_fallback: int = 20) -> dict:
+    """Build noise-model params dict from a QPUProfile JSON (approximate mapping)."""
+    from mghd.codes.qpu_profile import load_qpu_profile
+    prof = load_qpu_profile(path)
+    ge = prof.gate_error
+    n = int(getattr(prof, "n_qubits", n_qubits_fallback) or n_qubits_fallback)
+    # 1Q fidelities from chosen gate (rx90), F = 1 - p
+    p1 = float(ge.p_1q.get("rx90", next(iter(ge.p_1q.values()), 0.001))) if ge.p_1q else 0.001
+    F1Q = {q: float(1.0 - p1) for q in range(n)}
+    # 2Q fidelities per coupler from 'cx' map if present, otherwise default
+    F2Q = {}
+    p2_src = ge.p_2q.get("cx") if ge.p_2q else None
+    p2_default = float(p2_src.get("default", 0.01)) if isinstance(p2_src, dict) else 0.01
+    for (i, j) in getattr(prof, "coupling", []):
+        key = str((int(i), int(j)))
+        p_pair = float(p2_src.get(key, p2_default)) if isinstance(p2_src, dict) else p2_default
+        F2Q[(int(i), int(j))] = float(1.0 - p_pair)
+    # T1/T2 per qubit, default to medians
+    T1_us = {q: float(ge.t1_us.get(str(q), 43.1)) for q in range(n)}
+    T2_us = {q: float(ge.t2_us.get(str(q), 2.8)) for q in range(n)}
+    # Measurement assignment error (use symmetric for eps0, eps1)
+    eps0 = {q: float(ge.p_meas) for q in range(n)}
+    eps1 = {q: float(ge.p_meas) for q in range(n)}
+    # Gate durations
+    t_prx_ns = 20.0
+    t_cz_ns = 40.0
+    durations = getattr(prof, "meta", {}).get("durations_ns", {})
+    if isinstance(durations, dict):
+        t_prx_ns = float(durations.get("prx", t_prx_ns))
+        t_cz_ns = float(durations.get("cz", t_cz_ns))
+    return {
+        'F1Q': F1Q,
+        'F2Q': F2Q,
+        'T1_us': T1_us,
+        'T2_us': T2_us,
+        'eps0': eps0,
+        'eps1': eps1,
+        't_prx_ns': t_prx_ns,
+        't_cz_ns': t_cz_ns,
+    }
+
+
+def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: dict[str, Any],
                         rng: np.random.Generator, bitpack: bool = False,
                         surface_layout: str = "planar",
-                        phys_p: float = None, noise_scale: float = None) -> np.ndarray:
+                        phys_p: float = None, noise_scale: float = None,
+                        profile_json: str | None = None) -> np.ndarray:
     """
     Sample surface code syndromes using CUDA-Q with circuit-level noise.
     
@@ -461,17 +493,20 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, A
         bitpack: Whether to pack bits into bytes (currently ignored)
         
     Returns:
-        Packed syndrome + error array matching panq_functions format
+        Packed syndrome + error array matching the legacy training format
     """
     # Initialize noise model based on mode
-    if mode == "foundation":
-        priors = GarnetFoundationPriors()
-        params = priors.sample_pseudo_device(rng, n_qubits=20)
-    elif mode == "student":
-        calibration = GarnetStudentCalibration(n_qubits=20)
-        params = calibration.to_dict()
+    if profile_json:
+        params = _params_from_qpu_profile_json(profile_json)
     else:
-        raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
+        if mode == "foundation":
+            priors = GarnetFoundationPriors()
+            params = priors.sample_pseudo_device(rng, n_qubits=20)
+        elif mode == "student":
+            calibration = GarnetStudentCalibration(n_qubits=20)
+            params = calibration.to_dict()
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
     
     # Determine noise scaling from requested phys_p or explicit noise_scale
     scale = 1.0
@@ -588,7 +623,7 @@ def sample_surface_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, A
 
 
 def sample_bb_cudaq(mode: str, batch_size: int, T: int, hx: np.ndarray, hz: np.ndarray,
-                   mapping: Dict[int, int], rng: np.random.Generator, bitpack: bool = False) -> np.ndarray:
+                   mapping: dict[int, int], rng: np.random.Generator, bitpack: bool = False) -> np.ndarray:
     """
     Sample BB/qLDPC code syndromes using CUDA-Q with circuit-level noise.
     
@@ -603,7 +638,7 @@ def sample_bb_cudaq(mode: str, batch_size: int, T: int, hx: np.ndarray, hz: np.n
         bitpack: Whether to pack bits into bytes (currently ignored)
         
     Returns:
-        Packed syndrome + error array matching bb_panq_functions format
+        Packed syndrome + error array matching the legacy training format
     """
     # Initialize noise model
     if mode == "foundation":
@@ -659,7 +694,7 @@ def sample_bb_cudaq(mode: str, batch_size: int, T: int, hx: np.ndarray, hz: np.n
     return packed_result
 
 
-def sample_repetition_cudaq(mode: str, batch_size: int, T: int, layout: Dict[str, Any],
+def sample_repetition_cudaq(mode: str, batch_size: int, T: int, layout: dict[str, Any],
                            rng: np.random.Generator, bitpack: bool = False) -> np.ndarray:
     """
     Sample repetition code syndromes using CUDA-Q with circuit-level noise.

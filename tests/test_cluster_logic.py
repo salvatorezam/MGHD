@@ -1,5 +1,6 @@
 import numpy as np
-from mghd import core
+# Use the actual implementation module after the reorg
+from mghd.decoders.lsd import clustered as core
 
 
 def _bruteforce_ml(H, s, w=None):

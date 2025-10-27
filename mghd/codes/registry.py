@@ -1,13 +1,15 @@
 """Registry of CSS code families with deterministic parity-check matrices."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from functools import lru_cache
-from pathlib import Path
-from typing import Dict, Any, Optional, Iterable, List, Tuple
 import json
-import numpy as np
 import sys
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from functools import cache
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 
 def _ensure_binary(mat: np.ndarray) -> np.ndarray:
@@ -29,9 +31,9 @@ class CodeSpec:
     n: int
     hx: np.ndarray
     hz: np.ndarray
-    k: Optional[int] = None
-    d: Optional[int] = None
-    meta: Dict[str, Any] = field(default_factory=dict)
+    k: int | None = None
+    d: int | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hx", _ensure_binary(self.hx))
@@ -49,16 +51,16 @@ class CSSCode:
     k: int
     Hx: np.ndarray
     Hz: np.ndarray
-    layout: Dict[str, Any]
-    detectors_per_fault: Optional[List[List[int]]] = None
-    fault_weights: Optional[List[float]] = None
-    num_detectors: Optional[int] = None
-    num_observables: Optional[int] = None
-    stim_circuit: Optional[object] = None
-    Lx: Optional[np.ndarray] = None
-    Lz: Optional[np.ndarray] = None
+    layout: dict[str, Any]
+    detectors_per_fault: list[list[int]] | None = None
+    fault_weights: list[float] | None = None
+    num_detectors: int | None = None
+    num_observables: int | None = None
+    stim_circuit: object | None = None
+    Lx: np.ndarray | None = None
+    Lz: np.ndarray | None = None
 
-    def detectors_to_syndromes(self, dets: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def detectors_to_syndromes(self, dets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Best-effort mapping assuming detectors align with checks (X block then Z)."""
 
         mx = int(self.Hx.shape[0])
@@ -77,8 +79,8 @@ class CSSCode:
         return sx, sz
 
     def data_to_observables(self,
-                            ex: Optional[np.ndarray],
-                            ez: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                            ex: np.ndarray | None,
+                            ez: np.ndarray | None) -> np.ndarray | None:
         """Map data-space corrections to logical observable flips."""
 
         if self.Lx is None or self.Lz is None or self.num_observables is None:
@@ -149,10 +151,10 @@ def _gf2_rank(mat: np.ndarray) -> int:
     return rank
 
 
-def _gf2_rref(A: np.ndarray) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+def _gf2_rref(A: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int]]]:
     M = (np.asarray(A, dtype=np.uint8) & 1).copy()
     m, n = M.shape
-    pivots: List[Tuple[int, int]] = []
+    pivots: list[tuple[int, int]] = []
     row = 0
     for col in range(n):
         pivot = None
@@ -179,7 +181,7 @@ def _gf2_nullspace_dense(A: np.ndarray) -> np.ndarray:
     n = M.shape[1]
     pivot_cols = {c for _, c in pivots}
     free_cols = [c for c in range(n) if c not in pivot_cols]
-    basis: List[np.ndarray] = []
+    basis: list[np.ndarray] = []
     for free in free_cols:
         v = np.zeros(n, dtype=np.uint8)
         v[free] = 1
@@ -192,7 +194,7 @@ def _gf2_nullspace_dense(A: np.ndarray) -> np.ndarray:
     return np.stack(basis, axis=1)
 
 
-def _reduce_mod_rowspace(vec: np.ndarray, R: np.ndarray, pivots: List[Tuple[int, int]]) -> np.ndarray:
+def _reduce_mod_rowspace(vec: np.ndarray, R: np.ndarray, pivots: list[tuple[int, int]]) -> np.ndarray:
     res = (np.asarray(vec, dtype=np.uint8) & 1).copy()
     for r, c in pivots:
         if res[c]:
@@ -208,7 +210,7 @@ def _select_css_logicals(stab: np.ndarray, dual: np.ndarray, target: int) -> np.
     if null_dual.shape[1] == 0:
         return np.zeros((0, stab.shape[1]), dtype=np.uint8)
 
-    reps: List[np.ndarray] = []
+    reps: list[np.ndarray] = []
     seen: set[bytes] = set()
     for j in range(null_dual.shape[1]):
         rep = _reduce_mod_rowspace(null_dual[:, j], R, pivots)
@@ -221,7 +223,7 @@ def _select_css_logicals(stab: np.ndarray, dual: np.ndarray, target: int) -> np.
         reps.append(rep)
 
     reps.sort(key=lambda v: (int(v.sum()), v.tobytes()))
-    basis: List[np.ndarray] = []
+    basis: list[np.ndarray] = []
     for rep in reps:
         if not basis:
             basis.append(rep)
@@ -237,18 +239,18 @@ def _select_css_logicals(stab: np.ndarray, dual: np.ndarray, target: int) -> np.
     return np.stack(basis, axis=0)
 
 
-def _compute_css_logicals(Hx: np.ndarray, Hz: np.ndarray, target: int) -> Tuple[np.ndarray, np.ndarray]:
+def _compute_css_logicals(Hx: np.ndarray, Hz: np.ndarray, target: int) -> tuple[np.ndarray, np.ndarray]:
     Lx_auto = _select_css_logicals(Hx, Hz, target)
     Lz_auto = _select_css_logicals(Hz, Hx, target)
     return Lx_auto, Lz_auto
 
 
-def _fault_map(Hx: np.ndarray, Hz: np.ndarray) -> List[List[int]]:
+def _fault_map(Hx: np.ndarray, Hz: np.ndarray) -> list[list[int]]:
     mx, n = Hx.shape
     mz = Hz.shape[0]
-    mapping: List[List[int]] = []
+    mapping: list[list[int]] = []
     for j in range(n):
-        dets: List[int] = []
+        dets: list[int] = []
         if mx:
             dets.extend(np.flatnonzero(Hx[:, j]).tolist())
         if mz:
@@ -271,12 +273,12 @@ def _make_css(
     distance: int,
     Hx: np.ndarray,
     Hz: np.ndarray,
-    layout: Dict[str, Any],
-    detectors_per_fault: Optional[List[List[int]]] = None,
-    fault_weights: Optional[List[float]] = None,
-    num_observables: Optional[int] = None,
-    Lx: Optional[np.ndarray] = None,
-    Lz: Optional[np.ndarray] = None,
+    layout: dict[str, Any],
+    detectors_per_fault: list[list[int]] | None = None,
+    fault_weights: list[float] | None = None,
+    num_observables: int | None = None,
+    Lx: np.ndarray | None = None,
+    Lz: np.ndarray | None = None,
 ) -> CSSCode:
     Hx = _ensure_binary(Hx)
     Hz = _ensure_binary(Hz)
@@ -340,7 +342,7 @@ def _perm_matrix(n: int) -> np.ndarray:
     return P
 
 
-def bccb_from_taps(n1: int, n2: int, taps_2d: Iterable[Tuple[int, int]]) -> np.ndarray:
+def bccb_from_taps(n1: int, n2: int, taps_2d: Iterable[tuple[int, int]]) -> np.ndarray:
     """Block-circulant-with-circulant-blocks (BCCB) matrix over GF(2)."""
 
     Px = _perm_matrix(n1)
@@ -352,8 +354,8 @@ def bccb_from_taps(n1: int, n2: int, taps_2d: Iterable[Tuple[int, int]]) -> np.n
         mat ^= np.kron(Ax, Ay).astype(np.uint8)
     return mat
 
-def save_npz(hx: np.ndarray, hz: np.ndarray, path: str | np.ndarray, meta: Dict[str, Any], **extras: Any) -> None:
-    data: Dict[str, Any] = {
+def save_npz(hx: np.ndarray, hz: np.ndarray, path: str | np.ndarray, meta: dict[str, Any], **extras: Any) -> None:
+    data: dict[str, Any] = {
         "hx": _ensure_binary(hx),
         "hz": _ensure_binary(hz),
     }
@@ -367,8 +369,8 @@ def save_npz(hx: np.ndarray, hz: np.ndarray, path: str | np.ndarray, meta: Dict[
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=None)
-def build_surface_rotated_H(d: int) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+@cache
+def build_surface_rotated_H(d: int) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     if d < 1 or d % 2 == 0:
         raise ValueError("Rotated surface code requires odd distance >= 1")
     n_data = d * d
@@ -419,8 +421,8 @@ def build_surface_rotated_H(d: int) -> tuple[np.ndarray, np.ndarray, Dict[str, A
     return hx, hz, meta
 
 
-@lru_cache(maxsize=None)
-def default_surface_rotated_layout(d: int) -> Dict[str, Any]:
+@cache
+def default_surface_rotated_layout(d: int) -> dict[str, Any]:
     hx, hz, meta = build_surface_rotated_H(d)
     n_data = meta["N_bits"]
     ancilla_z = list(range(n_data, n_data + hz.shape[0]))
@@ -447,7 +449,7 @@ def default_surface_rotated_layout(d: int) -> Dict[str, Any]:
     }
 
 
-def logical_surface_rotated(d: int) -> Dict[str, np.ndarray]:
+def logical_surface_rotated(d: int) -> dict[str, np.ndarray]:
     if d < 1 or d % 2 == 0:
         raise ValueError("Rotated surface code requires odd distance >= 1")
     n = d * d
@@ -500,36 +502,41 @@ def build_surface(distance: int, *, rotated: bool = True) -> CSSCode:
 # BB (Bravyi-Bacon) families
 # ---------------------------------------------------------------------------
 
-def _bb_indices(l: int, m: int):
+def _bb_indices(size_x: int, size_y: int):
     def wrap_x(x: int) -> int:
-        return x % l
+        return x % size_x
 
     def wrap_y(y: int) -> int:
-        return y % m
+        return y % size_y
 
     def idx_h(x: int, y: int) -> int:
-        return wrap_y(y) * l + wrap_x(x)
+        return wrap_y(y) * size_x + wrap_x(x)
 
     def idx_v(x: int, y: int) -> int:
-        return l * m + wrap_y(y) * l + wrap_x(x)
+        return size_x * size_y + wrap_y(y) * size_x + wrap_x(x)
 
     return idx_h, idx_v, wrap_x, wrap_y
 
 
-def bb_from_shifts(l: int, m: int, a: tuple[int, int], b: tuple[int, int]) -> CodeSpec:
-    if l <= 0 or m <= 0:
+def bb_from_shifts(
+    size_x: int,
+    size_y: int,
+    a: tuple[int, int],
+    b: tuple[int, int],
+) -> CodeSpec:
+    if size_x <= 0 or size_y <= 0:
         raise ValueError("l and m must be positive")
     ax, ay = a
     bx, by = b
-    n_qubits = 2 * l * m
-    n_checks = l * m
+    n_qubits = 2 * size_x * size_y
+    n_checks = size_x * size_y
     hx = np.zeros((n_checks, n_qubits), dtype=np.uint8)
     hz = np.zeros_like(hx)
-    idx_h, idx_v, wrap_x, wrap_y = _bb_indices(l, m)
+    idx_h, idx_v, wrap_x, wrap_y = _bb_indices(size_x, size_y)
 
-    for x in range(l):
-        for y in range(m):
-            row = y * l + x
+    for x in range(size_x):
+        for y in range(size_y):
+            row = y * size_x + x
             hx_edges = {
                 idx_h(x, y),
                 idx_h(x + 1, y),
@@ -555,16 +562,16 @@ def bb_from_shifts(l: int, m: int, a: tuple[int, int], b: tuple[int, int]) -> Co
         raise ValueError("BB checks must have weight 6")
 
     return CodeSpec(
-        name=f"bb_l{l}_m{m}_a{a}_b{b}",
+        name=f"bb_l{size_x}_m{size_y}_a{a}_b{b}",
         n=n_qubits,
         hx=hx,
         hz=hz,
-        meta={"l": l, "m": m, "a": a, "b": b, "syndrome_order": "Z_first_then_X"},
+        meta={"l": size_x, "m": size_y, "a": a, "b": b, "syndrome_order": "Z_first_then_X"},
     )
 
 
 def bb_gross() -> CodeSpec:
-    return bb_from_shifts(l=12, m=6, a=(3, -1), b=(-1, -3))
+    return bb_from_shifts(size_x=12, size_y=6, a=(3, -1), b=(-1, -3))
 
 
 def build_gb_two_block(
@@ -609,8 +616,8 @@ def build_gb_two_block(
 def build_bb_bivariate(
     n1: int,
     n2: int,
-    taps_a_2d: Iterable[Tuple[int, int]],
-    taps_b_2d: Iterable[Tuple[int, int]],
+    taps_a_2d: Iterable[tuple[int, int]],
+    taps_b_2d: Iterable[tuple[int, int]],
 ) -> CSSCode:
     """Bivariate bicycle via block-circulant matrices."""
 
@@ -648,8 +655,8 @@ def build_bb(
     n1: int = 17,
     n2: int = 17,
     *,
-    taps_a_2d: Iterable[Tuple[int, int]] = ((0, 0), (1, 0), (0, 1)),
-    taps_b_2d: Iterable[Tuple[int, int]] = ((0, 0), (2, 0), (0, 2)),
+    taps_a_2d: Iterable[tuple[int, int]] = ((0, 0), (1, 0), (0, 1)),
+    taps_b_2d: Iterable[tuple[int, int]] = ((0, 0), (2, 0), (0, 2)),
 ) -> CSSCode:
     return build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d)
 
@@ -750,7 +757,7 @@ def qrm_hamming(m: int) -> CodeSpec:
 DATA_DIR = Path(__file__).resolve().parent.parent / "color_cache"
 
 
-def _load_cached_color(kind: str, distance: int) -> Optional[Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]]:
+def _load_cached_color(kind: str, distance: int) -> tuple[np.ndarray, np.ndarray, int, dict[str, Any]] | None:
     path = DATA_DIR / f"color_{kind}_d{distance}.npz"
     if not path.exists():
         return None
@@ -773,7 +780,7 @@ def _load_cached_color(kind: str, distance: int) -> Optional[Tuple[np.ndarray, n
     return Hx, Hz, n, layout
 
 
-def _write_color_cache(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: Dict[str, Any]) -> None:
+def _write_color_cache(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = DATA_DIR / f"color_{kind}_d{distance}.npz"
     payload = dict(layout)
@@ -786,7 +793,7 @@ def _write_color_cache(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray,
     )
 
 
-def _build_color_via_external(kind: str, distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+def _build_color_via_external(kind: str, distance: int) -> tuple[np.ndarray, np.ndarray, int, dict[str, Any]]:
     if kind == "666":
         try:
             from mghd.core import codes_external as cx
@@ -867,7 +874,7 @@ REGISTRY = {
 _OPTIONAL_DISTANCE = {"steane", "gb", "bb", "hgp"}
 
 
-def get_code(family: str, distance: Optional[int] = None, **kw) -> CSSCode:
+def get_code(family: str, distance: int | None = None, **kw) -> CSSCode:
     if family not in REGISTRY:
         raise KeyError(f"Unknown family '{family}'. Available: {list(REGISTRY)}")
     if distance is None and family not in _OPTIONAL_DISTANCE:
@@ -943,7 +950,7 @@ def load_matrix(path: str) -> np.ndarray:
         raise ValueError("NPZ must contain a single array or arr_0")
     if path.endswith(".npy"):
         return _ensure_binary(np.load(path))
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         obj = json.load(fh)
     return _ensure_binary(np.asarray(obj, dtype=np.uint8))
 

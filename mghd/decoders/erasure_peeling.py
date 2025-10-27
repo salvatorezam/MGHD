@@ -1,11 +1,11 @@
 """Erasure-aware peeling + cluster decoder for CSS codes."""
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from core import solve_on_erasure
+from mghd.decoders.lsd.clustered import solve_on_erasure
 
 
 def _peeling(

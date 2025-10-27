@@ -3,7 +3,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from mghd_public.features_v2 import pack_cluster
+from mghd.core.core import pack_cluster
 
 
 def test_masks_align_with_node_types():

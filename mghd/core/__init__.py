@@ -1,7 +1,7 @@
-"""Core model components for MGHD."""
+"""Core MGHD v2 package.
 
-from .blocks import *
-from .features_v2 import *
-from .model_v2 import *
-from .config import *
-from .infer import *
+Import submodules explicitly when needed, e.g. `from mghd.core.core import MGHDv2`.
+Avoid importing heavy deps at package import time to keep smoke tests lightweight.
+"""
+
+__all__: list[str] = []

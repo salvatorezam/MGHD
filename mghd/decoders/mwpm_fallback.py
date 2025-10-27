@@ -12,8 +12,9 @@ from typing import Any, Iterable, Optional
 import warnings
 
 import numpy as np
+import scipy.sparse as sp
 
-import core
+from mghd.decoders.lsd.clustered import ml_parity_project
 from mghd.utils.graphlike import is_graphlike
 
 try:  # pragma: no cover - optional dependency
@@ -129,8 +130,11 @@ class MWPMFallback:
     def _gf2_decode(self, syndromes: np.ndarray) -> np.ndarray:
         B = syndromes.shape[0]
         out = np.zeros((B, self._gf2_cols), dtype=np.uint8)
+        # ml_parity_project requires p_flip and sparse matrix; use uniform 0.5 for unweighted case
+        p_uniform = np.full(self.H.shape[1], 0.5, dtype=np.float32)
+        H_sparse = sp.csr_matrix(self.H) if not sp.issparse(self.H) else self.H
         for b in range(B):
-            out[b] = core.ml_parity_project(self.H, syndromes[b])
+            out[b] = ml_parity_project(H_sparse, syndromes[b], p_uniform)
         return out
 
     def decode_batch(

@@ -343,10 +343,12 @@ def _resolve_mwpm_weights(
         if value is None:
             return None
         try:
-            arr = np.asarray(list(value) if not isinstance(value, np.ndarray) else value, dtype=object)
-            arr = arr.astype(np.float64, casting="safe")
+            arr = np.asarray(value, dtype=np.float32)
         except Exception:
-            return None
+            try:
+                arr = np.asarray(list(value), dtype=np.float32)
+            except Exception:
+                return None
         return arr.astype(np.float32, copy=False)
 
     if isinstance(weights, dict):
