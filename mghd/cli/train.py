@@ -225,6 +225,8 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--family", type=str, default="surface")
     parser.add_argument("--distance", type=int, default=3)
     parser.add_argument("--p", type=float, default=0.005, help="Physical error rate for online sampling")
+    parser.add_argument("--p-curriculum", type=str, default=None, help="Comma-separated list of p values to cycle across epochs in online mode (e.g., '0.01,0.006,0.003')")
+    parser.add_argument("--epochs-per-p", type=int, default=1, help="Epochs to spend on each p value in --p-curriculum")
     parser.add_argument("--qpu-profile", type=str, default=None)
     parser.add_argument("--context-source", type=str, default="none", choices=["none","qiskit","cirq","cudaq"]) 
     parser.add_argument("--shots-per-epoch", type=int, default=256)
@@ -242,10 +244,57 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
     parser.add_argument("--noise-injection", type=float, default=0.009883059279379016)
     parser.add_argument("--grad-clip", type=float, default=0.8545326095750816)
-    parser.add_argument("--save", type=str, required=True)
+    parser.add_argument("--hparams", type=str, default=None, help="Path to JSON hyperparameters file")
+    parser.add_argument("--save", type=str, required=False, default=None, help="If omitted or contains '{auto}', an auto-named run dir is created under --save-root")
+    parser.add_argument("--save-root", type=str, default="data/results", help="Root directory for auto-named runs")
+    parser.add_argument("--save-auto", action="store_true", help="Force auto-named save directory under --save-root")
     parser.add_argument("--seed", type=int, default=42)
+    # Optional post-run teacher comparison report (writes teacher_eval.txt)
+    parser.add_argument("--post-eval", action="store_true")
+    parser.add_argument("--post-eval-sampler", type=str, default="stim")
+    parser.add_argument("--post-eval-shots-per-batch", type=int, default=16)
+    parser.add_argument("--post-eval-batches", type=int, default=2)
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
+        # Optionally load hyperparameters and apply to args
+        if getattr(args, "hparams", None):
+            try:
+                with open(args.hparams, "r", encoding="utf-8") as fh:
+                    hp = json.load(fh)
+            except Exception:
+                hp = None
+            if isinstance(hp, dict):
+                tp = hp.get("training_parameters", {}) or {}
+                args.lr = float(tp.get("lr", args.lr))
+                args.wd = float(tp.get("weight_decay", args.wd))
+                args.label_smoothing = float(tp.get("label_smoothing", args.label_smoothing))
+                args.grad_clip = float(tp.get("gradient_clip", args.grad_clip))
+                args.noise_injection = float(tp.get("noise_injection", args.noise_injection))
+                args.epochs = int(tp.get("epochs", args.epochs))
+                args.batch = int(tp.get("batch_size", args.batch))
+                setattr(args, "_hp_model", hp.get("model_architecture", {}) or {})
+                setattr(args, "_hp_mamba", hp.get("mamba_parameters", {}) or {})
+                setattr(args, "_hp_attn", hp.get("attention_mechanism", {}) or {})
+
+    # Resolve save directory (auto if requested or missing)
+    def _auto_name(family: str, distance: int, qpu_profile: str | None) -> str:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        qpu = "none"
+        if qpu_profile:
+            import os as _os
+            qpu = _os.path.splitext(_os.path.basename(qpu_profile))[0]
+        return f"{ts}_{family}_d{int(distance)}_{qpu}"
+
+    if args.save_auto or args.save is None or (isinstance(args.save, str) and "{auto}" in args.save):
+        auto = _auto_name(getattr(args, "family", "code"), int(getattr(args, "distance", 0)), getattr(args, "qpu_profile", None))
+        base = Path(getattr(args, "save_root", "data/results"))
+        base.mkdir(parents=True, exist_ok=True)
+        args.save = str(base / auto)
+    else:
+        # Support placeholder replacement in explicit paths
+        if "{auto}" in args.save:
+            auto = _auto_name(getattr(args, "family", "code"), int(getattr(args, "distance", 0)), getattr(args, "qpu_profile", None))
+            args.save = args.save.replace("{auto}", auto)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -292,6 +341,27 @@ def train_inprocess(ns) -> str:
 
     save_dir = Path(args.save)
     save_dir.mkdir(parents=True, exist_ok=True)
+    # Persist run metadata for reproducibility
+    try:
+        run_meta = {
+            "family": args.family,
+            "distance": int(args.distance),
+            "online": use_online,
+            "p": float(getattr(args, "p", 0.0)),
+            "p_curriculum": [float(x) for x in str(getattr(args, "p_curriculum", "")).split(",") if x.strip()] if getattr(args, "p_curriculum", None) else None,
+            "epochs_per_p": int(getattr(args, "epochs_per_p", 1)),
+            "teacher_mix": getattr(args, "teacher_mix", None),
+            "qpu_profile": getattr(args, "qpu_profile", None),
+            "context_source": getattr(args, "context_source", None),
+            "erasure_frac": float(getattr(args, "erasure_frac", 0.0)),
+            "shots_per_epoch": int(getattr(args, "shots_per_epoch", 0)),
+            "epochs": int(args.epochs),
+            "batch": int(args.batch),
+            "seed": int(args.seed),
+        }
+        (save_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2))
+    except Exception:
+        pass
 
     best_loss = float("inf")
     history: list[dict[str, Any]] = []
@@ -364,12 +434,26 @@ def train_inprocess(ns) -> str:
 
     bandit = None
     prev_epoch_loss = None
+    # Optional curriculum over p for online mode
+    p_list = None
+    if use_online and getattr(args, "p_curriculum", None):
+        try:
+            p_list = [float(x) for x in str(args.p_curriculum).split(",") if x.strip()]
+        except Exception:
+            p_list = None
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
         total_loss = 0.0
         n_items = 0
         if use_online:
+            # Select p for this epoch (curriculum if provided)
+            if p_list:
+                step = max(1, int(getattr(args, "epochs_per_p", 1)))
+                idx = min((epoch - 1) // step, len(p_list) - 1)
+                p_epoch = float(p_list[idx])
+            else:
+                p_epoch = float(getattr(args, "p", 0.005))
             # Teacher setup per epoch
             family = args.family
             if family != "surface":
@@ -407,7 +491,7 @@ def train_inprocess(ns) -> str:
             erase_data_mask = None  # optional per-batch erasure mask; None by default
             while shots_done < shots_target:
                 seed = int(rng.integers(0, 2**31 - 1))
-                sample = sample_round(d=args.distance, p=args.p, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
+                sample = sample_round(d=args.distance, p=p_epoch, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
                 # Build global detector stream [X then Z] for MWPFTeacher
                 dets_global = np.concatenate([
                     sample["synX"][np.newaxis, :].astype(np.uint8),
@@ -641,9 +725,34 @@ def train_inprocess(ns) -> str:
             best_loss = avg
             torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt")
 
-        print(json.dumps({"epoch": epoch, "loss": avg, "secs": dt}, separators=(",", ":")))
+        log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
+        if use_online:
+            log_obj["p"] = float(p_epoch if 'p_epoch' in locals() else getattr(args, "p", 0.0))
+        print(json.dumps(log_obj, separators=(",", ":")))
 
     (save_dir / "train_log.json").write_text(json.dumps(history, indent=2))
+
+    # Optional teacher comparison report
+    if hasattr(args, "post_eval") and bool(getattr(args, "post_eval", False)):
+        try:
+            import subprocess, sys as _sys, os as _os
+            shots = int(getattr(args, "post_eval_shots_per_batch", 16))
+            batches = int(getattr(args, "post_eval_batches", 2))
+            sampler = str(getattr(args, "post_eval_sampler", "stim"))
+            cmd = [
+                _sys.executable, "-m", "mghd.tools.teacher_eval",
+                "--families", str(args.family),
+                "--distances", str(args.distance),
+                "--sampler", sampler,
+                "--shots-per-batch", str(shots),
+                "--batches", str(batches),
+            ]
+            env = _os.environ.copy()
+            env.setdefault("PYTHONPATH", _os.getcwd())
+            cp = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            (save_dir / "teacher_eval.txt").write_text(cp.stdout + ("\n--- STDERR ---\n" + cp.stderr if cp.stderr else ""))
+        except Exception:
+            pass
 
     return os.path.join(args.save, "best.pt")
 def move_to(p: PackedCrop, device):
@@ -704,45 +813,14 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
             shutil.rmtree(temp_dir)
 
 def main():
-    # CLI wrapper that forwards to train_inprocess
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", type=str, required=True)
-    parser.add_argument("--profile", type=str, default="S")
-    parser.add_argument("--ema", type=float, default=0.999)
-    parser.add_argument("--lr", type=float, default=5.952925899948483e-05)
-    parser.add_argument("--wd", type=float, default=6.65850238574699e-05)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch", type=int, default=512)
-    parser.add_argument("--parity-lambda", type=float, default=0.03)
-    parser.add_argument("--projection-aware", type=int, default=1)
-    parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
-    parser.add_argument("--noise-injection", type=float, default=0.009883059279379016)
-    parser.add_argument("--grad-clip", type=float, default=0.8545326095750816)
-    parser.add_argument("--save", type=str, required=True)
-    parser.add_argument("--hparams", type=str, default=None, help="Path to JSON hyperparameters file")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    # Optionally load hyperparameters and apply to args
-    if args.hparams:
-        try:
-            with open(args.hparams, "r", encoding="utf-8") as fh:
-                hp = json.load(fh)
-        except Exception:
-            hp = None
-        if isinstance(hp, dict):
-            tp = hp.get("training_parameters", {}) or {}
-            args.lr = float(tp.get("lr", args.lr))
-            args.wd = float(tp.get("weight_decay", args.wd))
-            args.label_smoothing = float(tp.get("label_smoothing", args.label_smoothing))
-            args.grad_clip = float(tp.get("gradient_clip", args.grad_clip))
-            args.noise_injection = float(tp.get("noise_injection", args.noise_injection))
-            args.epochs = int(tp.get("epochs", args.epochs))
-            args.batch = int(tp.get("batch_size", args.batch))
-            setattr(args, "_hp_model", hp.get("model_architecture", {}) or {})
-            setattr(args, "_hp_mamba", hp.get("mamba_parameters", {}) or {})
-            setattr(args, "_hp_attn", hp.get("attention_mechanism", {}) or {})
-    # Delegate
-    train_inprocess(args)
+    """Unified CLI entrypoint supporting offline and online modes.
+
+    Delegates argument parsing to train_inprocess(), which understands both
+    --data-root (offline) and --online (CUDA-Q) paths plus --hparams, TAD/RL flags.
+    """
+    from types import SimpleNamespace
+    # Passing a dummy namespace will make train_inprocess parse sys.argv
+    train_inprocess(SimpleNamespace())
 
 if __name__ == "__main__":
     main()
