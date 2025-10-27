@@ -249,6 +249,8 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--save-root", type=str, default="data/results", help="Root directory for auto-named runs")
     parser.add_argument("--save-auto", action="store_true", help="Force auto-named save directory under --save-root")
     parser.add_argument("--seed", type=int, default=42)
+    # Progress reporting (prints per epoch; 1 = only near end, 0 = disable mid-epoch prints)
+    parser.add_argument("--progress-prints", type=int, default=1)
     # Optional post-run teacher comparison report (writes teacher_eval.txt)
     parser.add_argument("--post-eval", action="store_true")
     parser.add_argument("--post-eval-sampler", type=str, default="stim")
@@ -489,6 +491,9 @@ def train_inprocess(ns) -> str:
             shots_target = int(getattr(args, "shots_per_epoch", args.batch))
             shots_done = 0
             erase_data_mask = None  # optional per-batch erasure mask; None by default
+            # Mid-epoch progress prints (optional)
+            prog_stride = (max(1, shots_target // int(getattr(args, "progress_prints", 1)))
+                           if int(getattr(args, "progress_prints", 1)) > 1 else 0)
             while shots_done < shots_target:
                 seed = int(rng.integers(0, 2**31 - 1))
                 sample = sample_round(d=args.distance, p=p_epoch, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
@@ -639,11 +644,25 @@ def train_inprocess(ns) -> str:
                             total_loss += batch_loss.item() * batch_size
                             n_items += batch_size
                             shots_done += 1
+                            # Periodic progress print within epoch
+                            if prog_stride and (shots_done % prog_stride == 0):
+                                prog = {"epoch": epoch,
+                                        "step": int(shots_done),
+                                        "steps": int(shots_target),
+                                        "avg": float(total_loss / max(n_items, 1)),
+                                        "secs": float(time.time() - t0)}
+                                if p_epoch is not None:
+                                    prog["p"] = float(p_epoch)
+                                print(json.dumps(prog, separators=(",", ":")), flush=True)
                             if shots_done >= shots_target:
                                 break
                 if shots_done >= shots_target:
                     break
         else:
+            steps_done = 0
+            steps_total = len(loader) if hasattr(loader, "__len__") else 0
+            prog_stride = (max(1, steps_total // int(getattr(args, "progress_prints", 1)))
+                           if steps_total and int(getattr(args, "progress_prints", 1)) > 1 else 0)
             for batch in loader:
                 if not batch:
                     continue
@@ -709,6 +728,14 @@ def train_inprocess(ns) -> str:
 
             total_loss += batch_loss.item() * batch_size
             n_items += batch_size
+            steps_done += 1
+            if prog_stride and (steps_done % prog_stride == 0):
+                prog = {"epoch": epoch,
+                        "step": int(steps_done),
+                        "steps": int(steps_total),
+                        "avg": float(total_loss / max(n_items, 1)),
+                        "secs": float(time.time() - t0)}
+                print(json.dumps(prog, separators=(",", ":")), flush=True)
 
         sched.step()
         dt = time.time() - t0

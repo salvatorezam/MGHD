@@ -271,7 +271,8 @@ def pack_cluster(
     else:
         er = None
 
-    base_nodes = np.concatenate([
+    # Base per-node features (8 dims): xy(2), type(1), degree(1), k/r/bw/bh(4)
+    parts = [
         xy01,
         node_type[:, None].astype(np.float32),
         degree[:, None],
@@ -279,8 +280,12 @@ def pack_cluster(
         np.full((nQ + nC, 1), float(r), dtype=np.float32),
         np.full((nQ + nC, 1), float(bw), dtype=np.float32),
         np.full((nQ + nC, 1), float(bh), dtype=np.float32),
-        (np.concatenate([er if er is not None else np.zeros(nQ, dtype=np.float32), np.zeros(nC, dtype=np.float32)])[:, None]),
-    ], axis=1)
+    ]
+    # Optional per-node erasure flag (only when provided): adds +1 feature dim
+    if er is not None:
+        er_col = np.concatenate([er.astype(np.float32), np.zeros(nC, dtype=np.float32)])[:, None]
+        parts.append(er_col)
+    base_nodes = np.concatenate(parts, axis=1)
 
     ci, qi = np.nonzero(H_sub)
     src = qi.astype(np.int64)
@@ -684,6 +689,12 @@ class MGHDv2(nn.Module):
             g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0)
             g_bias = g_bias.expand(x.shape[0], -1)
 
+        # Guard against feature-dim mismatches (e.g., erasure channel optional)
+        if self.node_in.in_features != x.shape[-1]:
+            self.ensure_node_in(int(x.shape[-1]), x.device)
+        if self.edge_in.in_features != eatt.shape[-1]:
+            self.ensure_edge_in(int(eatt.shape[-1]), eatt.device)
+
         x = self.node_in(x) + g_bias
         e = self.edge_in(eatt)
         x = self.seq_encoder(x, packed.seq_idx.long(), packed.seq_mask.bool(), node_type=node_type)
@@ -758,6 +769,18 @@ class MGHDv2(nn.Module):
             layer = nn.Linear(g_dim, self.node_in.out_features)
             layer.to(device)
             self.g_proj = layer
+
+    def ensure_node_in(self, in_features: int, device: torch.device) -> None:
+        if self.node_in.in_features != in_features:
+            layer = nn.Linear(in_features, self.node_in.out_features)
+            layer.to(device)
+            self.node_in = layer
+
+    def ensure_edge_in(self, in_features: int, device: torch.device) -> None:
+        if self.edge_in.in_features != in_features:
+            layer = nn.Linear(in_features, self.edge_in.out_features)
+            layer.to(device)
+            self.edge_in = layer
 
     def set_authoritative_mats(self, *_args, **_kwargs) -> None:
         return None
