@@ -20,6 +20,8 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
+import os
+import shutil
 from pathlib import Path
 
 
@@ -45,7 +47,7 @@ class PreflightError(RuntimeError):
     """Raised when a blocking preflight error occurs."""
 
 
-def check_deps(log_path: Path) -> dict[str, object]:
+def check_deps(log_path: Path, *, expect_conda_env: str | None = None) -> dict[str, object]:
     """Verify core dependencies and emit a log; return version info dict.
 
     Ensures PyMatching≥2.3.0 and Stim are importable; probes CUDA‑Q presence
@@ -57,6 +59,10 @@ def check_deps(log_path: Path) -> dict[str, object]:
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     versions: dict[str, object] = {"cudaq_available": False}
+
+    # Record active conda env (if any)
+    conda_env = os.environ.get("CONDA_DEFAULT_ENV")
+    versions["conda_env"] = conda_env
 
     def emit(line: str) -> None:
         print(line)
@@ -106,6 +112,36 @@ def check_deps(log_path: Path) -> dict[str, object]:
             cudaq_version = "installed"
         versions["cudaq"] = cudaq_version
         emit(f"CUDA-Q version:   {cudaq_version}")
+
+    # Optionally probe a specific conda env for CUDA-Q if not available here
+    if not versions.get("cudaq_available") and expect_conda_env:
+        conda_bin = shutil.which("conda")
+        if conda_bin:
+            try:
+                cp = subprocess.run(
+                    [
+                        conda_bin,
+                        "run",
+                        "-n",
+                        expect_conda_env,
+                        "python",
+                        "-c",
+                        "import importlib.metadata as im; import cudaq; print(im.version('cudaq'))",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if cp.returncode == 0:
+                    v = cp.stdout.strip().splitlines()[-1] if cp.stdout else "installed"
+                    versions["cudaq_in_env"] = v
+                    emit(f"CUDA-Q in env '{expect_conda_env}': {v}")
+                else:
+                    versions["cudaq_in_env"] = None
+                    emit(f"CUDA-Q in env '{expect_conda_env}': not installed or import failed")
+            except Exception:
+                versions["cudaq_in_env"] = None
+        else:
+            versions["cudaq_in_env"] = None
 
     return versions
 
@@ -195,6 +231,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
     )
     parser.add_argument("--skip-cudaq", action="store_true")
+    parser.add_argument("--expect-conda-env", default=None, help="If set, also probe CUDA-Q inside this conda env (e.g., 'mlqec-env')")
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -209,7 +246,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     section("Dependency Check")
     deps_log = artifact_root / "deps.txt"
     try:
-        versions = check_deps(deps_log)
+        versions = check_deps(deps_log, expect_conda_env=args.expect_conda_env)
     except PreflightError as exc:
         summary_json["versions"] = {}
         summary_rows.append(StepResult("dependencies", "fail", {"message": str(exc)}))
@@ -317,6 +354,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     summary_json["steps"] = {row.name: row.to_summary() for row in summary_rows}
     summary_json.setdefault("versions", {})
     summary_json["cudaq_available"] = bool(versions.get("cudaq_available"))
+    if "conda_env" in versions:
+        summary_json["conda_env"] = versions.get("conda_env")
+    if "cudaq_in_env" in versions:
+        summary_json["cudaq_in_env"] = versions.get("cudaq_in_env")
 
     summary_path = artifact_root / "summary.json"
     summary_path.write_text(json.dumps(summary_json, indent=2) + "\n", encoding="utf-8")
