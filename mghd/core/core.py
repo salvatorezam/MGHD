@@ -413,7 +413,12 @@ def pack_cluster(
 
 
 class GraphDecoderCore(nn.Module):
-    """Graph neural network decoder used inside MGHD v2."""
+    """Iterative message-passing core used by MGHDv2's graph head.
+
+    Runs a small MLP for edge messages and a GRU to update node states for a
+    fixed number of iterations; exposes a 2‑logit per‑node head at each step
+    (the caller typically takes the last step).
+    """
 
     def __init__(
         self,
@@ -456,6 +461,15 @@ class GraphDecoderCore(nn.Module):
         src_ids: torch.Tensor,
         dst_ids: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute per‑node logits for one graph.
+
+        Parameters
+        - node_inputs: [N, F] node features (already projected to hidden dim)
+        - src_ids/dst_ids: [E] edge endpoints (0‑based node indices)
+
+        Returns
+        - [T, N, 2] logits (T iterations)
+        """
         device = node_inputs.device
         node_states = torch.zeros(node_inputs.shape[0], self.n_node_features, device=device)
         outputs_tensor = torch.zeros(
@@ -505,7 +519,7 @@ class ChannelSE(nn.Module):
 
 
 class GraphDecoder(nn.Module):
-    """Wrapper over the graph decoder that normalizes constructor kwargs."""
+    """Wrapper that normalizes kwargs and instantiates GraphDecoderCore."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__()
@@ -519,6 +533,7 @@ class GraphDecoder(nn.Module):
         self.core = GraphDecoderCore(**normalized)
 
     def forward(self, node_inputs: torch.Tensor, src_ids: torch.Tensor, dst_ids: torch.Tensor) -> torch.Tensor:
+        """Pass through to the underlying core; see GraphDecoderCore.forward."""
         return self.core(node_inputs, src_ids, dst_ids)
 
 
@@ -541,7 +556,11 @@ def _mamba_constructors() -> List[Any]:
 
 
 class SequenceEncoder(nn.Module):
-    """Mask-aware adapter over Mamba encoder implementations."""
+    """Mask‑aware adapter over Mamba encoder implementations.
+
+    Selects a working constructor from several common entry points and wraps the
+    resulting module with a layer norm and simple scatter‑add back to node space.
+    """
 
     def __init__(self, d_model: int, d_state: int):
         super().__init__()
@@ -575,6 +594,11 @@ class SequenceEncoder(nn.Module):
         *,
         node_type: torch.Tensor,
     ) -> torch.Tensor:
+        """Encode check‑node slice and scatter back to node features.
+
+        Uses ``seq_idx``/``seq_mask`` to pick and order checks in the sequence
+        encoder and then fuses the output additively into ``x``.
+        """
         if seq_idx.numel() == 0 or seq_mask.sum() == 0:
             return x
         valid = seq_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -592,7 +616,7 @@ class SequenceEncoder(nn.Module):
 
 
 class GraphDecoderAdapter(nn.Module):
-    """Adapter over the graph decoder for v2 crops."""
+    """Thin adapter over GraphDecoder for v2 crops (sets shapes/heads)."""
 
     def __init__(
         self,
@@ -624,6 +648,7 @@ class GraphDecoderAdapter(nn.Module):
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute last‑iteration logits [N,2] with masked edges."""
         src_ids = edge_index[0]
         dst_ids = edge_index[1]
         if edge_mask is not None:

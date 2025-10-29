@@ -389,6 +389,7 @@ def save_npz(hx: np.ndarray, hz: np.ndarray, path: str | np.ndarray, meta: dict[
 
 @cache
 def build_surface_rotated_H(d: int) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Construct rotated planar surface Hx/Hz with metadata for odd distance d."""
     if d < 1 or d % 2 == 0:
         raise ValueError("Rotated surface code requires odd distance >= 1")
     n_data = d * d
@@ -441,6 +442,7 @@ def build_surface_rotated_H(d: int) -> tuple[np.ndarray, np.ndarray, dict[str, A
 
 @cache
 def default_surface_rotated_layout(d: int) -> dict[str, Any]:
+    """Reference planar layout description for the rotated surface code."""
     hx, hz, meta = build_surface_rotated_H(d)
     n_data = meta["N_bits"]
     ancilla_z = list(range(n_data, n_data + hz.shape[0]))
@@ -468,6 +470,7 @@ def default_surface_rotated_layout(d: int) -> dict[str, Any]:
 
 
 def logical_surface_rotated(d: int) -> dict[str, np.ndarray]:
+    """Return simple weight‑d logicals crossing the center row/column (Lx/Lz)."""
     if d < 1 or d % 2 == 0:
         raise ValueError("Rotated surface code requires odd distance >= 1")
     n = d * d
@@ -482,6 +485,7 @@ def logical_surface_rotated(d: int) -> dict[str, np.ndarray]:
 
 
 def surface_rotated_spec(d: int) -> CodeSpec:
+    """Package the rotated surface Hx/Hz into an immutable CodeSpec."""
     hx, hz, meta = build_surface_rotated_H(d)
     meta_copy = dict(meta)
     return CodeSpec(name=f"surface_d{d}", n=hx.shape[1], hx=hx, hz=hz, d=d, meta=meta_copy)
@@ -493,6 +497,7 @@ def surface_rotated_spec(d: int) -> CodeSpec:
 
 
 def build_surface(distance: int, *, rotated: bool = True) -> CSSCode:
+    """Build a CSSCode object for the rotated planar surface code."""
     d = int(distance)
     if d < 3 or d % 2 == 0:
         raise ValueError("distance must be odd and >= 3 for rotated surface")

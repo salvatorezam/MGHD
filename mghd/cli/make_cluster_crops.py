@@ -1,3 +1,13 @@
+"""Generate teacher‑labeled cluster crops for offline training.
+
+This CLI samples single rounds (CUDA‑Q or synthetic), splits active checks into
+connected components (clusters), and packs each local subproblem into fixed‑pad
+"crops" compatible with MGHDv2. A teacher mix (MWPF/LSD/MWPM) produces per‑crop
+labels. Optional TAD features (from a QPU JSON and schedule IR) are included in
+the global token to bias training.
+
+Note: CUDA/CUDA‑Q are initialized only inside ``main()``.
+"""
 # NOTE: Initialize CUDA/CUDA-Q only in main().
 from __future__ import annotations
 
@@ -27,6 +37,13 @@ from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_
 
 @dataclass
 class TeacherOutput:
+    """Container for a candidate per‑crop label from one teacher.
+
+    bits:   local data‑qubit correction vector (uint8 [nQ])
+    weight: lightweight cost/weight metric from the teacher
+    teacher: name tag (e.g., 'mwpf', 'lsd', 'mwpm')
+    valid:  parity/coset validation flag for this crop
+    """
     bits: np.ndarray
     weight: int
     teacher: str
@@ -34,6 +51,7 @@ class TeacherOutput:
 
 
 def short_sha(*objs) -> str:
+    """Eight‑char SHA1 digest over a sequence of serializable objects."""
     h = hashlib.sha1()
     for o in objs:
         if isinstance(o, (bytes, bytearray)):
@@ -46,6 +64,11 @@ def short_sha(*objs) -> str:
 
 
 def _build_schedule_ir(context_source: str, code_obj: object):
+    """Best‑effort extraction of a schedule IR from a native circuit.
+
+    Returns a list of (time, gate, qubits, duration) tuples, or [] when no
+    circuit/adapter is available. ``context_source`` chooses among qiskit/cirq/cudaq.
+    """
     import sys
     native = None
     for attr in ("native_circuit", "reference_circuit", "circuit", "qc", "quantum_circuit"):
@@ -71,6 +94,7 @@ def _build_schedule_ir(context_source: str, code_obj: object):
 
 
 def parse_families(spec: str) -> List[str]:
+    """Parse comma‑separated family list; default ['surface'] when empty."""
     if not spec:
         return ["surface"]
     families = [part.strip() for part in spec.split(",") if part.strip()]
@@ -78,6 +102,7 @@ def parse_families(spec: str) -> List[str]:
 
 
 def parse_distances(spec: str) -> List[int]:
+    """Parse distance spec: '3', '3,5,7', or '3-9:2'."""
     spec = (spec or "").strip()
     if not spec:
         return []
@@ -91,6 +116,7 @@ def parse_distances(spec: str) -> List[int]:
 
 
 def parse_teacher_mix(spec: str) -> Dict[str, float]:
+    """Parse weights like 'mwpf=0.7,mwpm=0.2,lsd=0.1' into a dict."""
     weights = {"mwpf": 1.0, "mwpm": 0.0, "lsd": 0.0}
     if not spec:
         return weights
@@ -111,6 +137,7 @@ def parse_teacher_mix(spec: str) -> Dict[str, float]:
 
 
 def _parity_valid(bits: np.ndarray, synd_bits: np.ndarray, H_sub: np.ndarray) -> bool:
+    """Return True when H_sub @ bits ≡ synd_bits (mod 2) for the crop."""
     return _check_parity_coset_valid(bits & 1, synd_bits, H_sub)
 
 
@@ -119,6 +146,7 @@ def _select_teacher(
     mix: Dict[str, float],
     rng: np.random.Generator,
 ) -> TeacherOutput:
+    """Stochastic selection among valid teacher outputs using ``mix`` weights."""
     weighted = [
         (name, out, mix[name])
         for name, out in outputs.items()
@@ -140,6 +168,7 @@ def _select_teacher(
 
 
 def run(args) -> None:
+    """Core implementation for crop generation (argument object from argparse)."""
     rng = np.random.default_rng(args.seed)
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -388,6 +417,7 @@ def run(args) -> None:
 
 
 def main() -> None:
+    """CLI entry point for ``mghd-make-crops``."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--families", type=str, default="surface", help="Comma-separated code families")
     ap.add_argument("--distances", type=str, default="3", help="Distance spec (e.g., '3,5,7' or '3-9:2')")

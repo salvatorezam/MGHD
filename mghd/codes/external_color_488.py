@@ -1,4 +1,15 @@
-"""External providers for triangular 4.8.8 color codes."""
+"""External providers for triangular 4.8.8 color codes.
+
+This module tries to build Hx/Hz for the triangular 4.8.8 family via optional
+third‑party libraries. Two providers are supported:
+
+- PanQEC (``panqec``): generic color‑code constructors
+- PECOS (``quantum-pecos``): explicit Color488 model
+
+Each builder returns a tuple ``(Hx, Hz, n, layout)`` where ``Hx/Hz`` are uint8
+parity‑check matrices, ``n`` is the number of data qubits (columns), and
+``layout`` is a small dict describing the provenance and geometry.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Tuple
@@ -7,6 +18,15 @@ import numpy as np
 
 
 def _faces_to_matrix(faces: Iterable[Iterable[Any]], qubits: Iterable[Any]) -> np.ndarray:
+    """Convert a list of faces (qubit ids per stabilizer) into a binary matrix.
+
+    Parameters
+    - faces: iterable of stabilizer faces (each an iterable of qubit ids)
+    - qubits: iterable of all qubit ids in the code
+
+    Returns
+    - uint8 array with shape [#faces, #qubits] with ones at face memberships
+    """
     face_list = [tuple(face) for face in faces]
     qubit_list = list(qubits)
     index = {q: i for i, q in enumerate(qubit_list)}
@@ -18,6 +38,18 @@ def _faces_to_matrix(faces: Iterable[Iterable[Any]], qubits: Iterable[Any]) -> n
 
 
 def build_color_488_panqec(distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+    """Build triangular 4.8.8 code using PanQEC, if available.
+
+    Parameters
+    - distance: triangle side length (odd, typically ≥3)
+
+    Returns
+    - (Hx, Hz, n, layout): parity checks, number of data qubits, and metadata
+
+    Raises
+    - ImportError if PanQEC is installed but a compatible 4.8.8 class is not found
+    - RuntimeError if qubits/faces cannot be extracted from the provider
+    """
     import importlib
     import inspect
 
@@ -63,6 +95,17 @@ def build_color_488_panqec(distance: int) -> Tuple[np.ndarray, np.ndarray, int, 
 
 
 def build_color_488_pecos(distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+    """Build triangular 4.8.8 code using quantum‑PECOS, if available.
+
+    Parameters
+    - distance: triangle side length (odd, typically ≥3)
+
+    Returns
+    - (Hx, Hz, n, layout): parity checks, number of data qubits, and metadata
+
+    Raises
+    - RuntimeError if PECOS is not installed or stabilizers are unavailable
+    """
     import importlib
 
     pecos = importlib.import_module("pecos")
@@ -89,6 +132,10 @@ def build_color_488_pecos(distance: int) -> Tuple[np.ndarray, np.ndarray, int, D
 
 
 def build_color_488(distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any]]:
+    """Try PanQEC first, then PECOS, and return 4.8.8 code matrices.
+
+    Raises ImportError if neither provider is available.
+    """
     errors = []
     try:
         return build_color_488_panqec(distance)

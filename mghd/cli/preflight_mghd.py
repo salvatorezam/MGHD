@@ -1,5 +1,16 @@
 #!/usr/bin/env python
-"""MGHD preflight and validator."""
+"""MGHD preflight and validator.
+
+Runs a compact readiness suite:
+- Dependency checks (versions of PyMatching/Stim and CUDA‑Q availability)
+- Optional pytest run
+- Stim + DEM correlated matching A/B with LER thresholds
+- Optional CUDA‑Q smoke (teacher_eval with cudaq sampler)
+
+Artifacts are written under ``artifacts/preflight`` and a final summary is
+printed and saved as JSON. Non‑blocking failures are reported but do not abort
+the entire run; blocking failures raise PreflightError early.
+"""
 from __future__ import annotations
 
 import argparse
@@ -14,6 +25,7 @@ from pathlib import Path
 
 @dataclass
 class StepResult:
+    """One row in the preflight summary table."""
     name: str
     status: str
     details: dict[str, object]
@@ -25,6 +37,7 @@ class StepResult:
 
 
 def section(title: str) -> None:
+    """Print a section header to the console."""
     print(f"\n=== {title} ===")
 
 
@@ -33,6 +46,11 @@ class PreflightError(RuntimeError):
 
 
 def check_deps(log_path: Path) -> dict[str, object]:
+    """Verify core dependencies and emit a log; return version info dict.
+
+    Ensures PyMatching≥2.3.0 and Stim are importable; probes CUDA‑Q presence
+    without failing the entire run when unavailable.
+    """
     import importlib.metadata as im
 
     from packaging.version import Version  # type: ignore
@@ -93,6 +111,7 @@ def check_deps(log_path: Path) -> dict[str, object]:
 
 
 def run(cmd: Iterable[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess, tee output to a log, and return the CompletedProcess."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     cmd_list = list(cmd)
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -118,6 +137,7 @@ LER_PATTERN = re.compile(r"LER(?:_(?P<kind>dem|mix))?\s*[:=]\s*(?P<value>[0-9]+(
 
 
 def parse_ler(stdout: str) -> dict[str, float | None]:
+    """Extract LER_dem and LER_mix (if present) from teacher_eval output."""
     results: dict[str, float | None] = {"dem": None, "mix": None}
     for match in LER_PATTERN.finditer(stdout):
         kind = match.group("kind") or "mix"
@@ -135,6 +155,7 @@ def write_skip_log(path: Path, message: str) -> None:
 
 
 def summarize(rows: Iterable[StepResult]) -> None:
+    """Print a compact text table for the collected StepResults."""
     section("Summary")
     header = f"{'Stage':<18}{'Status':<8}Details"
     print(header)
@@ -154,6 +175,9 @@ def summarize(rows: Iterable[StepResult]) -> None:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    """CLI entrypoint for MGHD preflight.
+
+    Returns process‑style exit code (0 on pass, 1 on fail)."""
     parser = argparse.ArgumentParser("MGHD preflight and validator")
     parser.add_argument("--families", default="surface")
     parser.add_argument("--distances", default="5")
