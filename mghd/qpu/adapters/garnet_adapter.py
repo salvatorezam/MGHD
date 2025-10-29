@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+"""Garnet adapter: convenience helpers around CUDA‑Q surface sampling.
+
+This module provides a simple, self‑contained entrypoint (`sample_round`) that
+returns CSS parity checks, single‑round detector bits (Z→X order), and lattice
+coordinates for both data qubits and check operators. It also exposes
+`split_components_for_side`, a utility that groups active checks into connected
+components suitable for packing as training crops.
+
+Design notes:
+- Detector order is canonicalized to Z first, then X (consistent with DEM/Stim).
+- Check coordinates preserve geometric half‑offsets and are emitted as float32.
+- A synthetic fallback path keeps the pipeline alive when CUDA‑Q is unavailable.
+"""
+
 import os
 from typing import Any
 
@@ -20,13 +34,14 @@ _USE_SYNTH = os.getenv("MGHD_SYNTHETIC","0") == "1"
 _MODE = os.getenv("MGHD_MODE","foundation")  # {"foundation","student"}
 
 def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -> dict[str, Any]:
-    """
-    Returns dict with keys:
-      Hx, Hz: (uint8) parity-check matrices
-      synZ, synX: (uint8) syndrome vectors
-      coords_q, coords_c: (int32) absolute lattice coords for data qubits / checks
-      dem_meta: opaque metadata for MWPF teacher (DEM/circuit context), not used for sampling
-    CUDA-Q must initialize only inside this function.
+    """Sample a single surface‑code round via CUDA‑Q (or synthetic fallback).
+
+    Returns
+    - Hx, Hz: uint8 parity‑check matrices trimmed to measured checks
+    - synZ, synX: uint8 detector bits (Z then X ordering)
+    - coords_q: int32 data‑qubit lattice coordinates
+    - coords_c: float32 check coordinates (Z first then X), half‑offset preserved
+    - dem_meta: metadata for downstream teachers (opaque)
     """
     if _USE_SYNTH:
         return _synthetic_sample_round(d, p, seed)
@@ -51,8 +66,8 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
             profile_json=profile_path,
         )
         
-        # Extract syndrome components from packed result
-        # Format: [X_syndrome, 2*Z_syndrome, X_error + 2*Z_error]
+        # Extract Z/X syndrome components from packed result
+        # Backend format: [X_syndrome, 2*Z_syndrome, X_error + 2*Z_error]
         n_x_checks = len(layout['ancilla_x'])
         n_z_checks = len(layout['ancilla_z'])
         synX = result[0, :n_x_checks].astype(np.uint8)
@@ -62,7 +77,7 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
         Hx_measured = Hx[:n_x_checks, :]
         Hz_measured = Hz[:n_z_checks, :]
         
-        # Generate coordinate information for clustering
+        # Generate coordinate information for clustering (Z→X order for checks)
         coords_q = _generate_qubit_coords(d)
         coords_c = _generate_check_coords(d)
         
@@ -100,8 +115,9 @@ def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
     
     # Surface code dimensions for distance d
     n_data = d * d
-    n_check_x = d * (d - 1)  # X stabilizers
-    n_check_z = (d - 1) * d  # Z stabilizers
+    # Rotated planar per-round check counts (each type)
+    n_check_z = (d * d - 1) // 2
+    n_check_x = (d * d - 1) // 2
     
     # Create simple parity-check matrices (placeholder structure)
     Hz = rng.integers(0, 2, (n_check_z, n_data), dtype=np.uint8)
@@ -112,9 +128,9 @@ def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
     synZ = rng.choice([0, 1], size=n_check_z, p=[1-effective_p, effective_p]).astype(np.uint8)
     synX = rng.choice([0, 1], size=n_check_x, p=[1-effective_p, effective_p]).astype(np.uint8)
     
-    # Generate coordinate grids
+    # Generate coordinate grids (checks are Z then X)
     coords_q = _generate_qubit_coords(d)
-    coords_c = _generate_check_coords(d)
+    coords_c = _generate_check_coords(d)  # Z first then X
     
     return {
         'Hx': Hx,
@@ -127,7 +143,7 @@ def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
     }
 
 def _generate_qubit_coords(d: int) -> np.ndarray:
-    """Generate lattice coordinates for data qubits in rotated surface code"""
+    """Grid coordinates for data qubits on a rotated surface lattice (int32)."""
     coords = []
     for i in range(d):
         for j in range(d):
@@ -138,21 +154,24 @@ def _generate_qubit_coords(d: int) -> np.ndarray:
     return np.array(coords, dtype=np.int32)
 
 def _generate_check_coords(d: int) -> np.ndarray:
-    """Generate lattice coordinates for check operators in rotated surface code"""
-    coords = []
-    # X checks
-    for i in range(d-1):
+    """Check coordinates (float32), Z checks first then X checks.
+
+    Preserves half‑grid offsets so geometry is consistent with rotated planar
+    embeddings and can be used directly for Hilbert ordering and bbox.
+    """
+    coords: list[list[float]] = []
+    # Z checks first (canonical), then X checks
+    for i in range(d):
+        for j in range(d - 1):
+            x = i + j + 0.5
+            y = i - j - 0.5
+            coords.append([x, y])
+    for i in range(d - 1):
         for j in range(d):
             x = i + j + 0.5
             y = i - j + 0.5
             coords.append([x, y])
-    # Z checks  
-    for i in range(d):
-        for j in range(d-1):
-            x = i + j + 0.5
-            y = i - j - 0.5
-            coords.append([x, y])
-    return np.array(coords, dtype=np.int32)
+    return np.array(coords, dtype=np.float32)
 
 def split_components_for_side(
     *, side: str, Hx: np.ndarray, Hz: np.ndarray, synZ: np.ndarray, synX: np.ndarray,
@@ -166,8 +185,8 @@ def split_components_for_side(
     """
     try:
         import scipy.sparse as sp
-
-        from . import clustered as cc
+        # clustered lives under mghd.decoders.lsd
+        from mghd.decoders.lsd import clustered as cc
         
         # Select appropriate matrices and syndromes based on side
         if side == 'Z':
@@ -177,7 +196,7 @@ def split_components_for_side(
         elif side == 'X':
             H = Hx
             synd_bits = synX
-            check_coords = coords_c[len(synZ):len(synZ)+len(synX)]  # X checks after Z checks
+            check_coords = coords_c[len(synZ):len(synZ)+len(synX)]  # X after Z
         else:
             raise ValueError(f"Unknown side: {side}")
         
@@ -221,8 +240,8 @@ def split_components_for_side(
             
             component = {
                 'H_sub': H_sub.astype(np.uint8),
-                'xy_qubit': xy_qubit.astype(np.int32),
-                'xy_check': xy_check.astype(np.int32),
+                'xy_qubit': np.asarray(xy_qubit),
+                'xy_check': np.asarray(xy_check),
                 'synd_bits': synd_component.astype(np.uint8),
                 'bbox_xywh': bbox_xywh,
                 'k': k,

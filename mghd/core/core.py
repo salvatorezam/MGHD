@@ -18,7 +18,16 @@ import torch.nn as nn
 
 @dataclass
 class MGHDConfig:
-    """Minimal configuration needed to rebuild the S-profile MGHD model."""
+    """Minimal configuration for reconstructing an MGHDv2 instance.
+
+    Fields
+    - gnn: keyword args for the graph message-passing core
+    - mamba: keyword args for the sequence encoder (state-space model)
+    - profile: model size/profile tag (e.g., "S")
+    - dist: nominal code distance used for defaults (metadata only)
+    - n_qubits/n_checks: reference sizes (metadata only)
+    - n_node_inputs/n_node_outputs: feature and head sizes
+    """
 
     gnn: Dict[str, Any]
     mamba: Dict[str, Any]
@@ -105,6 +114,7 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
 
 @dataclass
 class CropMeta:
+    """Lightweight metadata describing a packed crop and pad/bucket sizes."""
     k: int
     r: int
     bbox_xywh: Tuple[int, int, int, int]
@@ -122,6 +132,7 @@ class CropMeta:
 
 @dataclass
 class PackedCrop:
+    """All tensors required for a single crop forward pass and supervision."""
     x_nodes: torch.Tensor
     node_mask: torch.Tensor
     node_type: torch.Tensor
@@ -139,12 +150,14 @@ class PackedCrop:
 
 
 def _degree_from_Hsub(H_sub: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (data_degree, check_degree) from a 0/1 submatrix H_sub."""
     deg_data = H_sub.sum(axis=0).astype(np.int32)
     deg_check = H_sub.sum(axis=1).astype(np.int32)
     return deg_data, deg_check
 
 
 def _normalize_xy(xy: np.ndarray, bbox_xywh: Tuple[int, int, int, int]) -> np.ndarray:
+    """Translate/scale absolute coordinates into [0,1] within the bbox."""
     x0, y0, w, h = bbox_xywh
     w = max(w, 1)
     h = max(h, 1)
@@ -155,6 +168,7 @@ def _normalize_xy(xy: np.ndarray, bbox_xywh: Tuple[int, int, int, int]) -> np.nd
 
 
 def _quantize_xy01(xy01: np.ndarray, levels: int = 64) -> np.ndarray:
+    """Uniformly quantize points in [0,1]^2 onto a levels×levels grid."""
     return np.clip((xy01 * (levels - 1) + 0.5).astype(np.int32), 0, levels - 1)
 
 
@@ -182,6 +196,7 @@ def _hilbert_xy_to_d(n: int, x: int, y: int) -> int:
 
 
 def _hilbert_index_2d(qxy: np.ndarray, levels: int = 64) -> np.ndarray:
+    """Return Hilbert indices for integer grid points qxy in [0,levels)."""
     idx = np.zeros(qxy.shape[0], dtype=np.int64)
     for i, (qx, qy) in enumerate(qxy):
         idx[i] = _hilbert_xy_to_d(levels, int(qx), int(qy))
@@ -189,6 +204,7 @@ def _hilbert_index_2d(qxy: np.ndarray, levels: int = 64) -> np.ndarray:
 
 
 def hilbert_order_within_bbox(check_xy: np.ndarray, bbox_xywh: Tuple[int, int, int, int]) -> np.ndarray:
+    """Stable argsort of check nodes by 2D Hilbert order inside bbox."""
     xy01 = _normalize_xy(check_xy, bbox_xywh)
     qxy = _quantize_xy01(xy01, levels=64)
     hilbert = _hilbert_index_2d(qxy, levels=64)
@@ -201,6 +217,7 @@ def infer_bucket_id(
     n_seq: int,
     bucket_spec: Sequence[Tuple[int, int, int]],
 ) -> int:
+    """Pick first (node_cap, edge_cap, seq_cap) triple that fits sizes."""
     for idx, (node_cap, edge_cap, seq_cap) in enumerate(bucket_spec):
         if n_nodes <= node_cap and n_edges <= edge_cap and n_seq <= seq_cap:
             return idx
@@ -233,6 +250,11 @@ def pack_cluster(
     g_extra: Optional[np.ndarray] = None,
     erase_local: Optional[np.ndarray] = None,
 ) -> PackedCrop:
+    """Pack a local subgraph into fixed-pad tensors for MGHDv2.
+
+    Produces node/edge/sequence tensors, a global conditioning token, and the
+    supervision vector y_bits (data-qubit region) with optional erasure feature.
+    """
     assert side in ("Z", "X")
     nC, nQ = H_sub.shape
     deg_data, deg_check = _degree_from_Hsub(H_sub)
@@ -391,7 +413,12 @@ def pack_cluster(
 
 
 class GraphDecoderCore(nn.Module):
-    """Graph neural network decoder used inside MGHD v2."""
+    """Iterative message-passing core used by MGHDv2's graph head.
+
+    Runs a small MLP for edge messages and a GRU to update node states for a
+    fixed number of iterations; exposes a 2‑logit per‑node head at each step
+    (the caller typically takes the last step).
+    """
 
     def __init__(
         self,
@@ -434,6 +461,15 @@ class GraphDecoderCore(nn.Module):
         src_ids: torch.Tensor,
         dst_ids: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute per‑node logits for one graph.
+
+        Parameters
+        - node_inputs: [N, F] node features (already projected to hidden dim)
+        - src_ids/dst_ids: [E] edge endpoints (0‑based node indices)
+
+        Returns
+        - [T, N, 2] logits (T iterations)
+        """
         device = node_inputs.device
         node_states = torch.zeros(node_inputs.shape[0], self.n_node_features, device=device)
         outputs_tensor = torch.zeros(
@@ -483,7 +519,7 @@ class ChannelSE(nn.Module):
 
 
 class GraphDecoder(nn.Module):
-    """Wrapper over the graph decoder that normalizes constructor kwargs."""
+    """Wrapper that normalizes kwargs and instantiates GraphDecoderCore."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__()
@@ -497,6 +533,7 @@ class GraphDecoder(nn.Module):
         self.core = GraphDecoderCore(**normalized)
 
     def forward(self, node_inputs: torch.Tensor, src_ids: torch.Tensor, dst_ids: torch.Tensor) -> torch.Tensor:
+        """Pass through to the underlying core; see GraphDecoderCore.forward."""
         return self.core(node_inputs, src_ids, dst_ids)
 
 
@@ -519,7 +556,11 @@ def _mamba_constructors() -> List[Any]:
 
 
 class SequenceEncoder(nn.Module):
-    """Mask-aware adapter over Mamba encoder implementations."""
+    """Mask‑aware adapter over Mamba encoder implementations.
+
+    Selects a working constructor from several common entry points and wraps the
+    resulting module with a layer norm and simple scatter‑add back to node space.
+    """
 
     def __init__(self, d_model: int, d_state: int):
         super().__init__()
@@ -553,6 +594,11 @@ class SequenceEncoder(nn.Module):
         *,
         node_type: torch.Tensor,
     ) -> torch.Tensor:
+        """Encode check‑node slice and scatter back to node features.
+
+        Uses ``seq_idx``/``seq_mask`` to pick and order checks in the sequence
+        encoder and then fuses the output additively into ``x``.
+        """
         if seq_idx.numel() == 0 or seq_mask.sum() == 0:
             return x
         valid = seq_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -570,7 +616,7 @@ class SequenceEncoder(nn.Module):
 
 
 class GraphDecoderAdapter(nn.Module):
-    """Adapter over the graph decoder for v2 crops."""
+    """Thin adapter over GraphDecoder for v2 crops (sets shapes/heads)."""
 
     def __init__(
         self,
@@ -602,6 +648,7 @@ class GraphDecoderAdapter(nn.Module):
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute last‑iteration logits [N,2] with masked edges."""
         src_ids = edge_index[0]
         dst_ids = edge_index[1]
         if edge_mask is not None:

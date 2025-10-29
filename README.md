@@ -27,7 +27,7 @@ The decoder is designed for real-time performance while maintaining high accurac
   - CUDA-Q for realistic circuit-level noise simulation with Kraus operators
   - Stim for efficient Pauli-channel sampling
 - **Teacher Ensemble**: Learns from multiple classical decoding algorithms:
-  - MWPF (Minimum Weight Perfect Matching with hypergraphs)
+  - Hyperblossom (MWPF)
   - LSD (Belief Propagation + OSD)
   - MWPM (Classical minimum weight perfect matching)
 - **Flexible Training**: Supports curriculum learning across code distances, online RL, and adaptive weighting
@@ -47,9 +47,10 @@ The decoder is designed for real-time performance while maintaining high accurac
 - Sampling Backends
   - CUDA‑Q (trajectories): Circuit‑level noise driven by the QPU profile JSON; used for online training via `--online`.
   - Stim (Pauli): Fast Pauli/twirled approximation for A/B checks and smoke tests.
+  - Canonical detector packing is Z→X across backends to match DEM/Stim conventions.
 
 - Teachers and Labels
-  - MWPFTeacher (`mghd.decoders.mwpf_teacher`): Hypergraph decoder on detector streams; accepts optional `mwpf_scale` (per‑fault scaling derived from TAD LLRs).
+- Hyperblossom (MWPF) (`mghd.decoders.mwpf_teacher`): Hypergraph decoder on detector streams; accepts optional `mwpf_scale` (per‑fault scaling derived from TAD LLRs).
   - LSDTeacher (`mghd.decoders.lsd_teacher`): BP+OSD on CSS parity checks; supports LLR overrides from TAD.
   - MWPMFallback (`mghd.decoders.mwpm_fallback`): Classical matching from H, used as fallback or in teacher mixes.
   - Mix selection (`--teacher-mix`): Weighted random choice per crop among available teachers.
@@ -81,6 +82,7 @@ The decoder is designed for real-time performance while maintaining high accurac
 - Erasure Awareness
   - Samplers can provide or inject erasure masks; `pack_cluster` adds a per‑data‑qubit erasure feature; teachers consume masks when available.
   - The node feature dimension increases by 1 when erasures are used; not tied to code distance or family.
+  - Stim mirrors CUDA‑Q interface knobs (e.g., optional observables and erasure masks) with zero overhead when unused; you can drive both samplers with the same flags.
 
 - Inference
   - The wrapper collates per‑crop tensors, applies the model, and scatters per‑data‑qubit probabilities back to the code’s local index set for metric computation.

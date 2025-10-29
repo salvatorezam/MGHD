@@ -42,22 +42,27 @@ except Exception as exc:  # pragma: no cover - optional dependency stack
 
 @dataclass
 class MixConfig:
+    """Configuration of teacher selection probabilities and limits.
+
+    p_mwpf/p_lsd/p_mwpm: selection probabilities per batch (normalized internally)
+    max_cluster: cap used by erasure teachers for local component size
+    """
     p_mwpf: float = 0.5
     p_lsd: float = 0.4
     p_mwpm: float = 0.1
     max_cluster: int = 256
-    max_cluster: int = 256
 
 
 class TeacherMix:
-    """
-    For CSS codes:
-      - MWPF works on detector graph (fault hypergraph) -> returns fault_ids
-      - LSD returns data-qubit flips ex, ez
-      - MWPM returns fault_ids w.r.t. H columns
-    The training loop can use either form:
-      - convert fault_ids to data flips via code_obj map
-      - or supervise per-fault logits (for MGHD) and parity projection
+    """Stochastic router across MWPF/LSD/MWPM/erasure teachers for CSS codes.
+
+    - MWPF (Hyperblossom) consumes detectors → returns fault_ids
+    - LSD returns data-qubit flips (ex, ez)
+    - MWPM returns fault_ids under graphlike assumptions
+    - Erasure teachers handle explicit erasure masks
+
+    The training loop can supervise per-fault or per-qubit heads depending on
+    the teacher used; parity projection ensures consistency when needed.
     """
 
     def __init__(
@@ -71,6 +76,7 @@ class TeacherMix:
         mix_cfg: Optional[MixConfig] = None,
         mwpm_graphlike_only: bool = True,
     ) -> None:
+        """Initialize teacher stack and probabilities for a given CSS code."""
         base_mix = mix_cfg or MixConfig()
         self._max_cluster = base_mix.max_cluster
         self._mwpm_graphlike_only = bool(mwpm_graphlike_only)
@@ -181,6 +187,11 @@ class TeacherMix:
         weight_overrides: Optional[Dict[str, Any]] = None,
         dem_teacher: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        """Route one batch through a chosen teacher according to mix probs.
+
+        Returns a payload tagged with 'which' ∈ {mwpf, lsd, mwpm, mwpm_fallback},
+        and optionally dem_* keys when DEM guidance is enabled.
+        """
         rng = rng or np.random.default_rng()
         r = float(rng.uniform())
         has_erasure = erase_data_mask is not None and np.any(erase_data_mask)
@@ -308,6 +319,7 @@ class TeacherMix:
             )
 
     def _set_mix_probs(self, p_mwpf: float, p_lsd: float, p_mwpm: float) -> None:
+        """Normalize and store mix probabilities, preserving total mass."""
         probs = np.array([float(p_mwpf), float(p_lsd), float(p_mwpm)], dtype=float)
         total = probs.sum()
         if total <= 0:
@@ -317,6 +329,7 @@ class TeacherMix:
         self.mix = MixConfig(float(probs[0]), float(probs[1]), float(probs[2]), self._max_cluster)
 
     def _disable_mwpm(self, reason: str) -> None:
+        """Disable MWPM branch and reassign its mass to LSD."""
         if not self._mwpm_enabled:
             return
         self._mwpm_enabled = False

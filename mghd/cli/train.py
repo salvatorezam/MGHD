@@ -1,3 +1,11 @@
+"""MGHD trainer: offline (crops) and online (CUDA‑Q) modes.
+
+Defines a small offline dataset loader for crop shards and an online training
+loop that samples syndromes on the fly, routes teacher supervision, and packs
+subgraphs into MGHDv2 input tensors. Detector bits are handled in canonical
+Z→X order throughout (matching Stim/DEM). CUDA is initialized only inside
+``main``.
+"""
 # NOTE: Initialize CUDA only in main(). This file defines dataset, model, loop.
 from __future__ import annotations
 
@@ -31,6 +39,8 @@ from mghd.codes.qpu_profile import load_qpu_profile
 
 
 class CropShardDataset(Dataset):
+    """Index all ``.npz`` shards under ``root`` and expose packed crops."""
+
     def __init__(self, root: str, curriculum: str = "stage1", max_shards: int | None = None):
         self.files = sorted(glob.glob(os.path.join(root, "**/*.npz"), recursive=True))
         if max_shards is not None:
@@ -51,9 +61,11 @@ class CropShardDataset(Dataset):
         print(f"Loaded {len(self.items)} crop items from {len(self.files)} shards")
         
     def __len__(self): 
+        """Return number of packed items across all shards."""
         return len(self.items)
         
     def __getitem__(self, idx):
+        """Load one PackedCrop (as torch tensors) and attach teacher metadata."""
         _, item = self.items[idx]
 
         def to_tensor(x, dtype=None):
@@ -126,8 +138,11 @@ def make_bucket_sampler(ds: CropShardDataset, *, stage="stage1", seed=0):
     return _S()
 
 def collate_packed(batch):
-    # Single-sample per item; batch via stacking on a new dim for tensors that allow it.
-    # Keep compatibility with existing microbatching by treating batch_size as micro-accumulation.
+    """Identity collate: crops are processed one by one in the training loop.
+
+    Retains compatibility with micro‑accumulation styles where the trainer
+    iterates over items and aggregates gradients manually.
+    """
     return batch
 
 def bce_binary_head_loss(
@@ -139,6 +154,7 @@ def bce_binary_head_loss(
     sample_weight: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
 ) -> torch.Tensor:
+    """Binary cross‑entropy on data‑qubit nodes with optional smoothing/weights."""
     # Use only data-qubit nodes (type==0) and valid mask
     is_data = (node_type == 0) & node_mask
     if is_data.sum() == 0:
@@ -159,6 +175,7 @@ def parity_auxiliary_loss(
     node_type: torch.Tensor,
     H_sub: np.ndarray,
 ) -> torch.Tensor:
+    """Small regularizer encouraging parity consistency within the crop."""
     # Differentiable XOR expectation ~= parity of Bernoulli probs
     with torch.no_grad():
         is_data = ((node_type == 0) & node_mask).cpu().numpy()
@@ -192,6 +209,11 @@ def projection_aware_logits_to_bits(
     *,
     data_mask: torch.Tensor,
 ) -> np.ndarray:
+    """Project probabilities to ML bits via the exact GF(2) projector.
+
+    Converts per‑node logits to probabilities, extracts data‑qubit region, and
+    invokes the clustered projector (or thresholds as a fallback).
+    """
     # Convert logits -> per-qubit probabilities -> run exact projector in GF(2) to ML correction.
     # restrict to data-qubits only to match H_sub columns
     probs1_full = torch.sigmoid(logits[:, 1] - logits[:, 0])
@@ -214,10 +236,7 @@ def projection_aware_logits_to_bits(
     return bits  # length == #data_qubits
 
 def train_inprocess(ns) -> str:
-    """
-    In-process entry that mirrors CLI `main()`.
-    Returns path to best checkpoint.
-    """
+    """Run the trainer in‑process (mirrors CLI ``main``) and return best.pt path."""
     args = ns
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, required=False)
@@ -368,6 +387,15 @@ def train_inprocess(ns) -> str:
     best_loss = float("inf")
     history: list[dict[str, Any]] = []
     def _build_tad_for_code(code_obj):
+        """Build transpilation‑aware context and per‑qubit LLR overrides.
+
+        Uses the provided QPU profile JSON (``--qpu-profile``) and the
+        requested ``--context-source`` to extract a schedule IR, construct
+        TAD weighting maps, and return:
+        - qpu_prof: loaded profile object
+        - ctx_vec: fixed global context vector for this epoch (or None)
+        - llr_overrides: per‑qubit log‑likelihood adjustments (or None)
+        """
         qpu_prof = None
         ctx_vec = None
         llr_overrides = None
@@ -417,6 +445,11 @@ def train_inprocess(ns) -> str:
         return qpu_prof, ctx_vec, llr_overrides
 
     def _parse_teacher_mix(spec: str):
+        """Parse a comma‑separated teacher weight spec into a dict.
+
+        Example: "mwpf=1.0,mwpm=0.5,lsd=0.25" → {"mwpf":1.0,"mwpm":0.5,"lsd":0.25}
+        Missing teachers default to 0.0; if all are zero, defaults to MWPF=1.0.
+        """
         weights = {"mwpf": 1.0, "mwpm": 0.0, "lsd": 0.0}
         if not spec:
             return weights
@@ -497,10 +530,10 @@ def train_inprocess(ns) -> str:
             while shots_done < shots_target:
                 seed = int(rng.integers(0, 2**31 - 1))
                 sample = sample_round(d=args.distance, p=p_epoch, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
-                # Build global detector stream [X then Z] for MWPFTeacher
+                # Pack detectors in canonical Z→X order for MWPFTeacher
                 dets_global = np.concatenate([
-                    sample["synX"][np.newaxis, :].astype(np.uint8),
                     sample["synZ"][np.newaxis, :].astype(np.uint8),
+                    sample["synX"][np.newaxis, :].astype(np.uint8),
                 ], axis=1)
                 # Global per-fault scaling dict
                 mwpf_scale = None
@@ -783,6 +816,7 @@ def train_inprocess(ns) -> str:
 
     return os.path.join(args.save, "best.pt")
 def move_to(p: PackedCrop, device):
+    """Move all tensors in a PackedCrop to a target device (in place)."""
     p.x_nodes = p.x_nodes.to(device)
     p.node_mask = p.node_mask.to(device)
     p.node_type = p.node_type.to(device)
@@ -796,7 +830,7 @@ def move_to(p: PackedCrop, device):
     return p
 
 def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float = 1e-4):
-    """Quick sanity training to validate the v2 system."""
+    """Quick sanity training over a small offline crop dir (for tests/demos)."""
     import os
     import tempfile
     from types import SimpleNamespace
@@ -842,8 +876,8 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
 def main():
     """Unified CLI entrypoint supporting offline and online modes.
 
-    Delegates argument parsing to train_inprocess(), which understands both
-    --data-root (offline) and --online (CUDA-Q) paths plus --hparams, TAD/RL flags.
+    Delegates to ``train_inprocess``, which accepts both offline (``--data-root``)
+    and online (``--online``) training paths with TAD/RL/erasure options.
     """
     from types import SimpleNamespace
     # Passing a dummy namespace will make train_inprocess parse sys.argv

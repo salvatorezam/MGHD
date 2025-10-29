@@ -35,6 +35,22 @@ def cudaq_sample_surface_wrapper(
     surface_layout: str = "planar",
     profile_json: str | None = None,
 ) -> np.ndarray:
+    """Sample one CUDA-Q surface-code round with circuit-level noise.
+
+    Parameters
+    - mode: "foundation" or "student" profile selection
+    - batch_size: number of trajectories to simulate
+    - T: number of syndrome rounds (default 3)
+    - d: surface-code distance
+    - layout: precomputed layout dictionary (optional)
+    - rng: NumPy Generator for reproducibility (optional)
+    - bitpack: if True, backend may return packed bits (we normalize to uint8)
+    - surface_layout: layout flavor (planar/rotated meta handling)
+    - profile_json: optional QPU profile JSON path
+
+    Returns
+    - uint8 array [B, A_x + A_z + n] with [X-syndrome | Z-syndrome | data errors]
+    """
     if mode not in ["foundation", "student"]:
         raise ValueError("Invalid mode: must be 'foundation' or 'student'")
     if layout is None:
@@ -77,6 +93,10 @@ def cudaq_sample_repetition_wrapper(
     rng: np.random.Generator | None = None,
     bitpack: bool = False,
 ) -> np.ndarray:
+    """Sample a repetition-code round via CUDA-Q backend.
+
+    Returns uint8 [B, A + n] with [syndrome | data errors].
+    """
     if mode not in ["foundation", "student"]:
         raise ValueError("Invalid mode: mode")
     if layout is None:
@@ -126,7 +146,11 @@ def _ensure_css_logicals(code: Any) -> tuple[np.ndarray | None, np.ndarray | Non
 
 
 def _obs_from_data_parities(code: Any, ex: np.ndarray, ez: np.ndarray) -> np.ndarray:
-    """Project data-space X/Z error indicators to logical observables."""
+    """Project data-qubit error indicators onto logical observables.
+
+    Multiplies data error indicators by logical operators (Lz with X errors,
+    Lx with Z errors) to form a compact logical outcome vector [Z | X].
+    """
 
     Lx, Lz = _ensure_css_logicals(code)
     shots = ex.shape[0]
@@ -155,9 +179,11 @@ def _obs_from_data_parities(code: Any, ex: np.ndarray, ez: np.ndarray) -> np.nda
 
 
 class CudaQSampler:
-    """
-    Uses CUDA-Q's Monte-Carlo trajectory method to sample detection events
-    under general circuit-level noise (Kraus/coherent supported).
+    """CUDA-Q Monte-Carlo sampler for circuit-level noise.
+
+    Generates detection events (Z then X ordering) and optional logical
+    observables from user-provided code objects (must expose Hx/Hz and
+    minimal layout metadata). Supports optional erasure injection.
     """
 
     def __init__(
@@ -181,6 +207,7 @@ class CudaQSampler:
 
     @staticmethod
     def _maybe_import(module_name: str, attr: str | None):
+        """Best-effort import of optional backend modules."""
         try:
             mod = importlib.import_module(module_name)
             return getattr(mod, attr) if attr else mod
@@ -193,13 +220,14 @@ class CudaQSampler:
         n_shots: int,
         seed: int | None = None,
     ) -> SampleBatch:
-        """
-        Args:
-          code_obj: an object from codes_registry (must provide a circuit builder
-                    or matrices & metadata sufficient for CUDA-Q construction).
-          n_shots:  number of trajectories to sample.
-        Returns:
-          SampleBatch(dets, obs, meta)
+        """Sample detection events for a CSS-like code using CUDA-Q.
+
+        Parameters
+        - code_obj: code with Hx/Hz (and optional layout/circuit metadata)
+        - n_shots: number of trajectories to simulate
+
+        Returns
+        - SampleBatch with dets [B, D], logical obs [B, K], and metadata.
         """
         if n_shots <= 0:
             raise ValueError("n_shots must be positive")
@@ -264,7 +292,10 @@ class CudaQSampler:
         num_data: int,
         rng: np.random.Generator,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-        """Construct erasure masks (data/detector) and optional probabilities."""
+        """Construct per-shot erasure masks and probabilities.
+
+        Returns (erase_data_mask [B,n], erase_det_mask [B,D], p_erase_data).
+        """
 
         erase_data_mask = np.zeros((n_shots, num_data), dtype=np.uint8)
         erase_det_mask = np.zeros((n_shots, num_detectors), dtype=np.uint8)
@@ -280,6 +311,7 @@ class CudaQSampler:
     # ------------------------------------------------------------------
 
     def _surface_kwargs(self) -> dict[str, Any]:
+        """Extract sampler tuning fields for surface-code backend."""
         extra: dict[str, Any] = {}
         if "phys_p" in self.profile_kwargs:
             extra["phys_p"] = self.profile_kwargs["phys_p"]
@@ -288,6 +320,10 @@ class CudaQSampler:
         return extra
 
     def _sample_surface(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """CUDA-Q sampling path for surface codes.
+
+        Returns (dets, x_err, z_err). Detectors are ordered Z checks then X checks.
+        """
         layout_info = getattr(code_obj, "layout", {})
         layout_dict = None
         surface_layout = "planar"
@@ -328,11 +364,12 @@ class CudaQSampler:
         sz_raw = synd_block[:, num_x:num_x + num_z]
         sz = ((sz_raw >> 1) & 1).astype(np.uint8)
 
+        # Canonical detector order: Z-checks first, then X-checks
         dets_parts = []
-        if num_x:
-            dets_parts.append(sx)
         if num_z:
             dets_parts.append(sz)
+        if num_x:
+            dets_parts.append(sx)
         dets = np.concatenate(dets_parts, axis=1) if dets_parts else np.zeros((n_shots, 0), dtype=np.uint8)
 
         x_err = (err_block & 1).astype(np.uint8)
@@ -340,6 +377,10 @@ class CudaQSampler:
         return dets, x_err, z_err
 
     def _sample_repetition(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """CUDA-Q sampling path for repetition codes.
+
+        Returns (dets, x_err, z_err). Detectors ordered Z then X when both exist.
+        """
         Hx = np.asarray(code_obj.Hx, dtype=np.uint8)
         Hz = np.asarray(code_obj.Hz, dtype=np.uint8)
         n_data = int(Hx.shape[1] or Hz.shape[1])
@@ -371,11 +412,12 @@ class CudaQSampler:
             sx = np.zeros((n_shots, num_x), dtype=np.uint8)
             sz = synd_block
 
+        # Canonical detector order: Z first, then X
         dets_parts = []
-        if num_x:
-            dets_parts.append(sx)
         if num_z:
             dets_parts.append(sz)
+        if num_x:
+            dets_parts.append(sx)
         dets = np.concatenate(dets_parts, axis=1) if dets_parts else np.zeros((n_shots, 0), dtype=np.uint8)
 
         x_err = (error_block & 1).astype(np.uint8)
@@ -394,6 +436,7 @@ class CudaQSampler:
     # ------------------------------------------------------------------
 
     def _synthetic_css(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Pure-NumPy fallback approximating a CSS channel (Pauli, for tests)."""
         Hx = np.asarray(code_obj.Hx, dtype=np.uint8)
         Hz = np.asarray(code_obj.Hz, dtype=np.uint8)
         n = Hx.shape[1]
@@ -402,18 +445,20 @@ class CudaQSampler:
         x_err = (rng.random((n_shots, n)) < px).astype(np.uint8)
         z_err = (rng.random((n_shots, n)) < pz).astype(np.uint8)
 
+        # Canonical detector order: Z checks (from X errors) first, then X checks
         parts = []
-        if Hx.shape[0]:
-            sx = (z_err @ (Hx.T % 2)) % 2
-            parts.append(sx.astype(np.uint8))
         if Hz.shape[0]:
             sz = (x_err @ (Hz.T % 2)) % 2
             parts.append(sz.astype(np.uint8))
+        if Hx.shape[0]:
+            sx = (z_err @ (Hx.T % 2)) % 2
+            parts.append(sx.astype(np.uint8))
         dets = np.concatenate(parts, axis=1) if parts else np.zeros((n_shots, 0), dtype=np.uint8)
         return dets, x_err, z_err
 
     @staticmethod
     def _logical_observables(code_obj: Any, x_err: np.ndarray, z_err: np.ndarray) -> np.ndarray:
+        """Compute logical observables [Z | X] from data error indicators."""
         return _obs_from_data_parities(code_obj, x_err, z_err)
 
 

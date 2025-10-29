@@ -31,6 +31,15 @@ except Exception as exc:  # pragma: no cover - executed when ldpc missing
 
 @dataclass
 class LSDConfig:
+    """Configuration for BP+LSD teacher (and NumPy fallback).
+
+    error_rate: Prior error probability used by BP/OSD.
+    max_iter:   BP iterations per decode.
+    bp_method:  Update rule (e.g., product_sum).
+    schedule:   Message schedule (serial/parallel).
+    lsd_method: OSD variant; 'OSD_CS' approximates LSD with cluster-search.
+    lsd_order:  OSD order parameter.
+    """
     error_rate: float = 0.05
     max_iter: int = 3
     bp_method: str = "product_sum"
@@ -40,9 +49,21 @@ class LSDConfig:
 
 
 class LSDTeacher:
-    """BP+LSD teacher with a numpy fallback when ldpc is unavailable."""
+    """BP+LSD teacher with a NumPy fallback when ldpc is unavailable.
+
+    When ldpc is present, we instantiate per-basis BP+OSD decoders (bposd).
+    When absent or when overrides/erasure are provided, we project via GF(2)
+    parity using ml_parity_project (or the torch-accelerated variant when
+    available) to produce data-qubit corrections ex/ez per batch.
+    """
 
     def __init__(self, Hx: np.ndarray, Hz: np.ndarray, *, cfg: Optional[LSDConfig] = None):
+        """Create a per-basis decoder for CSS codes.
+
+        Parameters
+        - Hx, Hz: parity-check matrices (uint8) for X and Z bases.
+        - cfg: optional LSDConfig controlling BP/OSD behavior.
+        """
         self.cfg = cfg or LSDConfig()
         self.Hx = np.asarray(Hx, dtype=np.uint8)
         self.Hz = np.asarray(Hz, dtype=np.uint8)
@@ -139,8 +160,16 @@ class LSDTeacher:
                 probs_x[mask] = 0.5
                 probs_z[mask] = 0.5
 
-            ex[b] = ml_parity_project(self.Hx, syndromes_x[b], probs_x)
-            ez[b] = ml_parity_project(self.Hz, syndromes_z[b], probs_z)
+            try:
+                from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
+                ex[b] = _ml_t(self.Hx, syndromes_x[b], probs_x)
+            except Exception:
+                ex[b] = ml_parity_project(self.Hx, syndromes_x[b], probs_x)
+            try:
+                from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
+                ez[b] = _ml_t(self.Hz, syndromes_z[b], probs_z)
+            except Exception:
+                ez[b] = ml_parity_project(self.Hz, syndromes_z[b], probs_z)
         return ex, ez
 
 

@@ -1,5 +1,16 @@
 #!/usr/bin/env python
-"""MGHD preflight and validator."""
+"""MGHD preflight and validator.
+
+Runs a compact readiness suite:
+- Dependency checks (versions of PyMatching/Stim and CUDA‑Q availability)
+- Optional pytest run
+- Stim + DEM correlated matching A/B with LER thresholds
+- Optional CUDA‑Q smoke (teacher_eval with cudaq sampler)
+
+Artifacts are written under ``artifacts/preflight`` and a final summary is
+printed and saved as JSON. Non‑blocking failures are reported but do not abort
+the entire run; blocking failures raise PreflightError early.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,11 +20,14 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
+import os
+import shutil
 from pathlib import Path
 
 
 @dataclass
 class StepResult:
+    """One row in the preflight summary table."""
     name: str
     status: str
     details: dict[str, object]
@@ -25,6 +39,7 @@ class StepResult:
 
 
 def section(title: str) -> None:
+    """Print a section header to the console."""
     print(f"\n=== {title} ===")
 
 
@@ -32,13 +47,22 @@ class PreflightError(RuntimeError):
     """Raised when a blocking preflight error occurs."""
 
 
-def check_deps(log_path: Path) -> dict[str, object]:
+def check_deps(log_path: Path, *, expect_conda_env: str | None = None) -> dict[str, object]:
+    """Verify core dependencies and emit a log; return version info dict.
+
+    Ensures PyMatching≥2.3.0 and Stim are importable; probes CUDA‑Q presence
+    without failing the entire run when unavailable.
+    """
     import importlib.metadata as im
 
     from packaging.version import Version  # type: ignore
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     versions: dict[str, object] = {"cudaq_available": False}
+
+    # Record active conda env (if any)
+    conda_env = os.environ.get("CONDA_DEFAULT_ENV")
+    versions["conda_env"] = conda_env
 
     def emit(line: str) -> None:
         print(line)
@@ -89,10 +113,41 @@ def check_deps(log_path: Path) -> dict[str, object]:
         versions["cudaq"] = cudaq_version
         emit(f"CUDA-Q version:   {cudaq_version}")
 
+    # Optionally probe a specific conda env for CUDA-Q if not available here
+    if not versions.get("cudaq_available") and expect_conda_env:
+        conda_bin = shutil.which("conda")
+        if conda_bin:
+            try:
+                cp = subprocess.run(
+                    [
+                        conda_bin,
+                        "run",
+                        "-n",
+                        expect_conda_env,
+                        "python",
+                        "-c",
+                        "import importlib.metadata as im; import cudaq; print(im.version('cudaq'))",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if cp.returncode == 0:
+                    v = cp.stdout.strip().splitlines()[-1] if cp.stdout else "installed"
+                    versions["cudaq_in_env"] = v
+                    emit(f"CUDA-Q in env '{expect_conda_env}': {v}")
+                else:
+                    versions["cudaq_in_env"] = None
+                    emit(f"CUDA-Q in env '{expect_conda_env}': not installed or import failed")
+            except Exception:
+                versions["cudaq_in_env"] = None
+        else:
+            versions["cudaq_in_env"] = None
+
     return versions
 
 
 def run(cmd: Iterable[str], log_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess, tee output to a log, and return the CompletedProcess."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     cmd_list = list(cmd)
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -118,6 +173,7 @@ LER_PATTERN = re.compile(r"LER(?:_(?P<kind>dem|mix))?\s*[:=]\s*(?P<value>[0-9]+(
 
 
 def parse_ler(stdout: str) -> dict[str, float | None]:
+    """Extract LER_dem and LER_mix (if present) from teacher_eval output."""
     results: dict[str, float | None] = {"dem": None, "mix": None}
     for match in LER_PATTERN.finditer(stdout):
         kind = match.group("kind") or "mix"
@@ -135,6 +191,7 @@ def write_skip_log(path: Path, message: str) -> None:
 
 
 def summarize(rows: Iterable[StepResult]) -> None:
+    """Print a compact text table for the collected StepResults."""
     section("Summary")
     header = f"{'Stage':<18}{'Status':<8}Details"
     print(header)
@@ -154,6 +211,9 @@ def summarize(rows: Iterable[StepResult]) -> None:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    """CLI entrypoint for MGHD preflight.
+
+    Returns process‑style exit code (0 on pass, 1 on fail)."""
     parser = argparse.ArgumentParser("MGHD preflight and validator")
     parser.add_argument("--families", default="surface")
     parser.add_argument("--distances", default="5")
@@ -171,6 +231,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
     )
     parser.add_argument("--skip-cudaq", action="store_true")
+    parser.add_argument("--expect-conda-env", default=None, help="If set, also probe CUDA-Q inside this conda env (e.g., 'mlqec-env')")
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -185,7 +246,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     section("Dependency Check")
     deps_log = artifact_root / "deps.txt"
     try:
-        versions = check_deps(deps_log)
+        versions = check_deps(deps_log, expect_conda_env=args.expect_conda_env)
     except PreflightError as exc:
         summary_json["versions"] = {}
         summary_rows.append(StepResult("dependencies", "fail", {"message": str(exc)}))
@@ -293,6 +354,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     summary_json["steps"] = {row.name: row.to_summary() for row in summary_rows}
     summary_json.setdefault("versions", {})
     summary_json["cudaq_available"] = bool(versions.get("cudaq_available"))
+    if "conda_env" in versions:
+        summary_json["conda_env"] = versions.get("conda_env")
+    if "cudaq_in_env" in versions:
+        summary_json["cudaq_in_env"] = versions.get("cudaq_in_env")
 
     summary_path = artifact_root / "summary.json"
     summary_path.write_text(json.dumps(summary_json, indent=2) + "\n", encoding="utf-8")
