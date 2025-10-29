@@ -5,12 +5,19 @@ import scipy.sparse as sp
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Iterable, Optional, Any, Sequence
+try:  # Optional GPU acceleration
+    import torch  # type: ignore
+    _TORCH_OK = True
+except Exception:  # pragma: no cover
+    _TORCH_OK = False
 
 
 @dataclass
 class Cluster:
     """Simple cluster container for legacy API compatibility."""
     check_indices: np.ndarray
+    qubit_indices: Optional[np.ndarray] = None
+    side: Optional[str] = None
 
 
 def _as_dense_uint8(M) -> np.ndarray:
@@ -23,6 +30,15 @@ def _as_dense_uint8(M) -> np.ndarray:
 
 
 def gf2_row_echelon(A: np.ndarray):
+    """Gaussian elimination over GF(2) returning row-echelon form and pivots.
+
+    Parameters
+    - A: binary m×n ndarray (uint8/0-1)
+
+    Returns
+    - R: row-echelon form over GF(2)
+    - pivots: list of (row, col) pivot positions
+    """
     A = (A & 1).astype(np.uint8).copy()
     m, n = A.shape
     pivots = []
@@ -143,6 +159,7 @@ def solve_small_cluster_channel_ml(
 
 
 def _delta_cost(e: np.ndarray, column: np.ndarray, w: np.ndarray) -> float:
+    """Cost change if we XOR `column` into current state `e` under weights `w`."""
     mask = column.astype(bool)
     if not mask.any():
         return 0.0
@@ -151,6 +168,10 @@ def _delta_cost(e: np.ndarray, column: np.ndarray, w: np.ndarray) -> float:
 
 
 def greedy_parity_project(H_sub: sp.csr_matrix, s_sub: np.ndarray, p_flip: np.ndarray, thresh: float = 0.5) -> np.ndarray:
+    """Greedy correction that reduces parity residual using weighted heuristic.
+
+    Not exact ML, but cheap and effective when exact search is too large.
+    """
     m_sub, n_sub = H_sub.shape
     e = (p_flip > thresh).astype(np.uint8)
     r = (H_sub @ e) % 2
@@ -265,6 +286,67 @@ def ml_parity_project(
     return best_e.astype(np.uint8)
 
 
+def ml_parity_project_torch(
+    H_sub: sp.csr_matrix | np.ndarray,
+    s_sub: np.ndarray,
+    p_flip: np.ndarray | None = None,
+    r_cap: int = 24,
+    stats_out: Dict[str, int] | None = None,
+    probs_local: np.ndarray | None = None,
+    device: str = "cuda",
+) -> np.ndarray:
+    """Torch-accelerated ML parity projection for small nullspaces (r≤24).
+
+    Falls back to ml_parity_project when torch is unavailable or r is large.
+    """
+    if not _TORCH_OK:
+        return ml_parity_project(H_sub, s_sub, p_flip, r_cap, stats_out, probs_local)
+    eps = 1e-6
+    if probs_local is not None and p_flip is None:
+        p_flip = probs_local
+    if p_flip is None:
+        p_flip = np.full(_as_dense_uint8(H_sub).shape[1], 0.5, dtype=np.float64)
+    p = np.clip(np.asarray(p_flip, dtype=np.float64), eps, 1 - eps)
+    w = np.log((1 - p) / p).astype(np.float32)
+
+    Hs = sp.csr_matrix(H_sub)
+    e0 = gf2_solve_particular(Hs, s_sub)
+    N = gf2_nullspace(Hs)
+    r = int(N.shape[1])
+    if r == 0 or r > r_cap:
+        return ml_parity_project(H_sub, s_sub, p_flip, r_cap, stats_out, probs_local)
+
+    dev = torch.device(device if torch.cuda.is_available() else "cpu")
+    w_t = torch.as_tensor(w, device=dev)
+    e = torch.as_tensor(e0.astype(np.uint8), device=dev)
+    cols = [torch.as_tensor(N[:, i].astype(np.uint8), device=dev) for i in range(r)]
+
+    best_e = e.clone()
+    best_cost = (w_t * e.float()).sum()
+    visited = 0
+
+    stack: list[tuple[int, torch.Tensor, torch.Tensor]] = [(0, e, best_cost)]
+    while stack:
+        idx, state, cost = stack.pop()
+        if idx == r:
+            visited += 1
+            if cost < best_cost:
+                best_cost = cost
+                best_e = state.clone()
+            continue
+        col = cols[idx]
+        # no flip
+        stack.append((idx + 1, state, cost))
+        # flip
+        s2 = state ^ col
+        delta = (w_t * (s2.float() - state.float())).sum()
+        stack.append((idx + 1, s2, cost + delta))
+
+    if stats_out is not None:
+        stats_out.update(states_visited=int(visited), states_pruned=0)
+    return best_e.detach().to("cpu").numpy().astype(np.uint8)
+
+
 def active_components(
     H: sp.csr_matrix | np.ndarray,
     s: np.ndarray,
@@ -356,6 +438,7 @@ def active_components(
 def extract_subproblem(
     H: sp.csr_matrix, s: np.ndarray, checks_idx: np.ndarray, qubits_idx: np.ndarray
 ) -> Tuple[sp.csr_matrix, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract a local subproblem H_sub, s_sub with index maps back to globals."""
     checks_idx = np.asarray(checks_idx, dtype=np.int64)
     qubits_idx = np.asarray(qubits_idx, dtype=np.int64)
     H_sub = H[checks_idx, :][:, qubits_idx].tocsr()
@@ -368,6 +451,11 @@ def extract_subproblem(
 def solve_on_erasure(
     H: np.ndarray, s: np.ndarray, mask_cols: np.ndarray, mask_rows: np.ndarray | None = None
 ) -> np.ndarray:
+    """Solve H e = s with columns (and optionally rows) erased.
+
+    Columns masked true are treated as variables to solve; rows masked true are
+    dropped. Returns a full-length solution vector (zeros else).
+    """
     H = np.asarray(H, dtype=np.uint8)
     s = np.asarray(s, dtype=np.uint8)
     mask_cols = np.asarray(mask_cols, dtype=np.uint8).astype(bool)
@@ -390,6 +478,7 @@ def solve_on_erasure(
 
 
 def infer_clusters_batched(Hx: np.ndarray, Hz: np.ndarray, SX: np.ndarray, SZ: np.ndarray):
+    """Convenience projector for a batch of independent CSS subproblems."""
     B = SX.shape[0]
     ex = np.zeros((B, Hx.shape[1]), dtype=np.uint8)
     ez = np.zeros((B, Hz.shape[1]), dtype=np.uint8)
@@ -597,7 +686,13 @@ class MGHDPrimaryClustered:
             q_l2g = entry["q_l2g"]
             if probs.shape[0] != H_sub.shape[1]:
                 raise AssertionError("Probability vector length mismatch for subgraph")
-            t_p0 = self._time.perf_counter()
+        t_p0 = self._time.perf_counter()
+        if _TORCH_OK:
+            try:
+                e_sub = ml_parity_project_torch(H_sub, s_sub, probs, r_cap=self.r_cap)
+            except Exception:
+                e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
+        else:
             e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
             t_proj += (self._time.perf_counter() - t_p0) * 1e6
             parity = (H_sub @ e_sub) % 2
@@ -620,6 +715,7 @@ __all__ = [
     "gf2_solve_particular",
     "gf2_nullspace",
     "ml_parity_project",
+    "ml_parity_project_torch",
     "greedy_parity_project",
     "active_components",
     "extract_subproblem",
