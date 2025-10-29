@@ -1,4 +1,10 @@
-"""Registry of CSS code families with deterministic parity-check matrices."""
+"""Registry of CSS code families with deterministic parity-check matrices.
+
+This module exposes small, reproducible builders for common CSS families
+(surface, BB, etc.) together with helpers to validate commutation, derive
+logical operators, and construct lightweight CSSCode carriers used by
+samplers/teachers.
+"""
 from __future__ import annotations
 
 import json
@@ -13,11 +19,13 @@ import numpy as np
 
 
 def _ensure_binary(mat: np.ndarray) -> np.ndarray:
+    """Cast to uint8 and reduce mod 2 (defensive normalization)."""
     arr = np.asarray(mat, dtype=np.uint8)
     return arr % 2
 
 
 def check_css_commutation(hx: np.ndarray, hz: np.ndarray) -> None:
+    """Raise if Hx Hz^T has any 1s (violates CSS commutation)."""
     hx_bin = _ensure_binary(hx)
     hz_bin = _ensure_binary(hz)
     comm = (hx_bin @ hz_bin.T) % 2
@@ -27,6 +35,7 @@ def check_css_commutation(hx: np.ndarray, hz: np.ndarray) -> None:
 
 @dataclass(frozen=True)
 class CodeSpec:
+    """Immutable spec describing a concrete CSS code instance."""
     name: str
     n: int
     hx: np.ndarray
@@ -43,7 +52,7 @@ class CodeSpec:
 
 @dataclass
 class CSSCode:
-    """Lightweight carrier for CSS codes with teacher-friendly metadata."""
+    """Lightweight carrier for CSS codes with teacher‑friendly metadata."""
 
     name: str
     distance: int
@@ -127,10 +136,12 @@ class CSSCode:
 
 
 def _assert_css(Hx: np.ndarray, Hz: np.ndarray) -> None:
+    """Validate that (Hx, Hz) define a valid CSS pair (commutation holds)."""
     check_css_commutation(Hx, Hz)
 
 
 def _gf2_rank(mat: np.ndarray) -> int:
+    """Rank over GF(2) via Gaussian elimination (dense, small matrices)."""
     A = (np.asarray(mat, dtype=np.uint8) & 1).copy()
     rows, cols = A.shape
     rank = 0
@@ -152,6 +163,7 @@ def _gf2_rank(mat: np.ndarray) -> int:
 
 
 def _gf2_rref(A: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Reduced row‑echelon form over GF(2) and pivot list (dense)."""
     M = (np.asarray(A, dtype=np.uint8) & 1).copy()
     m, n = M.shape
     pivots: list[tuple[int, int]] = []
@@ -177,6 +189,7 @@ def _gf2_rref(A: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int]]]:
 
 
 def _gf2_nullspace_dense(A: np.ndarray) -> np.ndarray:
+    """Dense nullspace basis over GF(2) (columns form a basis)."""
     M, pivots = _gf2_rref(A)
     n = M.shape[1]
     pivot_cols = {c for _, c in pivots}
@@ -195,6 +208,7 @@ def _gf2_nullspace_dense(A: np.ndarray) -> np.ndarray:
 
 
 def _reduce_mod_rowspace(vec: np.ndarray, R: np.ndarray, pivots: list[tuple[int, int]]) -> np.ndarray:
+    """Reduce a vector mod rowspace represented by (R, pivots) over GF(2)."""
     res = (np.asarray(vec, dtype=np.uint8) & 1).copy()
     for r, c in pivots:
         if res[c]:
@@ -203,6 +217,7 @@ def _reduce_mod_rowspace(vec: np.ndarray, R: np.ndarray, pivots: list[tuple[int,
 
 
 def _select_css_logicals(stab: np.ndarray, dual: np.ndarray, target: int) -> np.ndarray:
+    """Pick `target` independent logicals by reducing dual reps mod stab rowspace."""
     if target <= 0:
         return np.zeros((0, stab.shape[1]), dtype=np.uint8)
     R, pivots = _gf2_rref(stab)
@@ -240,12 +255,14 @@ def _select_css_logicals(stab: np.ndarray, dual: np.ndarray, target: int) -> np.
 
 
 def _compute_css_logicals(Hx: np.ndarray, Hz: np.ndarray, target: int) -> tuple[np.ndarray, np.ndarray]:
+    """Derive (Lx, Lz) bases for a CSS pair by symmetric reduction."""
     Lx_auto = _select_css_logicals(Hx, Hz, target)
     Lz_auto = _select_css_logicals(Hz, Hx, target)
     return Lx_auto, Lz_auto
 
 
 def _fault_map(Hx: np.ndarray, Hz: np.ndarray) -> list[list[int]]:
+    """Map each data qubit (column) to detector indices (Z block followed by X)."""
     mx, n = Hx.shape
     mz = Hz.shape[0]
     mapping: list[list[int]] = []
@@ -280,6 +297,7 @@ def _make_css(
     Lx: np.ndarray | None = None,
     Lz: np.ndarray | None = None,
 ) -> CSSCode:
+    """Assemble a CSSCode from parity checks and optional logicals/weights."""
     Hx = _ensure_binary(Hx)
     Hz = _ensure_binary(Hz)
     _assert_css(Hx, Hz)
