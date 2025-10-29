@@ -32,21 +32,33 @@ except Exception as exc:  # pragma: no cover - exercised when lib missing
 
 @dataclass
 class MWPFConfig:
-    cluster_node_limit: Optional[int] = None  # speed/accuracy trade-off
+    """Configuration knobs for the hypergraph solver.
+
+    cluster_node_limit: optional cap for clustering (speed/accuracy trade-off)
+    timeout: optional wall-clock limit per solve (seconds)
+    """
+    cluster_node_limit: Optional[int] = None
     timeout: Optional[float] = None
 
 
 class MWPFTeacher:
-    """
-    Construct a hypergraph with vertices = detectors, hyperedges = fault mechanisms.
-    Each hyperedge has a non-negative weight (e.g., -log p or an LLR-derived cost).
+    """Hyperblossom (a.k.a. Minimum-Weight Parity Factor, MWPF) teacher.
 
-    When the optional ``mwpf`` dependency is unavailable, a lightweight fallback
-    keeps the API usable for tests by applying a deterministic detector→fault
-    heuristic. Real training should install mwpf to benefit from the solver.
+    Kept as MWPFTeacher for backward compatibility (configs/imports). Builds a
+    fault hypergraph (vertices=detectors, hyperedges=faults) with non-negative
+    weights (e.g., -log p or TAD-scaled costs) and solves a minimum set cover in
+    hypergraph space conditional on a detector pattern.
+
+    If the optional ``mwpf`` dependency is unavailable, falls back to a simple
+    deterministic detector→fault heuristic for tests.
     """
 
     def __init__(self, code_obj: Any, *, config: Optional[MWPFConfig] = None):
+        """Initialize solver context from a code object's hypergraph hooks.
+
+        Expects either ``to_fault_hypergraph()`` or ``detectors_per_fault`` (+
+        optional ``fault_weights``). Stores hypergraph and prepares solver cfg.
+        """
         self.code_obj = code_obj
         self.config = config or MWPFConfig()
         self._vertex_num: Optional[int] = None
@@ -129,11 +141,16 @@ class MWPFTeacher:
         mwpf_scale: Optional[Dict[int, float]] = None,
     ) -> Dict[str, np.ndarray]:
         """
-        dets: uint8 [B, D] detection events (1 where detector fired)
-        returns:
-          dict with fields:
-            'fault_ids': int32 [B, F_sel] (variable-length via padded matrix; -1 pad)
-            'weights': float32 [B] (optional total weight per solution)
+        Solve a batch of detector patterns.
+
+        Parameters
+        - dets: uint8 [B, D] detection events (1 where detector fired)
+        - mwpf_scale: optional per-fault scaling overrides (from TAD) mapping
+                      global fault ids to multiplicative factors
+
+        Returns a dict with fields:
+        - 'fault_ids': int32 [B, F_sel] (padded with -1)
+        - 'weights': float32 [B] (optional total weight upper bound if exposed)
         """
 
         dets = np.asarray(dets, dtype=np.uint8)
@@ -155,6 +172,7 @@ class MWPFTeacher:
     # Internal helpers
     # ------------------------------------------------------------------
     def _build_solver_with_weights(self, weights: List[float]):
+        """Instantiate the MWPF solver for a given weight vector."""
         weighted_edges = [
             HyperEdge(list(edge.tolist()), float(weight))  # type: ignore[arg-type]
             for edge, weight in zip(self._fault_edges, weights)
@@ -169,6 +187,7 @@ class MWPFTeacher:
         *,
         mwpf_scale: Optional[Dict[int, float]] = None,
     ) -> Dict[str, np.ndarray]:
+        """Run the mwpf solver per sample; apply optional per-fault scaling."""
         sols: List[List[int]] = []
         weights: List[float] = []
         max_sel = 0
@@ -217,6 +236,7 @@ class MWPFTeacher:
         }
 
     def _decode_batch_fallback(self, dets: np.ndarray) -> Dict[str, np.ndarray]:
+        """Detector→fault heuristic used when mwpf is unavailable (tests only)."""
         sols: List[List[int]] = []
         max_sel = 0
         for sample in dets:
@@ -241,6 +261,9 @@ class MWPFTeacher:
 
 
 __all__ = ["MWPFTeacher", "MWPFConfig", "_HAVE_MWPF"]
+
+# Friendly alias reflecting 2025 literature; keeps API stable
+HyperblossomTeacher = MWPFTeacher
 
 
 if not _HAVE_MWPF and _MWPF_IMPORT_ERROR is not None:  # pragma: no cover - info
