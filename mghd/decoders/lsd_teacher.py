@@ -15,6 +15,7 @@ import warnings
 import numpy as np
 
 from mghd.decoders.lsd.clustered import ml_parity_project
+import torch as _torch  # Enforce CUDA availability for GPU projector
 
 try:  # pragma: no cover - optional dependency
     # ldpc 0.1.x has bposd_decoder, not bplsd_decoder
@@ -64,6 +65,9 @@ class LSDTeacher:
         - Hx, Hz: parity-check matrices (uint8) for X and Z bases.
         - cfg: optional LSDConfig controlling BP/OSD behavior.
         """
+        # Enforce GPU availability: this teacher runs exclusively on CUDA for performance.
+        if not _torch.cuda.is_available():  # pragma: no cover - fail fast on misconfigured envs
+            raise RuntimeError("LSDTeacher requires CUDA (torch.cuda.is_available() == True).")
         self.cfg = cfg or LSDConfig()
         self.Hx = np.asarray(Hx, dtype=np.uint8)
         self.Hz = np.asarray(Hz, dtype=np.uint8)
@@ -143,6 +147,9 @@ class LSDTeacher:
         B = syndromes_x.shape[0]
         ex = np.zeros((B, self.Hx.shape[1]), dtype=np.uint8)
         ez = np.zeros((B, self.Hz.shape[1]), dtype=np.uint8)
+        # Use the torch-accelerated projector on CUDA unconditionally
+        from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
+
         for b in range(B):
             probs_x = None
             probs_z = None
@@ -160,9 +167,8 @@ class LSDTeacher:
                 probs_x[mask] = 0.5
                 probs_z[mask] = 0.5
 
-            # Use the patchable projector entry point; tests intercept this
-            ex[b] = ml_parity_project(self.Hx, syndromes_x[b], probs_x)
-            ez[b] = ml_parity_project(self.Hz, syndromes_z[b], probs_z)
+            ex[b] = _ml_t(self.Hx, syndromes_x[b], probs_x, device="cuda")
+            ez[b] = _ml_t(self.Hz, syndromes_z[b], probs_z, device="cuda")
         return ex, ez
 
 

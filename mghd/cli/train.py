@@ -275,6 +275,11 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--post-eval-sampler", type=str, default="stim")
     parser.add_argument("--post-eval-shots-per-batch", type=int, default=16)
     parser.add_argument("--post-eval-batches", type=int, default=2)
+    # Early stopping
+    parser.add_argument("--early-stop-patience", type=int, default=0,
+                        help="Stop if no improvement for this many epochs (0 disables)")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0,
+                        help="Minimum loss improvement to reset patience")
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
         # Optionally load hyperparameters and apply to args
@@ -319,7 +324,10 @@ def train_inprocess(ns) -> str:
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Enforce GPU usage. Fail fast if CUDA is not available in this environment.
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required. Install a CUDA-enabled PyTorch build and run on a GPU node.")
+    device = torch.device("cuda")
     # Build model with optional hyperparameters from JSON
     hp_model = getattr(args, "_hp_model", {})
     hp_mamba = getattr(args, "_hp_mamba", {})
@@ -386,6 +394,7 @@ def train_inprocess(ns) -> str:
 
     best_loss = float("inf")
     history: list[dict[str, Any]] = []
+    last_improve_epoch = 0
     def _build_tad_for_code(code_obj):
         """Build transpilation‑aware context and per‑qubit LLR overrides.
 
@@ -781,16 +790,39 @@ def train_inprocess(ns) -> str:
         prev_epoch_loss = avg
 
         torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
-        if avg < best_loss:
+        if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
             best_loss = avg
             torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt")
 
         log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
         if use_online:
             log_obj["p"] = float(p_epoch if 'p_epoch' in locals() else getattr(args, "p", 0.0))
-        print(json.dumps(log_obj, separators=(",", ":")))
+        # Print epoch summary and flush so users see it promptly
+        print(json.dumps(log_obj, separators=(",", ":")), flush=True)
 
-    (save_dir / "train_log.json").write_text(json.dumps(history, indent=2))
+        # Persist logs incrementally each epoch (JSONL + JSON snapshot)
+        try:
+            with (save_dir / "train_log.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_obj, separators=(",", ":")) + "\n")
+            (save_dir / "train_log.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+        # Early stopping check
+        patience = int(getattr(args, "early_stop_patience", 0))
+        min_delta = float(getattr(args, "early_stop_min_delta", 0.0))
+        if patience > 0:
+            if avg <= best_loss + 1e-12:
+                last_improve_epoch = epoch
+            if (epoch - last_improve_epoch) >= patience:
+                print(json.dumps({"early_stop": True, "epoch": epoch, "best_loss": best_loss}, separators=(",", ":")))
+                break
+
+    # Final snapshot (in case of early termination without last write)
+    try:
+        (save_dir / "train_log.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
     # Optional teacher comparison report
     if hasattr(args, "post_eval") and bool(getattr(args, "post_eval", False)):
