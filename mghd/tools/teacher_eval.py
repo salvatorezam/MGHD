@@ -43,8 +43,12 @@ from mghd.codes.registry import get_code
 
 
 def parse_distances(spec: str) -> list[int]:
-    """
-    Accept forms like '5', '3,5,7', '3-31:2'. Returns list of ints.
+    """Parse a compact distance specification into a list of ints.
+
+    Supported forms
+    - "5"                → [5]
+    - "3,5,7"            → [3, 5, 7]
+    - "3-31:2"           → [3, 5, 7, ..., 31]
     """
     spec = spec.strip()
     if re.fullmatch(r"\d+", spec):
@@ -59,9 +63,12 @@ def parse_distances(spec: str) -> list[int]:
 
 
 def _resolve_syndromes(code_obj, dets):
-    """
-    BEST-EFFORT mapping from det-streams to CSS syndromes for LSD/MWPM teachers.
-    If code_obj exposes a helper, use it. Else return zeros with correct shapes.
+    """Derive CSS per-basis syndromes from detector streams (best effort).
+
+    - If the code exposes `detectors_to_syndromes`, use that authoritative
+      mapping (which may account for circuit construction).
+    - Otherwise synthesize zero-shaped arrays matching Hx/Hz row counts so
+      per-basis teachers (LSD/MWPM) can be invoked consistently.
     """
 
     mx = getattr(code_obj, "Hx", None)
@@ -82,6 +89,7 @@ def _resolve_syndromes(code_obj, dets):
 
 
 def _infer_data_qubits(code_obj: Any) -> int:
+    """Return the number of data qubits, probing common fields (n, Hx/Hz)."""
     if hasattr(code_obj, "n"):
         try:
             return int(code_obj.n)
@@ -97,6 +105,7 @@ def _infer_data_qubits(code_obj: Any) -> int:
 
 
 def _maybe_get_native_circuit(code_obj: Any) -> Any | None:
+    """Fetch a native circuit from the code, if present (qiskit/cirq/cudaq)."""
     for attr in ("native_circuit", "reference_circuit", "circuit", "qc", "quantum_circuit"):
         if hasattr(code_obj, attr):
             circuit = getattr(code_obj, attr)
@@ -111,6 +120,10 @@ def _maybe_get_native_circuit(code_obj: Any) -> Any | None:
 
 
 def _build_schedule_ir(context_source: str, code_obj: Any) -> Any:
+    """Return a schedule IR (time-ordered ops) from a native circuit when available.
+
+    Adapters are optional. If an adapter or circuit is not available, returns [].
+    """
     native = _maybe_get_native_circuit(code_obj)
     if native is None:
         return []
@@ -146,6 +159,7 @@ def _build_schedule_ir(context_source: str, code_obj: Any) -> Any:
 
 
 def _base_overrides_from_maps(weight_maps: dict[str, Any], n_qubits: int) -> dict[str, Any]:
+    """Convert TAD weight maps into base per-qubit overrides (LLR/teacher scales)."""
     llr = np.zeros(int(n_qubits), dtype=np.float32)
     w_qubit = weight_maps.get("w_qubit", {}) or {}
     for layer in w_qubit.values():
@@ -176,6 +190,7 @@ def _base_overrides_from_maps(weight_maps: dict[str, Any], n_qubits: int) -> dic
 
 
 def _materialize_overrides(base: dict[str, Any], scale: float) -> dict[str, Any]:
+    """Apply a scalar gain to base overrides to produce teacher-specific payloads."""
     if not base:
         return {}
     overrides: dict[str, Any] = {}
@@ -193,6 +208,7 @@ def _materialize_overrides(base: dict[str, Any], scale: float) -> dict[str, Any]
 
 
 def _load_bandit_state(path: pathlib.Path) -> dict[str, Any] | None:
+    """Load bandit state if present; return None on errors or absence."""
     if not path.exists():
         return None
     try:
@@ -202,6 +218,7 @@ def _load_bandit_state(path: pathlib.Path) -> dict[str, Any] | None:
 
 
 def _dump_bandit_state(path: pathlib.Path, state: dict[str, Any]) -> None:
+    """Persist bandit state; warn but continue on failure (best effort)."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state))
@@ -214,6 +231,12 @@ def _dump_bandit_state(path: pathlib.Path, state: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    """CLI to evaluate teacher stacks across code families/distances.
+
+    - Samples detectors/observables via the chosen sampler (CUDA‑Q or Stim).
+    - Packs detectors for teachers in canonical Z→X order.
+    - Routes batches through MWPF/LSD/MWPM/DEM mixes and reports LER.
+    """
     p = argparse.ArgumentParser()
     p.add_argument(
         "--family",
@@ -530,6 +553,8 @@ def main() -> None:
                     )
                     dem_teacher = None
 
+                # Canonical detector order for teachers is Z then X. Ensure
+                # downstream per-basis teachers see consistent ordering.
                 sx, sz = _resolve_syndromes(code, batch.dets)
 
                 scale = 1.0
