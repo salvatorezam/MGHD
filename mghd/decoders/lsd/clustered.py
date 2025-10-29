@@ -107,6 +107,47 @@ def gf2_nullspace(H: sp.csr_matrix):
     return np.stack(basis, axis=1)
 
 
+def gf2_nullspace_basis(H: sp.csr_matrix) -> np.ndarray:
+    """Return a dense uint8 matrix whose columns form a GF(2) nullspace basis of H.
+
+    Alias of ``gf2_nullspace`` exposed for clarity in calling sites where the
+    intent is to request a basis rather than an algorithm-specific structure.
+    Shape is ``(n, r)`` where ``n`` is the number of columns of H and ``r`` is
+    the nullity.
+    """
+    return gf2_nullspace(H)
+
+
+def gf2_project_to_coset(
+    H: sp.csr_matrix,
+    s: np.ndarray,
+    e_hint: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return one correction e in the coset {e : H e = s}.
+
+    Computes any particular solution ``e0`` such that ``H e0 = s`` and, when a
+    hint ``e_hint`` is supplied, nudges toward it within the coset by solving
+    ``N t = (e_hint ⊕ e0)`` for a nullspace basis ``N`` of ``H``. If the system
+    has empty nullspace or the hint is absent, simply returns ``e0``.
+
+    This is intended for projection-aware postprocessing of model outputs in
+    training/eval, keeping parity constraints exactly satisfied.
+    """
+    Hs = H.tocsr() if not isinstance(H, sp.csr_matrix) else H
+    e0 = gf2_solve_particular(Hs, np.asarray(s, dtype=np.uint8).ravel())
+    N = gf2_nullspace(Hs)  # n x r
+    if e_hint is None or N.shape[1] == 0:
+        return e0.astype(np.uint8)
+    d = (np.asarray(e_hint, dtype=np.uint8).ravel() ^ e0)  # desired delta within coset
+    try:
+        # Solve N t = d (mod 2); returns a length-r vector t
+        t = gf2_solve_particular(sp.csr_matrix(N), d)
+    except Exception:
+        return e0.astype(np.uint8)
+    adj = (N @ (t & 1)) & 1
+    return (e0 ^ adj).astype(np.uint8)
+
+
 # Tier-0 defaults for small-cluster solver
 TIER0_K_MAX = 3
 TIER0_R_MAX = 6
@@ -713,6 +754,8 @@ __all__ = [
     "Cluster",
     "gf2_row_echelon",
     "gf2_solve_particular",
+    "gf2_nullspace_basis",
+    "gf2_project_to_coset",
     "gf2_nullspace",
     "ml_parity_project",
     "ml_parity_project_torch",
