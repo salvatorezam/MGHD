@@ -1,8 +1,9 @@
 import numpy as np
 import pytest
-from mghd.core.core import pack_cluster
 
+# Ensure torch is available before importing core modules that require it
 torch = pytest.importorskip("torch")
+from mghd.core.core import pack_cluster
 
 
 def build_sample_cluster():

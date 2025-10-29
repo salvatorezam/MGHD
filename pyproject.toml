@@ -104,6 +104,13 @@ markers = [
 branch = true
 source = ["mghd"]
 
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+  "if __name__ == .__main__.:",
+  "pragma: no cover",
+]
+
 [tool.black]
 line-length = 100
 target-version = ["py310"]

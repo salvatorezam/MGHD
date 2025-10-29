@@ -727,14 +727,14 @@ class MGHDPrimaryClustered:
             q_l2g = entry["q_l2g"]
             if probs.shape[0] != H_sub.shape[1]:
                 raise AssertionError("Probability vector length mismatch for subgraph")
-        t_p0 = self._time.perf_counter()
-        if _TORCH_OK:
-            try:
-                e_sub = ml_parity_project_torch(H_sub, s_sub, probs, r_cap=self.r_cap)
-            except Exception:
+            t_p0 = self._time.perf_counter()
+            if _TORCH_OK:
+                try:
+                    e_sub = ml_parity_project_torch(H_sub, s_sub, probs, r_cap=self.r_cap)
+                except Exception:
+                    e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
+            else:
                 e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
-        else:
-            e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
             t_proj += (self._time.perf_counter() - t_p0) * 1e6
             parity = (H_sub @ e_sub) % 2
             parity = np.asarray(parity).ravel().astype(np.uint8) % 2
@@ -747,6 +747,7 @@ class MGHDPrimaryClustered:
             "sizes_hist": sizes_hist,
             "mghd_invoked": t_mghd,
             "proj_us": t_proj,
+            "mghd_clusters": int(len(subproblems)),
         }
 
 

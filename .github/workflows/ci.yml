@@ -29,8 +29,8 @@ jobs:
       - name: Lint
         run: ruff check
 
-      - name: Run unit tests
-        run: pytest -q
+      - name: Run unit tests with coverage (90% min)
+        run: pytest -q --cov=mghd --cov-report=term-missing --cov-report=xml --cov-fail-under=90
 
       - name: Build wheel
         run: python -m build --wheel

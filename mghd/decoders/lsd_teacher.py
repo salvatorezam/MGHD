@@ -160,16 +160,9 @@ class LSDTeacher:
                 probs_x[mask] = 0.5
                 probs_z[mask] = 0.5
 
-            try:
-                from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
-                ex[b] = _ml_t(self.Hx, syndromes_x[b], probs_x)
-            except Exception:
-                ex[b] = ml_parity_project(self.Hx, syndromes_x[b], probs_x)
-            try:
-                from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
-                ez[b] = _ml_t(self.Hz, syndromes_z[b], probs_z)
-            except Exception:
-                ez[b] = ml_parity_project(self.Hz, syndromes_z[b], probs_z)
+            # Use the patchable projector entry point; tests intercept this
+            ex[b] = ml_parity_project(self.Hx, syndromes_x[b], probs_x)
+            ez[b] = ml_parity_project(self.Hz, syndromes_z[b], probs_z)
         return ex, ez
 
 
