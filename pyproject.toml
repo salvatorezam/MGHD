@@ -70,6 +70,7 @@ mghd-preflight = "mghd.cli.preflight_mghd:main"
 mghd-teacher-eval = "mghd.tools.teacher_eval:main"
 mghd-train = "mghd.cli.train:main"
 mghd-make-crops = "mghd.cli.make_cluster_crops:main"
+mghd-plot-run = "mghd.tools.plot_run:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

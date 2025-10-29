@@ -129,7 +129,7 @@ Online (on-the-fly CUDA‑Q trajectories) with TAD + optional RL scaling and era
 mghd-train \
   --online \
   --family surface --distance 3 \
-  --p 0.005 \
+  --p-curriculum 0.01,0.006,0.003 --epochs-per-p 10 \
   --qpu-profile mghd/qpu/profiles/iqm_garnet_example.json \
   --context-source qiskit \
   --teacher-mix "mwpf=0.7,mwpm=0.2,lsd=0.1" \
@@ -339,6 +339,18 @@ The repository follows a modular design:
 - **`pytest.ini`**: Test configuration
 
 ---
+
+## Plotting Results
+
+Use the plotting tool to render loss curves (and the online p schedule) from a saved run directory. If a post‑run teacher evaluation was written (teacher_eval.txt), a teacher usage plot is generated too.
+
+Example:
+
+```bash
+mghd-plot-run data/results/20240101-120000_surface_d3_iqm_garnet_example
+```
+
+Outputs are saved next to the run (loss.png, teacher_usage.png, plots_manifest.json). If matplotlib is unavailable, a JSON summary is saved instead.
 
 ## Workflow
 
