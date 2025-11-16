@@ -17,6 +17,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,9 @@ from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_
 from mghd.tad import weighting as tad_weighting
 from mghd.tad import context as tad_context
 from mghd.codes.qpu_profile import load_qpu_profile
+
+
+_TEACHER_POOL: ThreadPoolExecutor | None = None
 
 
 class CropShardDataset(Dataset):
@@ -338,6 +342,12 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--post-eval-sampler", type=str, default="stim")
     parser.add_argument("--post-eval-shots-per-batch", type=int, default=16)
     parser.add_argument("--post-eval-batches", type=int, default=2)
+    parser.add_argument(
+        "--teacher-workers",
+        type=int,
+        default=4,
+        help="Thread pool workers used to prefetch teacher labels",
+    )
     # Early stopping
     parser.add_argument(
         "--early-stop-patience",
@@ -908,13 +918,31 @@ def train_inprocess(ns) -> str:
                 if steps_total and int(getattr(args, "progress_prints", 1)) > 1
                 else 0
             )
+            global _TEACHER_POOL
+            if _TEACHER_POOL is None:
+                workers = max(1, int(getattr(args, "teacher_workers", 4)))
+                _TEACHER_POOL = ThreadPoolExecutor(max_workers=workers)
+
+            def _teacher_prefetch(packed: PackedCrop) -> dict:
+                return {
+                    "valid": bool(getattr(packed, "teacher_valid", True)),
+                    "matched_local_ml": bool(
+                        getattr(packed, "teacher_matched_local_ml", False)
+                    ),
+                }
+
+            futures: list = []
+            teacher_outs: list = []
             for batch in loader:
                 if not batch:
                     continue
+                futures.clear()
                 moved = []
                 for packed in batch:
+                    futures.append(_TEACHER_POOL.submit(_teacher_prefetch, packed))
                     _validate_packed_contract(packed, expected_node_dim, expected_edge_dim)
                     moved.append(move_to(packed, device))
+                teacher_outs = [f.result() for f in futures]
                 if args.noise_injection > 0.0:
                     std = float(args.noise_injection)
                     for packed in moved:
@@ -922,13 +950,13 @@ def train_inprocess(ns) -> str:
                 opt.zero_grad(set_to_none=True)
 
             batch_loss = torch.zeros((), device=device)
-            for packed in moved:
+            for packed, teach in zip(moved, teacher_outs):
                 logits, node_mask = model(packed=packed)
                 logits = logits.squeeze(0)
                 node_mask = node_mask.squeeze(0)
 
-                hard = (0.5 if packed.teacher_valid else 1.5) + (
-                    0.5 if packed.teacher_matched_local_ml else 1.0
+                hard = (0.5 if teach.get("valid", True) else 1.5) + (
+                    0.5 if teach.get("matched_local_ml", False) else 1.0
                 )
                 sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
 
