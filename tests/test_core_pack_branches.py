@@ -31,7 +31,6 @@ def _base_kwargs():
 
 def test_pack_cluster_g_extra_and_jump_edges():
     kwargs = _base_kwargs()
-    nQ = kwargs["k"]
     bucket_spec = [(10, 20, 5)]
     crop = pack_cluster(
         **kwargs,
