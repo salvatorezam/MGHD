@@ -31,4 +31,3 @@ def test_preflight_main_stubbed(monkeypatch, tmp_path):
     ]
     rc = pf.main(args)
     assert rc in (0, 1)  # accept either, just ensure path executes
-

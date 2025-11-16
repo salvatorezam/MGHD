@@ -87,10 +87,15 @@ def plot_run(run_dir: Path, out_dir: Path | None = None, title: str | None = Non
     ax.plot(epochs, losses, marker="o", label="train loss")
     ax.set_xlabel("epoch")
     ax.set_ylabel("loss")
-    
+
     if any(p is not None for p in ps):
         ax2 = ax.twinx()
-        ax2.plot(epochs, [p if p is not None else float("nan") for p in ps], color="tab:orange", label="p (online)")
+        ax2.plot(
+            epochs,
+            [p if p is not None else float("nan") for p in ps],
+            color="tab:orange",
+            label="p (online)",
+        )
         ax2.set_ylabel("p")
         # Combine legends
         lines, labels = ax.get_legend_handles_labels()
@@ -99,7 +104,7 @@ def plot_run(run_dir: Path, out_dir: Path | None = None, title: str | None = Non
     else:
         ax.legend(loc="best")
 
-    ttl = title or f"MGHD run — {meta.get('family','?')} d={meta.get('distance','?')}"
+    ttl = title or f"MGHD run — {meta.get('family', '?')} d={meta.get('distance', '?')}"
     ax.set_title(ttl)
     fig.tight_layout()
     out1 = out_dir / "loss.png"
@@ -113,7 +118,9 @@ def plot_run(run_dir: Path, out_dir: Path | None = None, title: str | None = Non
         fig2, axb = plt.subplots(figsize=(5, 3))
         keys = list(usage)
         vals = [usage[k] for k in keys]
-        axb.bar(keys, vals, color=["#6699cc" if k.strip("'\"") == "mwpf" else "#99cc66" for k in keys])
+        axb.bar(
+            keys, vals, color=["#6699cc" if k.strip("'\"") == "mwpf" else "#99cc66" for k in keys]
+        )
         axb.set_title("Teacher usage (post-eval)")
         for i, v in enumerate(vals):
             axb.text(i, v, str(v), ha="center", va="bottom", fontsize=8)
@@ -131,8 +138,12 @@ def plot_run(run_dir: Path, out_dir: Path | None = None, title: str | None = Non
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Plot MGHD training run artifacts.")
-    ap.add_argument("run_dirs", nargs="+", help="One or more run directories containing train_log.json")
-    ap.add_argument("--out-dir", type=str, default=None, help="Output directory (defaults to each run dir)")
+    ap.add_argument(
+        "run_dirs", nargs="+", help="One or more run directories containing train_log.json"
+    )
+    ap.add_argument(
+        "--out-dir", type=str, default=None, help="Output directory (defaults to each run dir)"
+    )
     ap.add_argument("--title", type=str, default=None)
     args = ap.parse_args()
 
@@ -147,4 +158,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

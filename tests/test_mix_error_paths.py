@@ -7,7 +7,13 @@ from mghd.decoders.mwpm_fallback import MWPMFallback
 
 def test_mix_mwpm_fallback_outer_except(monkeypatch):
     code = get_code("surface", distance=3)
-    mix = TeacherMix(code, code.Hx, code.Hz, mix_cfg=MixConfig(p_mwpf=0.0, p_lsd=0.0, p_mwpm=1.0), mwpm_graphlike_only=False)
+    mix = TeacherMix(
+        code,
+        code.Hx,
+        code.Hz,
+        mix_cfg=MixConfig(p_mwpf=0.0, p_lsd=0.0, p_mwpm=1.0),
+        mwpm_graphlike_only=False,
+    )
     # Force MWPM branch by setting rng to return > thresholds
     rng = np.random.default_rng(123)
     dets = np.zeros((1, code.Hx.shape[0] + code.Hz.shape[0]), dtype=np.uint8)

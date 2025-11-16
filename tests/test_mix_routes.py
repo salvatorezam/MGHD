@@ -36,8 +36,9 @@ def test_mix_routes_with_dem_and_weight_overrides():
         "mwpf_scale": {0: 1.0},
         "mwpm_weights": (np.ones(code.Hx.shape[1]), np.ones(code.Hz.shape[1])),
     }
-    out = mix.route_batch(dets, sx, sz, dem_teacher=FakeDEMMatching(), weight_overrides=weight_overrides)
+    out = mix.route_batch(
+        dets, sx, sz, dem_teacher=FakeDEMMatching(), weight_overrides=weight_overrides
+    )
     assert out.get("dem_teacher") == "dem_matching"
     if "dem_pred_obs" in out:
         assert out["dem_pred_obs"].shape[0] == 1
-

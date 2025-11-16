@@ -61,9 +61,9 @@ def test_train_post_eval_writes_report(tmp_path, monkeypatch):
     ns.post_eval_batches = 1
 
     out_path = train_mod.train_inprocess(ns)
+    assert out_path is not None
     # teacher_eval.txt should exist under the auto run directory
     report_files = list(save_root.rglob("teacher_eval.txt"))
     assert report_files, "Expected teacher_eval.txt to be written"
     txt = report_files[0].read_text()
     assert "LER=" in txt
-

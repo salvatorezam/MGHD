@@ -2,6 +2,7 @@
 
 Exposes `run_distance` and a `sample_round` symbol (overridden by tests).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -40,4 +41,3 @@ def run_distance(
     rate = float(getattr(args, "inject_ler_rate", 0.0))
     failures = int(round(total * rate))
     return {"shots": total, "failures": failures}
-

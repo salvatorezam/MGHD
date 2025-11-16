@@ -1,4 +1,5 @@
 import numpy as np
+
 # Use the actual implementation module after the reorg
 from mghd.decoders.lsd import clustered as core
 
@@ -21,12 +22,15 @@ def _bruteforce_ml(H, s, w=None):
 
 def test_active_components_two_clusters():
     # 4 checks, 5 data; two disjoint pairs of checks sharing disjoint data
-    H = np.array([
-        [1, 0, 1, 0, 0],  # rows 0-1 share col 0 and 2
-        [1, 0, 1, 0, 0],
-        [0, 1, 0, 1, 0],  # rows 2-3 share col 1 and 3
-        [0, 1, 0, 1, 0],
-    ], dtype=np.uint8)
+    H = np.array(
+        [
+            [1, 0, 1, 0, 0],  # rows 0-1 share col 0 and 2
+            [1, 0, 1, 0, 0],
+            [0, 1, 0, 1, 0],  # rows 2-3 share col 1 and 3
+            [0, 1, 0, 1, 0],
+        ],
+        dtype=np.uint8,
+    )
     s = np.array([1, 1, 1, 0], dtype=np.uint8)
     clusters = core.active_components(H, s, basis="X")
     sizes = sorted([c.check_indices.size for c in clusters])
@@ -40,10 +44,13 @@ def test_active_components_two_clusters():
 
 def test_ml_projection_matches_bruteforce_small():
     # Tiny local problem with known solution
-    H = np.array([
-        [1, 1, 0],
-        [0, 1, 1],
-    ], dtype=np.uint8)
+    H = np.array(
+        [
+            [1, 1, 0],
+            [0, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
     s = np.array([1, 0], dtype=np.uint8)
     # uniform weights
     x_ml = core.ml_parity_project(H, s, probs_local=None, r_cap=8)
@@ -55,10 +62,13 @@ def test_ml_projection_matches_bruteforce_small():
 
 def test_batched_inference_shapes_and_consistency():
     # Build a simple CSS toy (same H for X and Z)
-    H = np.array([
-        [1, 0, 1, 0],
-        [0, 1, 0, 1],
-    ], dtype=np.uint8)
+    H = np.array(
+        [
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+        ],
+        dtype=np.uint8,
+    )
     B = 3
     sx = np.array([[1, 0], [0, 1], [1, 1]], dtype=np.uint8)
     sz = np.array([[0, 1], [1, 0], [1, 1]], dtype=np.uint8)

@@ -42,4 +42,3 @@ def test_mghdv2_forward_handles_feature_resize():
     logits, node_mask = model(pack)
     assert logits.shape[0] == node_mask.shape[0]
     assert logits.shape[1] == 2
-

@@ -7,9 +7,12 @@ from mghd.qpu.adapters.garnet_adapter import sample_round
 def test_garnet_adapter_synthetic_shapes(monkeypatch):
     monkeypatch.setenv("MGHD_SYNTHETIC", "1")
     out = sample_round(d=3, p=0.01, seed=0)
-    Hx = out["Hx"]; Hz = out["Hz"]
-    synZ = out["synZ"]; synX = out["synX"]
-    coords_q = out["coords_q"]; coords_c = out["coords_c"]
+    Hx = out["Hx"]
+    Hz = out["Hz"]
+    synZ = out["synZ"]
+    synX = out["synX"]
+    coords_q = out["coords_q"]
+    coords_c = out["coords_c"]
     n_data = 3 * 3
     n_check = (n_data - 1) // 2
     assert Hx.shape == (n_check, n_data)

@@ -23,7 +23,7 @@ def test_erasure_surface_ml_teacher_errors_and_basic():
 
     # Wrong mask length
     with pytest.raises(ValueError):
-        t.decode_batch(sx, sz, np.zeros((B, code.Hx.shape[1]-1), dtype=np.uint8))
+        t.decode_batch(sx, sz, np.zeros((B, code.Hx.shape[1] - 1), dtype=np.uint8))
 
     # Wrong det mask shape
     with pytest.raises(ValueError):
@@ -33,4 +33,3 @@ def test_erasure_surface_ml_teacher_errors_and_basic():
     out = t.decode_batch(sx, sz, mask)
     assert out["ex"].shape == (B, code.Hx.shape[1])
     assert out["ez"].shape == (B, code.Hz.shape[1])
-

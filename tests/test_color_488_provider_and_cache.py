@@ -1,4 +1,5 @@
 """Tests for 4.8.8 color-code providers and caches."""
+
 from __future__ import annotations
 
 import importlib

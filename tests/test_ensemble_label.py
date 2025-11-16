@@ -53,3 +53,36 @@ def test_get_teacher_label_invalid_fallback_and_match_flag():
         local_ml_bits=np.array([1, 0], dtype=np.uint8),
     )
     assert out.teacher == "mwpm" and out.valid
+
+
+def test_get_teacher_label_prefers_pf_when_pm_invalid():
+    H = np.array([[1, 0], [1, 1]], dtype=np.uint8)
+    s = np.array([1, 1], dtype=np.uint8)
+    bits_pf = np.array([1, 0], dtype=np.uint8)  # valid for both checks
+    bits_pm = np.array([0, 0], dtype=np.uint8)  # invalid parity
+    out = get_teacher_label(
+        H_sub=H,
+        synd_bits=s,
+        side="Z",
+        mwpf_ctx=FakePF(bits_pf, 3),
+        mwpm_ctx=FakePM(bits_pm, 1),
+        local_ml_bits=np.array([1, 0], dtype=np.uint8),
+    )
+    assert out.teacher == "mwpf"
+    assert out.valid is True
+
+
+def test_get_teacher_label_marks_invalid_when_both_fail():
+    H = np.array([[1, 1]], dtype=np.uint8)
+    s = np.array([1], dtype=np.uint8)
+    bits_invalid = np.array([0, 0], dtype=np.uint8)
+    out = get_teacher_label(
+        H_sub=H,
+        synd_bits=s,
+        side="Z",
+        mwpf_ctx=FakePF(bits_invalid, 2),
+        mwpm_ctx=FakePM(bits_invalid, 4),
+        local_ml_bits=np.array([1, 0], dtype=np.uint8),
+    )
+    assert out.teacher == "mwpf"
+    assert out.valid is False

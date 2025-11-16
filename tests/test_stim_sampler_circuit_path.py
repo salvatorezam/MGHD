@@ -25,4 +25,3 @@ def test_stim_sampler_uses_stim_circuit_path():
     batch = s.sample(FakeCode(), n_shots=3, seed=0)
     assert batch.dets.shape == (3, 5)
     assert batch.obs.shape == (3, 2)
-

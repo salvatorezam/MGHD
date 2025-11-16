@@ -1,4 +1,5 @@
 """Erasure-aware surface-code ML decoder (Delfosse–Zémor style)."""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional

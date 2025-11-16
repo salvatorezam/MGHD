@@ -5,6 +5,7 @@ by TAD (Teacher‑Assisted Decoding) to bias supervision and to provide compact
 context vectors to the model. Profiles are typically authored as JSON files
 checked into the repo under ``mghd/qpu/profiles/*.json``.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ class GateError:
     - idle_us: typical idle duration per scheduling tick (microseconds)
     - crosstalk_pairs: optional coupling weights for noisy pairs
     """
+
     p_1q: Dict[str, float]
     p_2q: Dict[str, Dict[str, float]]
     p_meas: float
@@ -45,6 +47,7 @@ class QPUProfile:
     - gate_error: GateError container with error/timing metadata
     - meta: freeform extras (e.g., vendor, date, calibration notes)
     """
+
     name: str
     n_qubits: int
     coupling: List[Tuple[int, int]]

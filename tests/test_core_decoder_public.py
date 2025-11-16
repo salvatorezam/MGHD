@@ -40,4 +40,3 @@ def test_decoder_public_priors_from_subgraphs_batched(tmp_path):
     assert probs[0].shape[0] == H_sub.shape[1]
     # Report should contain basic keys
     assert "device" in report and "batch_sizes" in report
-

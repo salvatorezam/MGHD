@@ -31,4 +31,3 @@ def test_stim_sampler_emit_obs_and_erasure_injection_smoke():
     assert batch2.obs.shape[0] == 2 and batch2.obs.shape[1] >= 0
     assert batch2.erase_data_mask is None
     assert batch2.p_erase_data is None
-

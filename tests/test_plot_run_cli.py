@@ -10,14 +10,17 @@ def test_plot_run_fallback_summary(tmp_path: Path, monkeypatch):
 
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    (run_dir / "train_log.json").write_text(json.dumps([
-        {"epoch": 1, "loss": 0.3},
-        {"epoch": 2, "loss": 0.2},
-    ]))
+    (run_dir / "train_log.json").write_text(
+        json.dumps(
+            [
+                {"epoch": 1, "loss": 0.3},
+                {"epoch": 2, "loss": 0.2},
+            ]
+        )
+    )
     (run_dir / "run_meta.json").write_text(json.dumps({"family": "surface", "distance": 3}))
     # No teacher_eval.txt
 
-    outs = plot_run.plot_run(run_dir)
+    plot_run.plot_run(run_dir)
     # No images in fallback; summary.json is written
     assert (run_dir / "summary.json").exists()
-

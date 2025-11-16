@@ -6,6 +6,7 @@ MWPM fallback using PyMatching v2.
 Refs:
 - PyMatching API (from_check_matrix, decode_batch): https://pymatching.readthedocs.io/en/latest/api.html
 """
+
 from __future__ import annotations
 
 from typing import Any, Iterable, Optional

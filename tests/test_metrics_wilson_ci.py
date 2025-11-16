@@ -18,4 +18,3 @@ def test_summary_line_includes_wilson_ci_text():
     # Expect "LER=<mean>±<pm>" in scientific notation
     assert "LER=" in line and "±" in line
     assert "per-logical=[" in line
-

@@ -9,4 +9,3 @@ def test_stim_surface_memory_shapes():
     assert dets.shape[0] == 4
     assert obs.shape[0] == 4
     assert dets.dtype == np.uint8 and obs.dtype == np.uint8
-

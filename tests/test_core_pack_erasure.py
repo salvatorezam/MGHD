@@ -36,4 +36,3 @@ def test_pack_cluster_includes_erasure_feature_when_provided():
     )
     # Erasure channel should add +1 feature dim (base is 8 → 9)
     assert crop.x_nodes.shape[1] >= 9
-

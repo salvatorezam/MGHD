@@ -1,6 +1,12 @@
 import numpy as np
 
-from mghd.utils.metrics import logical_error_rate, throughput, _wilson_interval, summary_line, LEResult
+from mghd.utils.metrics import (
+    logical_error_rate,
+    throughput,
+    _wilson_interval,
+    summary_line,
+    LEResult,
+)
 
 
 def test_metrics_edges_and_summary_na():
@@ -16,6 +22,7 @@ def test_metrics_edges_and_summary_na():
     # throughput
     assert throughput(100, 0.0) > 0
     # summary_line NA branch
-    line = summary_line("surface", 3, 1, 10, LEResult(None, None, 0, "obs unavailable"), 1.0, {"lsd": 1})
+    line = summary_line(
+        "surface", 3, 1, 10, LEResult(None, None, 0, "obs unavailable"), 1.0, {"lsd": 1}
+    )
     assert "LER=NA" in line
-

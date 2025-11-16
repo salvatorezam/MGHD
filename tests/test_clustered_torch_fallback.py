@@ -11,4 +11,3 @@ def test_ml_parity_project_torch_fallback_matches_numpy():
     e_np = ml_parity_project(H, s, p)
     e_tf = ml_parity_project_torch(H, s, p, r_cap=0)
     assert np.array_equal(e_np, e_tf)
-

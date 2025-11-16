@@ -39,4 +39,3 @@ def test_mghdv2_forward_on_packed_crop():
     logits, node_mask = model(pack)
     assert logits.shape[0] == node_mask.shape[0]
     assert logits.shape[1] == 2
-

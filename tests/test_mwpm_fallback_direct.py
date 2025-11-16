@@ -17,4 +17,3 @@ def test_mwpm_fallback_gf2_decode_shapes():
     synd = np.zeros((2, Hx.shape[0]), dtype=np.uint8)
     cx = mwpm_x.decode_batch(synd)
     assert cx.shape == (2, Hx.shape[1]) and cx.dtype == np.uint8
-

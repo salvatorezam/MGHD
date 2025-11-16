@@ -31,4 +31,3 @@ def test_gf2_project_to_coset_matches_hint_when_possible():
     # Check parity and equality with the hint (unique for this 1D nullspace)
     assert np.array_equal(((H @ e_proj) % 2).astype(np.uint8), s.astype(np.uint8))
     assert np.array_equal(e_proj, e_hint)
-

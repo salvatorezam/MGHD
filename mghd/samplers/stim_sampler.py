@@ -5,6 +5,7 @@ Adds CUDA‑Q parity in interface:
 - Optional erasure injection on data qubits (``inject_erasure_frac>0``)
   returning ``erase_data_mask`` and ``p_erase_data`` fields in ``SampleBatch``.
 """
+
 from __future__ import annotations
 
 from typing import Any, Optional, Tuple
@@ -57,9 +58,14 @@ class StimSampler:
         """Return True iff this sampler can generate a Stim circuit for the family."""
         return family in cls._SUPPORTED
 
-    def __init__(self, *, rounds: int = 5, dep: Optional[float] = None,
-                 emit_obs: bool = True,
-                 inject_erasure_frac: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        rounds: int = 5,
+        dep: Optional[float] = None,
+        emit_obs: bool = True,
+        inject_erasure_frac: float = 0.0,
+    ) -> None:
         self.rounds = int(rounds)
         self.dep = dep
         self.emit_obs = bool(emit_obs)
@@ -115,9 +121,11 @@ class StimSampler:
                     n_data = 0
                 if n_data > 0:
                     rng = np.random.default_rng(seed)
-                    mask = (rng.random((int(n_shots), n_data)) < self.inject_erasure_frac)
+                    mask = rng.random((int(n_shots), n_data)) < self.inject_erasure_frac
                     erase_data_mask = mask.astype(np.uint8)
-                    p_erase_data = np.full((int(n_shots), n_data), self.inject_erasure_frac, dtype=np.float32)
+                    p_erase_data = np.full(
+                        (int(n_shots), n_data), self.inject_erasure_frac, dtype=np.float32
+                    )
                     meta.setdefault("erasure_frac", self.inject_erasure_frac)
         return SampleBatch(
             dets=dets.astype(np.uint8),

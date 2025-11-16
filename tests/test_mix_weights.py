@@ -18,4 +18,3 @@ def test_resolve_mwpm_weights_dict_and_array():
     assert np.allclose(wx3, wz3)
     # None returns (None, None)
     assert _resolve_mwpm_weights(None) == (None, None)
-

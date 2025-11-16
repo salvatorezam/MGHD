@@ -20,4 +20,3 @@ def test_lsd_teacher_basic_and_shape_errors():
     # erase_mask wrong length should raise
     with pytest.raises(ValueError):
         t.decode_batch_xz(sx, sz, erase_mask=np.zeros(Hx.shape[1] - 1, dtype=np.uint8))
-

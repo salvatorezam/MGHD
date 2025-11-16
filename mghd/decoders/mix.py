@@ -5,6 +5,7 @@ If a teacher fails (raises), fall back to MWPM.
 
 All teachers consume raw detection streams or syndromes; no DEM required.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ class MixConfig:
     p_mwpf/p_lsd/p_mwpm: selection probabilities per batch (normalized internally)
     max_cluster: cap used by erasure teachers for local component size
     """
+
     p_mwpf: float = 0.5
     p_lsd: float = 0.4
     p_mwpm: float = 0.1

@@ -1,4 +1,5 @@
 """Helpers for constructing and caching detector error models (DEMs)."""
+
 from __future__ import annotations
 
 import hashlib

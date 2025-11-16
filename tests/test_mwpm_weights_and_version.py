@@ -1,4 +1,5 @@
 """Regression coverage for MWPM fallback weight coercion and decode shim."""
+
 from __future__ import annotations
 
 import types

@@ -22,7 +22,15 @@ def test_precompute_script_runs(tmp_path: Path, monkeypatch):
     env = os.environ.copy()
     project_root = Path(__file__).resolve().parents[1]
     env["PYTHONPATH"] = str(project_root) + os.pathsep + env.get("PYTHONPATH", "")
-    cmd = [sys.executable, "-m", "mghd.cli.precompute_color_codes", "--max-d", "3", "--which", "666"]
+    cmd = [
+        sys.executable,
+        "-m",
+        "mghd.cli.precompute_color_codes",
+        "--max-d",
+        "3",
+        "--which",
+        "666",
+    ]
     cp = subprocess.run(cmd, capture_output=True, text=True, env=env)
     assert cp.returncode == 0, cp.stderr
     cache_file = tmp_path / "color_cache" / "color_666_d3.npz"

@@ -1,4 +1,5 @@
 """Consolidated MGHD v2 runtime stack (features, model, decoder)."""
+
 from __future__ import annotations
 
 import math
@@ -37,6 +38,7 @@ class MGHDConfig:
     n_checks: int = 8
     n_node_inputs: int = 9
     n_node_outputs: int = 2  # binary head for rotated d=3
+
 
 def to_dict(self) -> Dict[str, Any]:
     return asdict(self)
@@ -78,7 +80,7 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
             parity = (r + c) % 2
             include = False
             if side == "Z":
-                include = (parity == 1)
+                include = parity == 1
             else:  # side == 'X'
                 include = (parity == 0) and not (r == center and c == center)
             if not include:
@@ -115,6 +117,7 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
 @dataclass
 class CropMeta:
     """Lightweight metadata describing a packed crop and pad/bucket sizes."""
+
     k: int
     r: int
     bbox_xywh: Tuple[int, int, int, int]
@@ -133,6 +136,7 @@ class CropMeta:
 @dataclass
 class PackedCrop:
     """All tensors required for a single crop forward pass and supervision."""
+
     x_nodes: torch.Tensor
     node_mask: torch.Tensor
     node_type: torch.Tensor
@@ -203,7 +207,9 @@ def _hilbert_index_2d(qxy: np.ndarray, levels: int = 64) -> np.ndarray:
     return idx
 
 
-def hilbert_order_within_bbox(check_xy: np.ndarray, bbox_xywh: Tuple[int, int, int, int]) -> np.ndarray:
+def hilbert_order_within_bbox(
+    check_xy: np.ndarray, bbox_xywh: Tuple[int, int, int, int]
+) -> np.ndarray:
     """Stable argsort of check nodes by 2D Hilbert order inside bbox."""
     xy01 = _normalize_xy(check_xy, bbox_xywh)
     qxy = _quantize_xy01(xy01, levels=64)
@@ -221,9 +227,7 @@ def infer_bucket_id(
     for idx, (node_cap, edge_cap, seq_cap) in enumerate(bucket_spec):
         if n_nodes <= node_cap and n_edges <= edge_cap and n_seq <= seq_cap:
             return idx
-    raise ValueError(
-        f"No bucket accommodates nodes={n_nodes}, edges={n_edges}, seq={n_seq}"
-    )
+    raise ValueError(f"No bucket accommodates nodes={n_nodes}, edges={n_edges}, seq={n_seq}")
 
 
 def pack_cluster(
@@ -261,10 +265,12 @@ def pack_cluster(
     xy_q01 = _normalize_xy(xy_qubit, bbox_xywh)
     xy_c01 = _normalize_xy(xy_check, bbox_xywh)
 
-    node_type = np.concatenate([
-        np.zeros(nQ, dtype=np.int8),
-        np.ones(nC, dtype=np.int8),
-    ])
+    node_type = np.concatenate(
+        [
+            np.zeros(nQ, dtype=np.int8),
+            np.ones(nC, dtype=np.int8),
+        ]
+    )
     degree = np.concatenate([deg_data, deg_check]).astype(np.float32)
     xy01 = np.vstack([xy_q01, xy_c01]).astype(np.float32)
 
@@ -482,7 +488,9 @@ class GraphDecoderCore(nn.Module):
         for i in range(self.n_iters):
             msg_in = torch.cat((node_states[src_ids], node_states[dst_ids]), dim=1)
             messages = self.msg_net(msg_in)
-            agg_msg = torch.zeros(node_inputs.shape[0], self.n_edge_features, device=device, dtype=messages.dtype)
+            agg_msg = torch.zeros(
+                node_inputs.shape[0], self.n_edge_features, device=device, dtype=messages.dtype
+            )
             agg_msg.index_add_(dim=0, index=dst_ids, source=messages)
             gru_inputs = torch.cat((agg_msg, node_inputs), dim=1)
 
@@ -532,7 +540,9 @@ class GraphDecoder(nn.Module):
             normalized["n_node_outputs"] = 2
         self.core = GraphDecoderCore(**normalized)
 
-    def forward(self, node_inputs: torch.Tensor, src_ids: torch.Tensor, dst_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, node_inputs: torch.Tensor, src_ids: torch.Tensor, dst_ids: torch.Tensor
+    ) -> torch.Tensor:
         """Pass through to the underlying core; see GraphDecoderCore.forward."""
         return self.core(node_inputs, src_ids, dst_ids)
 
@@ -728,7 +738,11 @@ class MGHDv2(nn.Module):
             if self.g_proj is None or self.g_proj.in_features != g_dim:
                 self.ensure_g_proj(g_dim, gtok.device)
             g_bias = self.g_proj(gtok)
-            g_bias = g_bias.unsqueeze(1).expand(batch_size, nodes_pad, -1).reshape(batch_size * nodes_pad, -1)
+            g_bias = (
+                g_bias.unsqueeze(1)
+                .expand(batch_size, nodes_pad, -1)
+                .reshape(batch_size * nodes_pad, -1)
+            )
         else:
             g_dim = gtok.numel()
             if self.g_proj is None or self.g_proj.in_features != g_dim:
@@ -778,19 +792,45 @@ class MGHDv2(nn.Module):
             nodes_pad=nodes_pad,
         )
 
-    def copy_into_static(self, static_ns: SimpleNamespace, host_ns: SimpleNamespace, *, non_blocking: bool = True) -> None:
-        for name in ("x_nodes", "node_mask", "node_type", "edge_index", "edge_attr", "edge_mask", "seq_idx", "seq_mask", "g_token"):
+    def copy_into_static(
+        self, static_ns: SimpleNamespace, host_ns: SimpleNamespace, *, non_blocking: bool = True
+    ) -> None:
+        for name in (
+            "x_nodes",
+            "node_mask",
+            "node_type",
+            "edge_index",
+            "edge_attr",
+            "edge_mask",
+            "seq_idx",
+            "seq_mask",
+            "g_token",
+        ):
             getattr(static_ns, name).copy_(getattr(host_ns, name), non_blocking=non_blocking)
 
-    def move_packed_to_device(self, host_ns: SimpleNamespace, device: torch.device) -> SimpleNamespace:
+    def move_packed_to_device(
+        self, host_ns: SimpleNamespace, device: torch.device
+    ) -> SimpleNamespace:
         tensors: Dict[str, torch.Tensor] = {}
-        for name in ("x_nodes", "node_mask", "node_type", "edge_index", "edge_attr", "edge_mask", "seq_idx", "seq_mask", "g_token"):
+        for name in (
+            "x_nodes",
+            "node_mask",
+            "node_type",
+            "edge_index",
+            "edge_attr",
+            "edge_mask",
+            "seq_idx",
+            "seq_mask",
+            "g_token",
+        ):
             tensors[name] = getattr(host_ns, name).to(device, non_blocking=True)
         tensors["batch_size"] = host_ns.batch_size
         tensors["nodes_pad"] = host_ns.nodes_pad
         return SimpleNamespace(**tensors)
 
-    def gather_from_static(self, static_output: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def gather_from_static(
+        self, static_output: Sequence[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         logits, node_mask = static_output
         return logits, node_mask
 
@@ -893,7 +933,9 @@ class MGHDDecoderPublic:
         self._Hx = Hx.tocsr()
         self._Hz = Hz.tocsr()
         if hasattr(self.model, "set_authoritative_mats"):
-            self.model.set_authoritative_mats(self._Hx.toarray(), self._Hz.toarray(), device=self.device)
+            self.model.set_authoritative_mats(
+                self._Hx.toarray(), self._Hz.toarray(), device=self.device
+            )
         self._bound = True
 
     def set_message_iters(self, n_iters: Optional[int]) -> None:

@@ -13,6 +13,7 @@ from mghd.cli import train as train_mod
 
 def _to_numpy(t):
     import torch as _torch
+
     return t.detach().cpu().numpy() if _torch.is_tensor(t) else np.asarray(t)
 
 
@@ -98,4 +99,3 @@ def test_train_inprocess_offline_minipack(tmp_path, monkeypatch):
     # Ensure logs exist
     found = list(save_root.rglob("train_log.json"))
     assert found and json.loads(found[0].read_text())
-

@@ -7,6 +7,7 @@ Refs:
 - Python API & examples (hyperedges, solver init): https://github.com/yuewuo/mwpf (README 'Usage')
 - Sinter adapter exists but is optional (we don't rely on DEM for training).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ try:  # pragma: no cover - optional dependency
         SolverSerialJointSingleHair,
         SyndromePattern,
     )
+
     _HAVE_MWPF = True
     _MWPF_IMPORT_ERROR: Optional[Exception] = None
 except Exception as exc:  # pragma: no cover - exercised when lib missing
@@ -37,6 +39,7 @@ class MWPFConfig:
     cluster_node_limit: optional cap for clustering (speed/accuracy trade-off)
     timeout: optional wall-clock limit per solve (seconds)
     """
+
     cluster_node_limit: Optional[int] = None
     timeout: Optional[float] = None
 
@@ -103,8 +106,7 @@ class MWPFTeacher:
             fault_map_list = list(range(len(edges_list)))
         else:  # pragma: no cover - defensive
             raise NotImplementedError(
-                "code_obj must provide detectors_per_fault+fault_weights "
-                "or to_fault_hypergraph()."
+                "code_obj must provide detectors_per_fault+fault_weights or to_fault_hypergraph()."
             )
 
         self._vertex_num = int(vertex_num)
@@ -160,9 +162,7 @@ class MWPFTeacher:
             raise RuntimeError("MWPFTeacher not initialized correctly")
         B, D = dets.shape
         if D != self._vertex_num:
-            raise AssertionError(
-                f"syndrome length {D} != vertex count {self._vertex_num}"
-            )
+            raise AssertionError(f"syndrome length {D} != vertex count {self._vertex_num}")
 
         if _HAVE_MWPF:
             return self._decode_batch_mwpf(dets, mwpf_scale=mwpf_scale)

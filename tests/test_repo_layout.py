@@ -1,5 +1,6 @@
 def test_imports_smoke():
     import importlib
+
     assert importlib.import_module("mghd.core")
     assert importlib.import_module("mghd.codes.registry")
     assert importlib.import_module("mghd.samplers")
@@ -10,5 +11,6 @@ def test_imports_smoke():
 def test_sampler_registry_defaults():
     from mghd.samplers import get_sampler
     from mghd.samplers.cudaq_sampler import CudaQSampler
+
     cudaq = get_sampler("cudaq")
     assert isinstance(cudaq, CudaQSampler)

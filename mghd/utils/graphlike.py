@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 from scipy import sparse
 
+
 def is_graphlike(H) -> bool:
     """True iff every column has <=2 ones."""
     if sparse.issparse(H):

@@ -16,4 +16,3 @@ def test_clustered_decode_empty_syndrome_returns_zero_and_hist():
     assert out["e"].shape[0] == H.shape[1]
     assert isinstance(out.get("sizes_hist"), dict)
     assert out.get("mghd_clusters") == 0
-

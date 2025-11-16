@@ -11,6 +11,7 @@ Artifacts are written under ``artifacts/preflight`` and a final summary is
 printed and saved as JSON. Non‑blocking failures are reported but do not abort
 the entire run; blocking failures raise PreflightError early.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,6 +29,7 @@ from pathlib import Path
 @dataclass
 class StepResult:
     """One row in the preflight summary table."""
+
     name: str
     status: str
     details: dict[str, object]
@@ -169,7 +171,9 @@ def run(cmd: Iterable[str], log_path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(cmd_list, retcode, "".join(output_chunks), "")
 
 
-LER_PATTERN = re.compile(r"LER(?:_(?P<kind>dem|mix))?\s*[:=]\s*(?P<value>[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)")
+LER_PATTERN = re.compile(
+    r"LER(?:_(?P<kind>dem|mix))?\s*[:=]\s*(?P<value>[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)"
+)
 
 
 def parse_ler(stdout: str) -> dict[str, float | None]:
@@ -231,7 +235,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
     )
     parser.add_argument("--skip-cudaq", action="store_true")
-    parser.add_argument("--expect-conda-env", default=None, help="If set, also probe CUDA-Q inside this conda env (e.g., 'mlqec-env')")
+    parser.add_argument(
+        "--expect-conda-env",
+        default=None,
+        help="If set, also probe CUDA-Q inside this conda env (e.g., 'mlqec-env')",
+    )
 
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -347,7 +355,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         summary_rows.append(StepResult("cudaq", cudaq_status, cudaq_detail))
     else:
         section("CUDA-Q Smoke")
-        reason = "CUDA-Q not available" if not versions.get("cudaq_available") else "skipped via --skip-cudaq"
+        reason = (
+            "CUDA-Q not available"
+            if not versions.get("cudaq_available")
+            else "skipped via --skip-cudaq"
+        )
         write_skip_log(cudaq_log, reason)
         summary_rows.append(StepResult("cudaq", "skip", {"note": reason}))
 
