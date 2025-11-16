@@ -386,12 +386,17 @@ def train_inprocess(ns) -> str:
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    # Enforce GPU usage. Fail fast if CUDA is not available in this environment.
-    if not torch.cuda.is_available():
+    # Prefer CUDA when available; optionally require it via MGHD_REQUIRE_CUDA=1.
+    require_cuda = os.getenv("MGHD_REQUIRE_CUDA", "").lower() in {"1", "true", "yes"}
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif require_cuda:
         raise RuntimeError(
-            "CUDA GPU is required. Install a CUDA-enabled PyTorch build and run on a GPU node."
+            "CUDA GPU is required but not available (MGHD_REQUIRE_CUDA=1). "
+            "Install a CUDA-enabled PyTorch build and run on a GPU node."
         )
-    device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     # Build model with optional hyperparameters from JSON
     hp_model = getattr(args, "_hp_model", {})
     hp_mamba = getattr(args, "_hp_mamba", {})
