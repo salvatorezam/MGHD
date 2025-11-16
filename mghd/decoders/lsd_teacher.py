@@ -16,7 +16,6 @@ import warnings
 import numpy as np
 
 from mghd.decoders.lsd.clustered import ml_parity_project
-import torch as _torch  # Enforce CUDA availability for GPU projector
 
 try:  # pragma: no cover - optional dependency
     # ldpc 0.1.x has bposd_decoder, not bplsd_decoder
@@ -68,9 +67,6 @@ class LSDTeacher:
         - Hx, Hz: parity-check matrices (uint8) for X and Z bases.
         - cfg: optional LSDConfig controlling BP/OSD behavior.
         """
-        # Enforce GPU availability: this teacher runs exclusively on CUDA for performance.
-        if not _torch.cuda.is_available():  # pragma: no cover - fail fast on misconfigured envs
-            raise RuntimeError("LSDTeacher requires CUDA (torch.cuda.is_available() == True).")
         self.cfg = cfg or LSDConfig()
         self.Hx = np.asarray(Hx, dtype=np.uint8)
         self.Hz = np.asarray(Hz, dtype=np.uint8)
