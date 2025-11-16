@@ -152,5 +152,10 @@ def test_sequence_encoder_constructor_fallback(monkeypatch):
     node_type = torch.zeros(4, dtype=torch.long)
     out = encoder(x, seq_idx, seq_mask, node_type=node_type)
     assert out.shape == x.shape
-    empty = encoder(x, torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.bool), node_type=torch.tensor([], dtype=torch.long))
+    empty = encoder(
+        x,
+        torch.tensor([], dtype=torch.long),
+        torch.tensor([], dtype=torch.bool),
+        node_type=torch.tensor([], dtype=torch.long),
+    )
     assert torch.allclose(empty, x)

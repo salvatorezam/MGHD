@@ -43,6 +43,11 @@ class MGHDConfig:
         return asdict(self)
 
 
+def to_dict(cfg: MGHDConfig) -> Dict[str, Any]:
+    """Backward compatible helper returning the dataclass fields as a dict."""
+    return cfg.to_dict()
+
+
 # ---------------------------------------------------------------------------
 # Minimal CSS helpers (moved from codes.pcm_real for consolidation)
 # ---------------------------------------------------------------------------
@@ -949,6 +954,10 @@ class MGHDDecoderPublic:
         self._bound = False
         self._Hx: Optional[sp.csr_matrix] = None
         self._Hz: Optional[sp.csr_matrix] = None
+        self._graph: Optional[torch.cuda.CUDAGraph] = None
+        self._static_in: Optional[PackedCrop] = None
+        self._static_logits: Optional[torch.Tensor] = None
+        self._static_mask: Optional[torch.Tensor] = None
 
     def bind_code(self, Hx: sp.csr_matrix, Hz: sp.csr_matrix) -> None:
         self._Hx = Hx.tocsr()
@@ -1001,6 +1010,35 @@ class MGHDDecoderPublic:
 
     def priors_from_syndrome(self, *_args, **_kwargs) -> np.ndarray:  # pragma: no cover
         raise RuntimeError("MGHD v2 decoder only supports packed crop inference")
+
+    def warmup_and_capture(self, example_packed: PackedCrop, iters: int = 3) -> Optional[bool]:
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        pack = self._move_packed_crop(example_packed, self.device)
+        stream = torch.cuda.Stream(device=self.device)
+        torch.cuda.synchronize(self.device)
+        with torch.cuda.stream(stream):
+            for _ in range(max(1, int(iters))):
+                _ = self.model(pack)
+        torch.cuda.synchronize(self.device)
+        self._graph = torch.cuda.CUDAGraph()
+        self._static_in = pack
+        with torch.cuda.graph(self._graph):  # type: ignore[attr-defined]
+            logits, node_mask = self.model(self._static_in)
+            self._static_logits = logits.clone()
+            self._static_mask = node_mask.clone()
+        self._graph_capture_enabled = True
+        return True
+
+    @torch.inference_mode()
+    def fast_infer(self, packed: PackedCrop):
+        if self._graph is None or self._static_in is None:
+            pack = self._move_packed_crop(packed, self.device)
+            return self.model(pack)
+        pack = self._move_packed_crop(packed, self.device)
+        self._copy_into_static_pack(self._static_in, pack)
+        self._graph.replay()
+        return self._static_logits, self._static_mask
 
     def _normalize_entry(
         self,
@@ -1058,6 +1096,18 @@ class MGHDDecoderPublic:
                 setattr(pack, name, value.to(device, non_blocking=True))
         return pack
 
+    def _copy_into_static_pack(self, dst: PackedCrop, src: PackedCrop) -> None:
+        for name in TensorFields:
+            src_val = getattr(src, name, None)
+            dst_val = getattr(dst, name, None)
+            if torch.is_tensor(src_val) and torch.is_tensor(dst_val):
+                if src_val.shape != dst_val.shape:
+                    raise ValueError(
+                        f"Tensor field '{name}' shape mismatch for CUDA graph replay: "
+                        f"{tuple(src_val.shape)} vs {tuple(dst_val.shape)}"
+                    )
+                dst_val.copy_(src_val)
+
     def _device_info(self) -> Dict[str, Any]:
         info: Dict[str, Any] = {"device": str(self.device)}
         if self.device.type == "cuda":
@@ -1085,6 +1135,7 @@ def warmup_and_capture(*_args, **_kwargs) -> Dict[str, Any]:
 
 __all__ = [
     "MGHDConfig",
+    "to_dict",
     "CropMeta",
     "PackedCrop",
     "pack_cluster",

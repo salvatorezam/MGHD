@@ -475,7 +475,9 @@ def train_inprocess(ns) -> str:
         "d_model": int(getattr(args, "d_model", 192)),
         "d_state": int(getattr(args, "d_state", 80)),
         "n_iters": int(getattr(args, "n_iters", 8)),
-        "gnn_msg_net_size": int(getattr(args, "msg_net_size", max(96, getattr(args, "d_model", 192)))),
+        "gnn_msg_net_size": int(
+            getattr(args, "msg_net_size", max(96, getattr(args, "d_model", 192)))
+        ),
         "gnn_msg_dropout": float(getattr(args, "msg_net_dropout_p", 0.0)),
         "gnn_gru_dropout": float(getattr(args, "gru_dropout_p", 0.0)),
         "se_reduction": int(getattr(args, "se_reduction", 4)),
@@ -926,9 +928,7 @@ def train_inprocess(ns) -> str:
             def _teacher_prefetch(packed: PackedCrop) -> dict:
                 return {
                     "valid": bool(getattr(packed, "teacher_valid", True)),
-                    "matched_local_ml": bool(
-                        getattr(packed, "teacher_matched_local_ml", False)
-                    ),
+                    "matched_local_ml": bool(getattr(packed, "teacher_matched_local_ml", False)),
                 }
 
             futures: list = []
