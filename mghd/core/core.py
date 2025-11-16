@@ -39,9 +39,8 @@ class MGHDConfig:
     n_node_inputs: int = 9
     n_node_outputs: int = 2  # binary head for rotated d=3
 
-
-def to_dict(self) -> Dict[str, Any]:
-    return asdict(self)
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +446,7 @@ class GraphDecoderCore(nn.Module):
 
         self.final_digits = nn.Linear(self.n_node_features, self.n_node_outputs)
         self.msg_net = nn.Sequential(
-            nn.Linear(2 * n_node_features, msg_net_size),
+            nn.Linear(2 * n_node_features + n_edge_features, msg_net_size),
             nn.ReLU(),
             nn.Dropout(msg_net_dropout_p),
             nn.Linear(msg_net_size, msg_net_size),
@@ -466,6 +465,7 @@ class GraphDecoderCore(nn.Module):
         node_inputs: torch.Tensor,
         src_ids: torch.Tensor,
         dst_ids: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute per‑node logits for one graph.
 
@@ -486,7 +486,16 @@ class GraphDecoderCore(nn.Module):
         )
 
         for i in range(self.n_iters):
-            msg_in = torch.cat((node_states[src_ids], node_states[dst_ids]), dim=1)
+            if edge_attr is None:
+                edge_feat = torch.zeros(
+                    src_ids.shape[0],
+                    self.n_edge_features,
+                    device=node_inputs.device,
+                    dtype=node_inputs.dtype,
+                )
+            else:
+                edge_feat = edge_attr.to(node_inputs.device, dtype=node_inputs.dtype)
+            msg_in = torch.cat((node_states[src_ids], node_states[dst_ids], edge_feat), dim=1)
             messages = self.msg_net(msg_in)
             agg_msg = torch.zeros(
                 node_inputs.shape[0], self.n_edge_features, device=device, dtype=messages.dtype
@@ -541,10 +550,14 @@ class GraphDecoder(nn.Module):
         self.core = GraphDecoderCore(**normalized)
 
     def forward(
-        self, node_inputs: torch.Tensor, src_ids: torch.Tensor, dst_ids: torch.Tensor
+        self,
+        node_inputs: torch.Tensor,
+        src_ids: torch.Tensor,
+        dst_ids: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Pass through to the underlying core; see GraphDecoderCore.forward."""
-        return self.core(node_inputs, src_ids, dst_ids)
+        return self.core(node_inputs, src_ids, dst_ids, edge_attr=edge_attr)
 
 
 def _mamba_constructors() -> List[Any]:
@@ -666,11 +679,14 @@ class GraphDecoderAdapter(nn.Module):
         """Compute last‑iteration logits [N,2] with masked edges."""
         src_ids = edge_index[0]
         dst_ids = edge_index[1]
+        attr = edge_attr
         if edge_mask is not None:
             valid_edges = edge_mask
             src_ids = src_ids[valid_edges]
             dst_ids = dst_ids[valid_edges]
-        output = self.core(x_nodes, src_ids, dst_ids)
+            if attr is not None:
+                attr = attr[valid_edges]
+        output = self.core(x_nodes, src_ids, dst_ids, edge_attr=attr)
         idx = output.shape[0] - 1
         if self.iter_override is not None:
             idx = max(0, min(self.iter_override - 1, output.shape[0] - 1))
@@ -710,7 +726,7 @@ class MGHDv2(nn.Module):
         self.se = ChannelSE(channels=d_model, reduction=int(se_reduction))
         self.gnn = GraphDecoderAdapter(
             hidden_dim=d_model,
-            edge_feat_dim=edge_feat_dim,
+            edge_feat_dim=d_model,
             n_iters=n_iters,
             msg_net_size=gnn_msg_net_size,
             msg_net_dropout_p=gnn_msg_dropout,

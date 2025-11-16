@@ -148,6 +148,28 @@ def collate_packed(batch):
     return batch
 
 
+def _load_hparams(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _validate_packed_contract(packed: PackedCrop, node_feat_dim: int, edge_feat_dim: int) -> None:
+    node_dim = int(packed.x_nodes.shape[-1])
+    if node_dim != int(node_feat_dim):
+        raise ValueError(
+            f"Packed crop node feature dimension {node_dim} does not match expected "
+            f"{node_feat_dim}. Check data_contract.node_feat_dim or erasure setting."
+        )
+    if packed.edge_attr is None:
+        raise ValueError("Packed crop is missing edge_attr entries required by the model")
+    edge_dim = int(packed.edge_attr.shape[-1])
+    if edge_dim != int(edge_feat_dim):
+        raise ValueError(
+            f"Packed crop edge feature dimension {edge_dim} does not match expected "
+            f"{edge_feat_dim}. Update data_contract.edge_feat_dim or regenerate crops."
+        )
+
+
 def bce_binary_head_loss(
     logits: torch.Tensor,
     node_mask: torch.Tensor,
@@ -331,25 +353,66 @@ def train_inprocess(ns) -> str:
     )
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
-        # Optionally load hyperparameters and apply to args
-        if getattr(args, "hparams", None):
-            try:
-                with open(args.hparams, "r", encoding="utf-8") as fh:
-                    hp = json.load(fh)
-            except Exception:
-                hp = None
-            if isinstance(hp, dict):
-                tp = hp.get("training_parameters", {}) or {}
-                args.lr = float(tp.get("lr", args.lr))
-                args.wd = float(tp.get("weight_decay", args.wd))
-                args.label_smoothing = float(tp.get("label_smoothing", args.label_smoothing))
-                args.grad_clip = float(tp.get("gradient_clip", args.grad_clip))
-                args.noise_injection = float(tp.get("noise_injection", args.noise_injection))
-                args.epochs = int(tp.get("epochs", args.epochs))
-                args.batch = int(tp.get("batch_size", args.batch))
-                setattr(args, "_hp_model", hp.get("model_architecture", {}) or {})
-                setattr(args, "_hp_mamba", hp.get("mamba_parameters", {}) or {})
-                setattr(args, "_hp_attn", hp.get("attention_mechanism", {}) or {})
+
+    # Default structural hyperparameters (can be overridden via JSON/CLI namespace)
+    defaults = {
+        "d_model": 192,
+        "d_state": 80,
+        "n_iters": 8,
+        "msg_net_dropout_p": 0.0,
+        "gru_dropout_p": 0.0,
+        "se_reduction": 4,
+        "node_feat_dim": 8,
+        "edge_feat_dim": 3,
+    }
+    for attr, value in defaults.items():
+        if not hasattr(args, attr):
+            setattr(args, attr, value)
+    if not hasattr(args, "msg_net_size"):
+        args.msg_net_size = max(96, int(getattr(args, "d_model", 192)))
+
+    hp = None
+    if getattr(args, "hparams", None):
+        try:
+            hp = _load_hparams(args.hparams)
+        except Exception:
+            hp = None
+    if isinstance(hp, dict):
+        hp_model = hp.get("model_architecture", {}) or {}
+        hp_mamba = hp.get("mamba_parameters", {}) or {}
+        hp_attn = hp.get("attention_mechanism", {}) or {}
+        hp_data = hp.get("data_contract", {}) or {}
+        hp_train = hp.get("training_parameters", {}) or {}
+
+        args.d_model = int(hp_mamba.get("d_model", args.d_model))
+        args.d_state = int(hp_mamba.get("d_state", args.d_state))
+        args.n_iters = int(hp_model.get("n_iters", args.n_iters))
+        args.msg_net_size = int(hp_model.get("msg_net_size", max(96, args.d_model)))
+        args.msg_net_dropout_p = float(hp_model.get("msg_net_dropout_p", args.msg_net_dropout_p))
+        args.gru_dropout_p = float(hp_model.get("gru_dropout_p", args.gru_dropout_p))
+        args.se_reduction = int(hp_attn.get("se_reduction", args.se_reduction))
+
+        node_feat_dim = int(hp_data.get("node_feat_dim", args.node_feat_dim))
+        if bool(hp_data.get("erasure_enabled", False)):
+            node_feat_dim = 9
+        edge_feat_dim = int(hp_data.get("edge_feat_dim", args.edge_feat_dim))
+        args.node_feat_dim = node_feat_dim
+        args.edge_feat_dim = edge_feat_dim
+
+        args.lr = float(hp_train.get("lr", args.lr))
+        args.wd = float(hp_train.get("weight_decay", args.wd))
+        args.epochs = int(hp_train.get("epochs", args.epochs))
+        args.batch = int(hp_train.get("batch_size", args.batch))
+        args.label_smoothing = float(hp_train.get("label_smoothing", args.label_smoothing))
+        args.grad_clip = float(hp_train.get("gradient_clip", args.grad_clip))
+        args.noise_injection = float(hp_train.get("noise_injection", args.noise_injection))
+
+    args.msg_net_size = int(getattr(args, "msg_net_size", max(96, int(args.d_model))))
+    if bool(getattr(args, "online", False)) and float(getattr(args, "erasure_frac", 0.0)) > 0.0:
+        args.node_feat_dim = max(int(args.node_feat_dim), 9)
+
+    expected_node_dim = int(args.node_feat_dim)
+    expected_edge_dim = int(args.edge_feat_dim)
 
     # Resolve save directory (auto if requested or missing)
     def _auto_name(family: str, distance: int, qpu_profile: str | None) -> str:
@@ -397,30 +460,18 @@ def train_inprocess(ns) -> str:
         )
     else:
         device = torch.device("cpu")
-    # Build model with optional hyperparameters from JSON
-    hp_model = getattr(args, "_hp_model", {})
-    hp_mamba = getattr(args, "_hp_mamba", {})
-    hp_attn = getattr(args, "_hp_attn", {})
-    m_kwargs = {}
-    if hp_mamba:
-        if "d_model" in hp_mamba:
-            m_kwargs["d_model"] = int(hp_mamba["d_model"])  # type: ignore[assignment]
-        if "d_state" in hp_mamba:
-            m_kwargs["d_state"] = int(hp_mamba["d_state"])  # type: ignore[assignment]
-    if hp_model:
-        if "n_iters" in hp_model:
-            m_kwargs["n_iters"] = int(hp_model["n_iters"])  # type: ignore[assignment]
-        if "msg_net_size" in hp_model:
-            m_kwargs["gnn_msg_net_size"] = int(hp_model["msg_net_size"])  # type: ignore[assignment]
-        if "msg_net_dropout_p" in hp_model:
-            m_kwargs["gnn_msg_dropout"] = float(hp_model["msg_net_dropout_p"])  # type: ignore[assignment]
-        if "gru_dropout_p" in hp_model:
-            m_kwargs["gnn_gru_dropout"] = float(hp_model["gru_dropout_p"])  # type: ignore[assignment]
-    if hp_attn and "se_reduction" in hp_attn:
-        m_kwargs["se_reduction"] = int(hp_attn["se_reduction"])  # type: ignore[assignment]
-    # If online with erasures, expand node features by 1 (erasure flag)
-    if bool(getattr(args, "online", False)) and float(getattr(args, "erasure_frac", 0.0)) > 0.0:
-        m_kwargs["node_feat_dim"] = 9
+    # Build model with optional hyperparameters from JSON/data contract
+    m_kwargs = {
+        "d_model": int(getattr(args, "d_model", 192)),
+        "d_state": int(getattr(args, "d_state", 80)),
+        "n_iters": int(getattr(args, "n_iters", 8)),
+        "gnn_msg_net_size": int(getattr(args, "msg_net_size", max(96, getattr(args, "d_model", 192)))),
+        "gnn_msg_dropout": float(getattr(args, "msg_net_dropout_p", 0.0)),
+        "gnn_gru_dropout": float(getattr(args, "gru_dropout_p", 0.0)),
+        "se_reduction": int(getattr(args, "se_reduction", 4)),
+        "node_feat_dim": expected_node_dim,
+        "edge_feat_dim": expected_edge_dim,
+    }
     model = MGHDv2(profile=args.profile, **m_kwargs).to(device)
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -760,6 +811,7 @@ def train_inprocess(ns) -> str:
                                 else None
                             ),
                         )
+                        _validate_packed_contract(pack, expected_node_dim, expected_edge_dim)
                         batch_buf.append(move_to(pack, device))
                         if len(batch_buf) >= args.batch:
                             # run a step
@@ -859,7 +911,10 @@ def train_inprocess(ns) -> str:
             for batch in loader:
                 if not batch:
                     continue
-                moved = [move_to(packed, device) for packed in batch]
+                moved = []
+                for packed in batch:
+                    _validate_packed_contract(packed, expected_node_dim, expected_edge_dim)
+                    moved.append(move_to(packed, device))
                 if args.noise_injection > 0.0:
                     std = float(args.noise_injection)
                     for packed in moved:
@@ -1045,7 +1100,13 @@ def move_to(p: PackedCrop, device):
     return p
 
 
-def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float = 1e-4):
+def sanity_train(
+    crop_root: str,
+    epochs: int = 2,
+    batch_size: int = 2,
+    lr: float = 1e-4,
+    hparams: str | None = None,
+):
     """Quick sanity training over a small offline crop dir (for tests/demos)."""
     import os
     import tempfile
@@ -1062,9 +1123,12 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
     ns.parity_lambda = 0.03
     ns.projection_aware = 1
     ns.seed = 42
-    ns.label_smoothing = 0.13831652882929857
-    ns.noise_injection = 0.009883059279379016
-    ns.grad_clip = 0.8545326095750816
+    ns.label_smoothing = 0.1
+    ns.noise_injection = 0.0
+    ns.grad_clip = 1.0
+    ns.node_feat_dim = 8
+    ns.edge_feat_dim = 3
+    ns.hparams = hparams
 
     # Create temporary directory for save path
     temp_dir = tempfile.mkdtemp()
