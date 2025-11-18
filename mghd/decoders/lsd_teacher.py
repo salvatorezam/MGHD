@@ -6,6 +6,7 @@ Refs:
 - ldpc docs (BP+LSD, BP+OSD, belief-find): https://software.roffe.eu/ldpc/quantum_decoder.html
 - LSD paper (parallel local inversions / cluster solves): https://arxiv.org/abs/2406.18655
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ try:  # pragma: no cover - optional dependency
     # ldpc 0.1.x has bposd_decoder, not bplsd_decoder
     # BP+OSD with osd_method can approximate LSD behavior
     import ldpc
+
     BpLsdDecoder = ldpc.bposd_decoder  # type: ignore
     _HAVE_LDPC = True
     _LDPC_IMPORT_ERROR: Optional[Exception] = None
@@ -40,6 +42,7 @@ class LSDConfig:
     lsd_method: OSD variant; 'OSD_CS' approximates LSD with cluster-search.
     lsd_order:  OSD order parameter.
     """
+
     error_rate: float = 0.05
     max_iter: int = 3
     bp_method: str = "product_sum"
@@ -143,6 +146,9 @@ class LSDTeacher:
         B = syndromes_x.shape[0]
         ex = np.zeros((B, self.Hx.shape[1]), dtype=np.uint8)
         ez = np.zeros((B, self.Hz.shape[1]), dtype=np.uint8)
+        # Use the torch-accelerated projector on CUDA unconditionally
+        from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
+
         for b in range(B):
             probs_x = None
             probs_z = None
@@ -160,16 +166,8 @@ class LSDTeacher:
                 probs_x[mask] = 0.5
                 probs_z[mask] = 0.5
 
-            try:
-                from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
-                ex[b] = _ml_t(self.Hx, syndromes_x[b], probs_x)
-            except Exception:
-                ex[b] = ml_parity_project(self.Hx, syndromes_x[b], probs_x)
-            try:
-                from mghd.decoders.lsd.clustered import ml_parity_project_torch as _ml_t
-                ez[b] = _ml_t(self.Hz, syndromes_z[b], probs_z)
-            except Exception:
-                ez[b] = ml_parity_project(self.Hz, syndromes_z[b], probs_z)
+            ex[b] = _ml_t(self.Hx, syndromes_x[b], probs_x, device="cuda")
+            ez[b] = _ml_t(self.Hz, syndromes_z[b], probs_z, device="cuda")
         return ex, ez
 
 

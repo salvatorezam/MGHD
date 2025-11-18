@@ -1,4 +1,5 @@
 """Utilities for schedule-aware weighting and context features."""
+
 from __future__ import annotations
 
 import math

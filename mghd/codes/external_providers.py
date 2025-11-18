@@ -1,4 +1,5 @@
 """Optional external builders for CSS codes (requires extra dependencies)."""
+
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -11,12 +12,16 @@ def build_color_666_qecsim(distance: int) -> Tuple[np.ndarray, np.ndarray, int, 
     try:
         from qecsim.models.color import Color666Code
     except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("qecsim is required to build color_666 codes. Install `qecsim`." ) from exc
+        raise RuntimeError(
+            "qecsim is required to build color_666 codes. Install `qecsim`."
+        ) from exc
 
     code = Color666Code(distance)
     n, k, d = code.n_k_d
     if d != distance:
-        raise RuntimeError(f"Unexpected distance from qecsim ({d}) for color_666 with distance={distance}.")
+        raise RuntimeError(
+            f"Unexpected distance from qecsim ({d}) for color_666 with distance={distance}."
+        )
 
     stabilizers = code.stabilizers.astype(np.uint8)
     num_checks = len(code._plaquette_indices)

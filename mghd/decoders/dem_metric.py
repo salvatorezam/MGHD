@@ -8,6 +8,7 @@ References
 - Ben Barber et al., "Real-time decoder ... Collision Clustering" (Supplementary),
   Appendix E: coordinate embedding and distance function (Eq. E4).
 """
+
 from __future__ import annotations
 
 from typing import Tuple
@@ -60,4 +61,3 @@ __all__ = [
     "cc_distance_4d",
     "distance_to_boundary_min_x_or_y",
 ]
-

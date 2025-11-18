@@ -19,7 +19,7 @@ def test_erasure_path_neutralizes_probabilities(surface_teacher, monkeypatch):
 
     captures: list[np.ndarray | None] = []
 
-    def fake_ml_parity(H, syndrome, probs):
+    def fake_ml_parity(H, syndrome, probs, **kwargs):
         if probs is not None:
             captures.append(np.asarray(probs, dtype=np.float64))
         else:
@@ -27,7 +27,7 @@ def test_erasure_path_neutralizes_probabilities(surface_teacher, monkeypatch):
         return np.zeros(H.shape[1], dtype=np.uint8)
 
     monkeypatch.setattr("mghd.decoders.lsd.clustered.ml_parity_project", fake_ml_parity)
-    monkeypatch.setattr("mghd.decoders.lsd_teacher.ml_parity_project", fake_ml_parity)
+    monkeypatch.setattr("mghd.decoders.lsd.clustered.ml_parity_project_torch", fake_ml_parity)
 
     llr = np.linspace(-0.5, 0.5, code.Hx.shape[1], dtype=np.float64)
     mask = np.zeros(code.Hx.shape[1], dtype=bool)
@@ -59,7 +59,7 @@ def test_erasure_mask_remains_neutral_under_llr_flip(surface_teacher, monkeypatc
 
     captures: list[np.ndarray | None] = []
 
-    def fake_ml_parity(_H, _syndrome, probs):
+    def fake_ml_parity(_H, _syndrome, probs, **kwargs):
         if probs is not None:
             captures.append(np.asarray(probs, dtype=np.float64))
         else:
@@ -67,7 +67,7 @@ def test_erasure_mask_remains_neutral_under_llr_flip(surface_teacher, monkeypatc
         return np.zeros(_H.shape[1], dtype=np.uint8)
 
     monkeypatch.setattr("mghd.decoders.lsd.clustered.ml_parity_project", fake_ml_parity)
-    monkeypatch.setattr("mghd.decoders.lsd_teacher.ml_parity_project", fake_ml_parity)
+    monkeypatch.setattr("mghd.decoders.lsd.clustered.ml_parity_project_torch", fake_ml_parity)
 
     mask = np.zeros(code.Hx.shape[1], dtype=bool)
     mask[2] = True

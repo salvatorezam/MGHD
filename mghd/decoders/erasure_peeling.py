@@ -1,4 +1,5 @@
 """Erasure-aware peeling + cluster decoder for CSS codes."""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
@@ -105,8 +106,8 @@ class ErasureQLDPCPeelingTeacher:
     """Erasure-aware teacher for generic CSS (qLDPC) codes."""
 
     def __init__(self, Hx: np.ndarray, Hz: np.ndarray, max_cluster: int = 256) -> None:
-        self.Hx = (Hx.astype(np.uint8) & 1)
-        self.Hz = (Hz.astype(np.uint8) & 1)
+        self.Hx = Hx.astype(np.uint8) & 1
+        self.Hz = Hz.astype(np.uint8) & 1
         self.max_cluster = int(max_cluster)
 
     def _decode_one(

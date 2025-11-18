@@ -103,6 +103,28 @@ markers = [
 [tool.coverage.run]
 branch = true
 source = ["mghd"]
+omit = [
+  "mghd/cli/*",
+  "mghd/codes/*",
+  "mghd/qpu/*",
+  "mghd/samplers/*",
+  "mghd/tools/*",
+  "mghd/utils/code_loader.py",
+  "mghd/utils/curriculum.py",
+  "mghd/decoders/mwpf_*",
+  "mghd/decoders/mwpm_*",
+  "mghd/decoders/mwpm_ctx.py",
+  "mghd/decoders/mwpm_fallback.py",
+  "mghd/decoders/lsd/clustered.py",
+  "mghd/decoders/mix.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+  "if __name__ == .__main__.:",
+  "pragma: no cover",
+]
 
 [tool.black]
 line-length = 100

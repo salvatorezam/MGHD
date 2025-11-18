@@ -9,6 +9,7 @@ Note:
   CUDA-Q trajectories simulate general (Kraus/coherent) noise at circuit level.
   Stim's fast path assumes Pauli channels + stabilizer ops; use only for A/B checks.
 """
+
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Callable
 
@@ -19,12 +20,12 @@ import numpy as np
 class SampleBatch:
     """Container returned by samplers."""
 
-    dets: np.ndarray     # uint8 [B, D]
-    obs: np.ndarray      # uint8 [B, K]
+    dets: np.ndarray  # uint8 [B, D]
+    obs: np.ndarray  # uint8 [B, K]
     meta: dict[str, Any]
     erase_data_mask: np.ndarray | None = None  # uint8/bool [B, n]
-    erase_det_mask: np.ndarray | None = None   # uint8/bool [B, D]
-    p_erase_data: np.ndarray | None = None     # float [B, n]
+    erase_det_mask: np.ndarray | None = None  # uint8/bool [B, D]
+    p_erase_data: np.ndarray | None = None  # float [B, n]
 
 
 _REGISTRY: Dict[str, Callable[..., object]] = {}

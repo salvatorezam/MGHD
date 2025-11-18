@@ -9,10 +9,11 @@ try:
 except ImportError:
     pm = None
 
+
 class MWPMatchingContext:
     def __init__(self):
         self._matcher_cache = {}
-        
+
     def decode(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str):
         """
         MWPM decoder using pymatching.
@@ -34,28 +35,28 @@ class MWPMatchingContext:
                 self._matcher_cache[cache_key] = pm.Matching(H_binary)
 
             matcher = self._matcher_cache[cache_key]
-            
+
             # Decode syndrome
             syndrome_binary = (synd_bits % 2).astype(np.uint8)
             correction = matcher.decode(syndrome_binary)
-            
+
             # Convert to uint8 and compute weight
             correction_uint8 = correction.astype(np.uint8)
             weight = int(correction_uint8.sum())
-            
+
             return correction_uint8, weight
-            
+
         except BaseException as e:
             # Fallback on any error
             print(f"Warning: MWPM decode failed ({e}), using fallback")
             return self._decode_fallback(H_sub, synd_bits, side)
-    
+
     def _decode_fallback(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str):
         """Fallback decoder when pymatching is not available"""
         n_qubits = H_sub.shape[1]
-        
+
         # Return maximum weight correction as a conservative fallback
         correction = np.ones(n_qubits, dtype=np.uint8)
         weight = n_qubits
-        
+
         return correction, weight

@@ -16,6 +16,7 @@ Notes:
   - CUDA-Q trajectories simulate general Kraus/coherent noise at circuit level;
     we keep this as the gold training path vs Pauli-only DEM approximations.   [Ref]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -181,10 +182,7 @@ def _base_overrides_from_maps(weight_maps: dict[str, Any], n_qubits: int) -> dic
     override = {
         "llr": clipped_llr.astype(np.float32, copy=False),
         "mwpm": probs.astype(np.float32, copy=False),
-        "mwpf": {
-            idx: float(np.clip(prob / 0.5, 0.1, 10.0))
-            for idx, prob in enumerate(probs)
-        },
+        "mwpf": {idx: float(np.clip(prob / 0.5, 0.1, 10.0)) for idx, prob in enumerate(probs)},
     }
     return override
 
@@ -318,12 +316,7 @@ def main() -> None:
             Hz = getattr(code, "Hz", None)
 
             # Teacher stack
-            graph_ok = (
-                Hx is not None
-                and Hz is not None
-                and is_graphlike(Hx)
-                and is_graphlike(Hz)
-            )
+            graph_ok = Hx is not None and Hz is not None and is_graphlike(Hx) and is_graphlike(Hz)
             pymatching_ok = args.dem_enable or graph_ok
             if sampler_name == "cudaq" and not pymatching_ok:
                 warnings.warn(
@@ -422,6 +415,7 @@ def main() -> None:
                         )
                     else:
                         from mghd.decoders.dem_utils import build_surface_memory_dem, dem_cache_path
+
                         try:
                             from mghd.decoders.dem_matching import DEMMatchingTeacher
                         except Exception as exc:
@@ -469,9 +463,8 @@ def main() -> None:
             if sampler_name == "stim":
                 dep_value = None
                 if profile_dict:
-                    dep_value = (
-                        profile_dict.get("gate_error", {})
-                        .get("after_clifford_depolarization")
+                    dep_value = profile_dict.get("gate_error", {}).get(
+                        "after_clifford_depolarization"
                     )
                 if dep_value is None:
                     dep_value = 0.001
@@ -658,6 +651,8 @@ def main() -> None:
             if bandit is not None and args.rl_state:
                 state = {"A": bandit.A.tolist(), "b": bandit.b.tolist()}
                 _dump_bandit_state(pathlib.Path(args.rl_state), state)
+
+
 if __name__ == "__main__":
     try:
         main()

@@ -4,8 +4,7 @@ import pytest
 
 def test_mix_instantiation_and_route_smoke(monkeypatch):
     # Minimal toy CSS code: small Hx, Hz; fake code_obj exposing detector->fault mapping
-    H = np.array([[1, 0, 1, 0],
-                  [0, 1, 0, 1]], dtype=np.uint8)
+    H = np.array([[1, 0, 1, 0], [0, 1, 0, 1]], dtype=np.uint8)
 
     class ToyCode:
         num_detectors = 4
@@ -24,8 +23,14 @@ def test_mix_instantiation_and_route_smoke(monkeypatch):
 
     from mghd.decoders.mix import TeacherMix, MixConfig
 
-    mix = TeacherMix(code, H, H, mwpf_cfg=MWPFConfig(cluster_node_limit=10),
-                     lsd_cfg=LSDConfig(max_iter=1), mix_cfg=MixConfig(p_mwpf=0.5, p_lsd=0.4, p_mwpm=0.1))
+    mix = TeacherMix(
+        code,
+        H,
+        H,
+        mwpf_cfg=MWPFConfig(cluster_node_limit=10),
+        lsd_cfg=LSDConfig(max_iter=1),
+        mix_cfg=MixConfig(p_mwpf=0.5, p_lsd=0.4, p_mwpm=0.1),
+    )
     B = 3
     dets = np.zeros((B, 4), dtype=np.uint8)
     dets[0, [0, 2]] = 1  # activate first fault

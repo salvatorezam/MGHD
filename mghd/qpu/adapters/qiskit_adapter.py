@@ -1,4 +1,5 @@
 """Minimal Qiskit adapter producing ScheduleIR tuples."""
+
 from __future__ import annotations
 
 from typing import Any, List, Tuple

@@ -8,6 +8,7 @@ Expected to find your files on PYTHONPATH:
 
 If those live outside the repo, ensure PYTHONPATH includes their parent dirs.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -23,6 +24,7 @@ from . import register_sampler
 # ---------------------------------------------------------------------------
 # Local wrappers bridging CUDA-Q backend to sampler surface
 # ---------------------------------------------------------------------------
+
 
 def cudaq_sample_surface_wrapper(
     mode: str,
@@ -319,7 +321,9 @@ class CudaQSampler:
             extra["noise_scale"] = self.profile_kwargs["noise_scale"]
         return extra
 
-    def _sample_surface(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _sample_surface(
+        self, code_obj: Any, n_shots: int, rng: np.random.Generator
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """CUDA-Q sampling path for surface codes.
 
         Returns (dets, x_err, z_err). Detectors are ordered Z checks then X checks.
@@ -354,14 +358,14 @@ class CudaQSampler:
             raise ValueError("cudaq surface sampler returned fewer columns than expected")
 
         synd_block = packed[:, : num_x + num_z]
-        err_block = packed[:, num_x + num_z:]
+        err_block = packed[:, num_x + num_z :]
         if err_block.shape[1] < n:
             err_block = np.pad(err_block, ((0, 0), (0, n - err_block.shape[1])), mode="constant")
         elif err_block.shape[1] > n:
             err_block = err_block[:, :n]
 
         sx = (synd_block[:, :num_x] & 1).astype(np.uint8)
-        sz_raw = synd_block[:, num_x:num_x + num_z]
+        sz_raw = synd_block[:, num_x : num_x + num_z]
         sz = ((sz_raw >> 1) & 1).astype(np.uint8)
 
         # Canonical detector order: Z-checks first, then X-checks
@@ -370,13 +374,19 @@ class CudaQSampler:
             dets_parts.append(sz)
         if num_x:
             dets_parts.append(sx)
-        dets = np.concatenate(dets_parts, axis=1) if dets_parts else np.zeros((n_shots, 0), dtype=np.uint8)
+        dets = (
+            np.concatenate(dets_parts, axis=1)
+            if dets_parts
+            else np.zeros((n_shots, 0), dtype=np.uint8)
+        )
 
         x_err = (err_block & 1).astype(np.uint8)
         z_err = ((err_block >> 1) & 1).astype(np.uint8)
         return dets, x_err, z_err
 
-    def _sample_repetition(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _sample_repetition(
+        self, code_obj: Any, n_shots: int, rng: np.random.Generator
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """CUDA-Q sampling path for repetition codes.
 
         Returns (dets, x_err, z_err). Detectors ordered Z then X when both exist.
@@ -418,7 +428,11 @@ class CudaQSampler:
             dets_parts.append(sz)
         if num_x:
             dets_parts.append(sx)
-        dets = np.concatenate(dets_parts, axis=1) if dets_parts else np.zeros((n_shots, 0), dtype=np.uint8)
+        dets = (
+            np.concatenate(dets_parts, axis=1)
+            if dets_parts
+            else np.zeros((n_shots, 0), dtype=np.uint8)
+        )
 
         x_err = (error_block & 1).astype(np.uint8)
         z_err = ((error_block >> 1) & 1).astype(np.uint8)
@@ -427,15 +441,17 @@ class CudaQSampler:
             x_err = np.pad(x_err, ((0, 0), (0, pad)), mode="constant")
             z_err = np.pad(z_err, ((0, 0), (0, pad)), mode="constant")
         elif Hx.shape[1] and x_err.shape[1] > Hx.shape[1]:
-            x_err = x_err[:, :Hx.shape[1]]
-            z_err = z_err[:, :Hx.shape[1]]
+            x_err = x_err[:, : Hx.shape[1]]
+            z_err = z_err[:, : Hx.shape[1]]
         return dets, x_err, z_err
 
     # ------------------------------------------------------------------
     # Synthetic fallback (keeps pipeline alive if CUDA-Q unavailable)
     # ------------------------------------------------------------------
 
-    def _synthetic_css(self, code_obj: Any, n_shots: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _synthetic_css(
+        self, code_obj: Any, n_shots: int, rng: np.random.Generator
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Pure-NumPy fallback approximating a CSS channel (Pauli, for tests)."""
         Hx = np.asarray(code_obj.Hx, dtype=np.uint8)
         Hz = np.asarray(code_obj.Hz, dtype=np.uint8)

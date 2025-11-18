@@ -6,6 +6,7 @@ subgraphs into MGHDv2 input tensors. Detector bits are handled in canonical
 Z→X order throughout (matching Stim/DEM). CUDA is initialized only inside
 ``main``.
 """
+
 # NOTE: Initialize CUDA only in main(). This file defines dataset, model, loop.
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,9 @@ from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_
 from mghd.tad import weighting as tad_weighting
 from mghd.tad import context as tad_context
 from mghd.codes.qpu_profile import load_qpu_profile
+
+
+_TEACHER_POOL: ThreadPoolExecutor | None = None
 
 
 class CropShardDataset(Dataset):
@@ -59,11 +64,11 @@ class CropShardDataset(Dataset):
                 for it in packed_array:
                     self.items.append((f, it))
         print(f"Loaded {len(self.items)} crop items from {len(self.files)} shards")
-        
-    def __len__(self): 
+
+    def __len__(self):
         """Return number of packed items across all shards."""
         return len(self.items)
-        
+
     def __getitem__(self, idx):
         """Load one PackedCrop (as torch tensors) and attach teacher metadata."""
         _, item = self.items[idx]
@@ -110,7 +115,7 @@ def make_bucket_sampler(ds: CropShardDataset, *, stage="stage1", seed=0):
         # coarse p bin
         p = float(meta.get("p", 0.005))
         pbin = 0 if p < 0.003 else (1 if p < 0.01 else 2)
-        buckets[(min(r,8), min(kappa,32), pbin)].append(i)
+        buckets[(min(r, 8), min(kappa, 32), pbin)].append(i)
     order = []
     # Interleave buckets to avoid collapse
     keys = sorted(buckets.keys())
@@ -137,6 +142,7 @@ def make_bucket_sampler(ds: CropShardDataset, *, stage="stage1", seed=0):
 
     return _S()
 
+
 def collate_packed(batch):
     """Identity collate: crops are processed one by one in the training loop.
 
@@ -144,6 +150,29 @@ def collate_packed(batch):
     iterates over items and aggregates gradients manually.
     """
     return batch
+
+
+def _load_hparams(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _validate_packed_contract(packed: PackedCrop, node_feat_dim: int, edge_feat_dim: int) -> None:
+    node_dim = int(packed.x_nodes.shape[-1])
+    if node_dim != int(node_feat_dim):
+        raise ValueError(
+            f"Packed crop node feature dimension {node_dim} does not match expected "
+            f"{node_feat_dim}. Check data_contract.node_feat_dim or erasure setting."
+        )
+    if packed.edge_attr is None:
+        raise ValueError("Packed crop is missing edge_attr entries required by the model")
+    edge_dim = int(packed.edge_attr.shape[-1])
+    if edge_dim != int(edge_feat_dim):
+        raise ValueError(
+            f"Packed crop edge feature dimension {edge_dim} does not match expected "
+            f"{edge_feat_dim}. Update data_contract.edge_feat_dim or regenerate crops."
+        )
+
 
 def bce_binary_head_loss(
     logits: torch.Tensor,
@@ -168,6 +197,7 @@ def bce_binary_head_loss(
         weight = sample_weight.to(logits.device).clamp_min(0.5).clamp_max(3.0)
         loss_all = loss_all * weight
     return loss_all.mean()
+
 
 def parity_auxiliary_loss(
     logits: torch.Tensor,
@@ -203,6 +233,7 @@ def parity_auxiliary_loss(
     # Encourage small E_par (close to 0 or target) — here we push toward 0.5 neutrality lightly
     return (E_par - 0.5).pow(2).mean()
 
+
 def projection_aware_logits_to_bits(
     logits: torch.Tensor,
     projector_kwargs: dict[str, Any],
@@ -235,6 +266,7 @@ def projection_aware_logits_to_bits(
         bits = (probs1 > 0.5).astype(np.uint8)
     return bits  # length == #data_qubits
 
+
 def train_inprocess(ns) -> str:
     """Run the trainer in‑process (mirrors CLI ``main``) and return best.pt path."""
     args = ns
@@ -243,15 +275,38 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--online", action="store_true", help="Enable on-the-fly CUDA-Q sampling")
     parser.add_argument("--family", type=str, default="surface")
     parser.add_argument("--distance", type=int, default=3)
-    parser.add_argument("--p", type=float, default=0.005, help="Physical error rate for online sampling")
-    parser.add_argument("--p-curriculum", type=str, default=None, help="Comma-separated list of p values to cycle across epochs in online mode (e.g., '0.01,0.006,0.003')")
-    parser.add_argument("--epochs-per-p", type=int, default=1, help="Epochs to spend on each p value in --p-curriculum")
+    parser.add_argument(
+        "--p", type=float, default=0.005, help="Physical error rate for online sampling"
+    )
+    parser.add_argument(
+        "--p-curriculum",
+        type=str,
+        default=None,
+        help="Comma-separated list of p values to cycle across epochs in online mode (e.g., '0.01,0.006,0.003')",
+    )
+    parser.add_argument(
+        "--epochs-per-p",
+        type=int,
+        default=1,
+        help="Epochs to spend on each p value in --p-curriculum",
+    )
     parser.add_argument("--qpu-profile", type=str, default=None)
-    parser.add_argument("--context-source", type=str, default="none", choices=["none","qiskit","cirq","cudaq"]) 
+    parser.add_argument(
+        "--context-source", type=str, default="none", choices=["none", "qiskit", "cirq", "cudaq"]
+    )
     parser.add_argument("--shots-per-epoch", type=int, default=256)
-    parser.add_argument("--erasure-frac", type=float, default=0.0, help="Optional erasure injection fraction for online sampling")
+    parser.add_argument(
+        "--erasure-frac",
+        type=float,
+        default=0.0,
+        help="Optional erasure injection fraction for online sampling",
+    )
     parser.add_argument("--teacher-mix", type=str, default="mwpf=1.0,mwpm=0.0,lsd=0.0")
-    parser.add_argument("--online-rl", action="store_true", help="Enable LinTS scaling of TAD overrides in online mode")
+    parser.add_argument(
+        "--online-rl",
+        action="store_true",
+        help="Enable LinTS scaling of TAD overrides in online mode",
+    )
     parser.add_argument("--profile", type=str, default="S")
     parser.add_argument("--ema", type=float, default=0.999)
     parser.add_argument("--lr", type=float, default=5.952925899948483e-05)
@@ -263,10 +318,22 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
     parser.add_argument("--noise-injection", type=float, default=0.009883059279379016)
     parser.add_argument("--grad-clip", type=float, default=0.8545326095750816)
-    parser.add_argument("--hparams", type=str, default=None, help="Path to JSON hyperparameters file")
-    parser.add_argument("--save", type=str, required=False, default=None, help="If omitted or contains '{auto}', an auto-named run dir is created under --save-root")
-    parser.add_argument("--save-root", type=str, default="data/results", help="Root directory for auto-named runs")
-    parser.add_argument("--save-auto", action="store_true", help="Force auto-named save directory under --save-root")
+    parser.add_argument(
+        "--hparams", type=str, default=None, help="Path to JSON hyperparameters file"
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        required=False,
+        default=None,
+        help="If omitted or contains '{auto}', an auto-named run dir is created under --save-root",
+    )
+    parser.add_argument(
+        "--save-root", type=str, default="data/results", help="Root directory for auto-named runs"
+    )
+    parser.add_argument(
+        "--save-auto", action="store_true", help="Force auto-named save directory under --save-root"
+    )
     parser.add_argument("--seed", type=int, default=42)
     # Progress reporting (prints per epoch; 1 = only near end, 0 = disable mid-epoch prints)
     parser.add_argument("--progress-prints", type=int, default=1)
@@ -275,27 +342,87 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--post-eval-sampler", type=str, default="stim")
     parser.add_argument("--post-eval-shots-per-batch", type=int, default=16)
     parser.add_argument("--post-eval-batches", type=int, default=2)
+    parser.add_argument(
+        "--teacher-workers",
+        type=int,
+        default=4,
+        help="Thread pool workers used to prefetch teacher labels",
+    )
+    # Early stopping
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Stop if no improvement for this many epochs (0 disables)",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum loss improvement to reset patience",
+    )
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
-        # Optionally load hyperparameters and apply to args
-        if getattr(args, "hparams", None):
-            try:
-                with open(args.hparams, "r", encoding="utf-8") as fh:
-                    hp = json.load(fh)
-            except Exception:
-                hp = None
-            if isinstance(hp, dict):
-                tp = hp.get("training_parameters", {}) or {}
-                args.lr = float(tp.get("lr", args.lr))
-                args.wd = float(tp.get("weight_decay", args.wd))
-                args.label_smoothing = float(tp.get("label_smoothing", args.label_smoothing))
-                args.grad_clip = float(tp.get("gradient_clip", args.grad_clip))
-                args.noise_injection = float(tp.get("noise_injection", args.noise_injection))
-                args.epochs = int(tp.get("epochs", args.epochs))
-                args.batch = int(tp.get("batch_size", args.batch))
-                setattr(args, "_hp_model", hp.get("model_architecture", {}) or {})
-                setattr(args, "_hp_mamba", hp.get("mamba_parameters", {}) or {})
-                setattr(args, "_hp_attn", hp.get("attention_mechanism", {}) or {})
+
+    # Default structural hyperparameters (can be overridden via JSON/CLI namespace)
+    defaults = {
+        "d_model": 192,
+        "d_state": 80,
+        "n_iters": 8,
+        "msg_net_dropout_p": 0.0,
+        "gru_dropout_p": 0.0,
+        "se_reduction": 4,
+        "node_feat_dim": 8,
+        "edge_feat_dim": 3,
+    }
+    for attr, value in defaults.items():
+        if not hasattr(args, attr):
+            setattr(args, attr, value)
+    if not hasattr(args, "msg_net_size"):
+        args.msg_net_size = max(96, int(getattr(args, "d_model", 192)))
+
+    hp = None
+    if getattr(args, "hparams", None):
+        try:
+            hp = _load_hparams(args.hparams)
+        except Exception:
+            hp = None
+    if isinstance(hp, dict):
+        hp_model = hp.get("model_architecture", {}) or {}
+        hp_mamba = hp.get("mamba_parameters", {}) or {}
+        hp_attn = hp.get("attention_mechanism", {}) or {}
+        hp_data = hp.get("data_contract", {}) or {}
+        hp_train = hp.get("training_parameters", {}) or {}
+
+        args.d_model = int(hp_mamba.get("d_model", args.d_model))
+        args.d_state = int(hp_mamba.get("d_state", args.d_state))
+        args.n_iters = int(hp_model.get("n_iters", args.n_iters))
+        args.msg_net_size = int(hp_model.get("msg_net_size", max(96, args.d_model)))
+        args.msg_net_dropout_p = float(hp_model.get("msg_net_dropout_p", args.msg_net_dropout_p))
+        args.gru_dropout_p = float(hp_model.get("gru_dropout_p", args.gru_dropout_p))
+        args.se_reduction = int(hp_attn.get("se_reduction", args.se_reduction))
+
+        node_feat_dim = int(hp_data.get("node_feat_dim", args.node_feat_dim))
+        if bool(hp_data.get("erasure_enabled", False)):
+            node_feat_dim = 9
+        edge_feat_dim = int(hp_data.get("edge_feat_dim", args.edge_feat_dim))
+        args.node_feat_dim = node_feat_dim
+        args.edge_feat_dim = edge_feat_dim
+
+        args.lr = float(hp_train.get("lr", args.lr))
+        args.wd = float(hp_train.get("weight_decay", args.wd))
+        args.epochs = int(hp_train.get("epochs", args.epochs))
+        args.batch = int(hp_train.get("batch_size", args.batch))
+        args.label_smoothing = float(hp_train.get("label_smoothing", args.label_smoothing))
+        args.grad_clip = float(hp_train.get("gradient_clip", args.grad_clip))
+        args.noise_injection = float(hp_train.get("noise_injection", args.noise_injection))
+
+    args.msg_net_size = int(getattr(args, "msg_net_size", max(96, int(args.d_model))))
+    if bool(getattr(args, "online", False)) and float(getattr(args, "erasure_frac", 0.0)) > 0.0:
+        args.node_feat_dim = max(int(args.node_feat_dim), 9)
+
+    expected_node_dim = int(args.node_feat_dim)
+    expected_edge_dim = int(args.edge_feat_dim)
 
     # Resolve save directory (auto if requested or missing)
     def _auto_name(family: str, distance: int, qpu_profile: str | None) -> str:
@@ -303,47 +430,60 @@ def train_inprocess(ns) -> str:
         qpu = "none"
         if qpu_profile:
             import os as _os
+
             qpu = _os.path.splitext(_os.path.basename(qpu_profile))[0]
         return f"{ts}_{family}_d{int(distance)}_{qpu}"
 
-    if args.save_auto or args.save is None or (isinstance(args.save, str) and "{auto}" in args.save):
-        auto = _auto_name(getattr(args, "family", "code"), int(getattr(args, "distance", 0)), getattr(args, "qpu_profile", None))
+    if (
+        args.save_auto
+        or args.save is None
+        or (isinstance(args.save, str) and "{auto}" in args.save)
+    ):
+        auto = _auto_name(
+            getattr(args, "family", "code"),
+            int(getattr(args, "distance", 0)),
+            getattr(args, "qpu_profile", None),
+        )
         base = Path(getattr(args, "save_root", "data/results"))
         base.mkdir(parents=True, exist_ok=True)
         args.save = str(base / auto)
     else:
         # Support placeholder replacement in explicit paths
         if "{auto}" in args.save:
-            auto = _auto_name(getattr(args, "family", "code"), int(getattr(args, "distance", 0)), getattr(args, "qpu_profile", None))
+            auto = _auto_name(
+                getattr(args, "family", "code"),
+                int(getattr(args, "distance", 0)),
+                getattr(args, "qpu_profile", None),
+            )
             args.save = args.save.replace("{auto}", auto)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Build model with optional hyperparameters from JSON
-    hp_model = getattr(args, "_hp_model", {})
-    hp_mamba = getattr(args, "_hp_mamba", {})
-    hp_attn = getattr(args, "_hp_attn", {})
-    m_kwargs = {}
-    if hp_mamba:
-        if "d_model" in hp_mamba:
-            m_kwargs["d_model"] = int(hp_mamba["d_model"])  # type: ignore[assignment]
-        if "d_state" in hp_mamba:
-            m_kwargs["d_state"] = int(hp_mamba["d_state"])  # type: ignore[assignment]
-    if hp_model:
-        if "n_iters" in hp_model:
-            m_kwargs["n_iters"] = int(hp_model["n_iters"])  # type: ignore[assignment]
-        if "msg_net_size" in hp_model:
-            m_kwargs["gnn_msg_net_size"] = int(hp_model["msg_net_size"])  # type: ignore[assignment]
-        if "msg_net_dropout_p" in hp_model:
-            m_kwargs["gnn_msg_dropout"] = float(hp_model["msg_net_dropout_p"])  # type: ignore[assignment]
-        if "gru_dropout_p" in hp_model:
-            m_kwargs["gnn_gru_dropout"] = float(hp_model["gru_dropout_p"])  # type: ignore[assignment]
-    if hp_attn and "se_reduction" in hp_attn:
-        m_kwargs["se_reduction"] = int(hp_attn["se_reduction"])  # type: ignore[assignment]
-    # If online with erasures, expand node features by 1 (erasure flag)
-    if bool(getattr(args, "online", False)) and float(getattr(args, "erasure_frac", 0.0)) > 0.0:
-        m_kwargs["node_feat_dim"] = 9
+    # Prefer CUDA when available; optionally require it via MGHD_REQUIRE_CUDA=1.
+    require_cuda = os.getenv("MGHD_REQUIRE_CUDA", "").lower() in {"1", "true", "yes"}
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif require_cuda:
+        raise RuntimeError(
+            "CUDA GPU is required but not available (MGHD_REQUIRE_CUDA=1). "
+            "Install a CUDA-enabled PyTorch build and run on a GPU node."
+        )
+    else:
+        device = torch.device("cpu")
+    # Build model with optional hyperparameters from JSON/data contract
+    m_kwargs = {
+        "d_model": int(getattr(args, "d_model", 192)),
+        "d_state": int(getattr(args, "d_state", 80)),
+        "n_iters": int(getattr(args, "n_iters", 8)),
+        "gnn_msg_net_size": int(
+            getattr(args, "msg_net_size", max(96, getattr(args, "d_model", 192)))
+        ),
+        "gnn_msg_dropout": float(getattr(args, "msg_net_dropout_p", 0.0)),
+        "gnn_gru_dropout": float(getattr(args, "gru_dropout_p", 0.0)),
+        "se_reduction": int(getattr(args, "se_reduction", 4)),
+        "node_feat_dim": expected_node_dim,
+        "edge_feat_dim": expected_edge_dim,
+    }
     model = MGHDv2(profile=args.profile, **m_kwargs).to(device)
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -369,7 +509,11 @@ def train_inprocess(ns) -> str:
             "distance": int(args.distance),
             "online": use_online,
             "p": float(getattr(args, "p", 0.0)),
-            "p_curriculum": [float(x) for x in str(getattr(args, "p_curriculum", "")).split(",") if x.strip()] if getattr(args, "p_curriculum", None) else None,
+            "p_curriculum": [
+                float(x) for x in str(getattr(args, "p_curriculum", "")).split(",") if x.strip()
+            ]
+            if getattr(args, "p_curriculum", None)
+            else None,
             "epochs_per_p": int(getattr(args, "epochs_per_p", 1)),
             "teacher_mix": getattr(args, "teacher_mix", None),
             "qpu_profile": getattr(args, "qpu_profile", None),
@@ -386,6 +530,8 @@ def train_inprocess(ns) -> str:
 
     best_loss = float("inf")
     history: list[dict[str, Any]] = []
+    last_improve_epoch = 0
+
     def _build_tad_for_code(code_obj):
         """Build transpilation‑aware context and per‑qubit LLR overrides.
 
@@ -408,7 +554,13 @@ def train_inprocess(ns) -> str:
             # Attempt schedule IR extraction via adapters if native circuit present
             try:
                 native = None
-                for attr in ("native_circuit","reference_circuit","circuit","qc","quantum_circuit"):
+                for attr in (
+                    "native_circuit",
+                    "reference_circuit",
+                    "circuit",
+                    "qc",
+                    "quantum_circuit",
+                ):
                     if hasattr(code_obj, attr):
                         native = getattr(code_obj, attr)
                         if native is not None:
@@ -416,24 +568,29 @@ def train_inprocess(ns) -> str:
                 schedule_ir = []
                 if native is not None:
                     import sys as _sys
+
                     if args.context_source == "qiskit" and "qiskit" in _sys.modules:
                         from mghd.qpu.adapters import qiskit_adapter
+
                         schedule_ir = qiskit_adapter.to_schedule_ir(native)
                     elif args.context_source == "cirq" and "cirq" in _sys.modules:
                         from mghd.qpu.adapters import cirq_adapter  # type: ignore
+
                         schedule_ir = cirq_adapter.to_schedule_ir(native)
                     elif args.context_source == "cudaq" and "cudaq" in _sys.modules:
                         from mghd.qpu.adapters import cudaq_adapter  # type: ignore
+
                         schedule_ir = cudaq_adapter.to_schedule_ir(native)
                 n_qubits = getattr(code_obj, "n", None) or int(code_obj.Hx.shape[1])
                 maps = tad_weighting.schedule_to_weight_maps(schedule_ir, qpu_prof, n_qubits)
                 feats = tad_weighting.feature_vector(schedule_ir)
-                gate_vocab = {g:i for i,g in enumerate(sorted(feats.get("gate_hist",{}).keys()))}
+                gate_vocab = {g: i for i, g in enumerate(sorted(feats.get("gate_hist", {}).keys()))}
                 ctx_vec = tad_context.context_vector(feats, gate_vocab)
                 # Build per-qubit LLR override
                 import numpy as _np
+
                 llr = _np.zeros(int(n_qubits), dtype=_np.float32)
-                for layer in (maps.get("w_qubit",{}) or {}).values():
+                for layer in (maps.get("w_qubit", {}) or {}).values():
                     for q, w in layer.items():
                         idx = int(q)
                         if 0 <= idx < llr.size:
@@ -495,54 +652,78 @@ def train_inprocess(ns) -> str:
                 raise NotImplementedError("Online training currently supports family='surface'")
             # Build code object
             from mghd.codes.registry import get_code
+
             code = get_code(family, distance=args.distance)
-            # Initialize MWPFTeacher once per epoch
+            # Initialize teachers once per epoch
+            teacher_mix = _parse_teacher_mix(
+                getattr(args, "teacher_mix", "mwpf=1.0,mwpm=0.0,lsd=0.0")
+            )
+            use_mwpf = teacher_mix.get("mwpf", 0.0) > 0.0
+            use_mwpm = teacher_mix.get("mwpm", 0.0) > 0.0
+            use_lsd = teacher_mix.get("lsd", 0.0) > 0.0
+
             mwpf_teacher = None
-            try:
-                mwpf_teacher = MWPFTeacher(code)
-            except Exception:
-                mwpf_teacher = None
-            mwpm_ctx = MWPMatchingContext()
+            if use_mwpf:
+                try:
+                    mwpf_teacher = MWPFTeacher(code)
+                except Exception:
+                    mwpf_teacher = None
+
+            mwpm_ctx = MWPMatchingContext() if use_mwpm else None
+
             lsd_teacher = None
-            try:
-                lsd_teacher = LSDTeacher(code.Hx, code.Hz)
-            except Exception:
-                lsd_teacher = None
-            teacher_mix = _parse_teacher_mix(getattr(args, "teacher_mix", "mwpf=1.0,mwpm=0.0,lsd=0.0"))
+            if use_lsd:
+                try:
+                    lsd_teacher = LSDTeacher(code.Hx, code.Hz)
+                except Exception:
+                    lsd_teacher = None
             # TAD context/overrides
             qpu_prof, ctx_vec, llr_overrides = _build_tad_for_code(code)
             # Initialize bandit once if requested and context available
             if args.online_rl and ctx_vec is not None and bandit is None:
                 try:
                     from mghd.tad.rl.lin_ts import LinTSBandit
+
                     bandit = LinTSBandit(d=ctx_vec.size, prior_var=5.0, noise_var=0.5)
                 except Exception:
                     bandit = None
             import numpy as _np
+
             rng = _np.random.default_rng(args.seed + epoch)
             batch_buf: list[PackedCrop] = []
             shots_target = int(getattr(args, "shots_per_epoch", args.batch))
             shots_done = 0
             erase_data_mask = None  # optional per-batch erasure mask; None by default
             # Mid-epoch progress prints (optional)
-            prog_stride = (max(1, shots_target // int(getattr(args, "progress_prints", 1)))
-                           if int(getattr(args, "progress_prints", 1)) > 1 else 0)
+            prog_stride = (
+                max(1, shots_target // int(getattr(args, "progress_prints", 1)))
+                if int(getattr(args, "progress_prints", 1)) > 1
+                else 0
+            )
             while shots_done < shots_target:
                 seed = int(rng.integers(0, 2**31 - 1))
-                sample = sample_round(d=args.distance, p=p_epoch, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
+                sample = sample_round(
+                    d=args.distance,
+                    p=p_epoch,
+                    seed=seed,
+                    profile_path=args.qpu_profile if args.qpu_profile else None,
+                )
                 # Pack detectors in canonical Z→X order for MWPFTeacher
-                dets_global = np.concatenate([
-                    sample["synZ"][np.newaxis, :].astype(np.uint8),
-                    sample["synX"][np.newaxis, :].astype(np.uint8),
-                ], axis=1)
+                dets_global = np.concatenate(
+                    [
+                        sample["synZ"][np.newaxis, :].astype(np.uint8),
+                        sample["synX"][np.newaxis, :].astype(np.uint8),
+                    ],
+                    axis=1,
+                )
                 # Global per-fault scaling dict
                 mwpf_scale = None
                 if llr_overrides is not None:
-                    probs = 1.0/(1.0+_np.exp(llr_overrides))
-                    scale_full = _np.clip(probs/0.5, 0.1, 10.0)
+                    probs = 1.0 / (1.0 + _np.exp(llr_overrides))
+                    scale_full = _np.clip(probs / 0.5, 0.1, 10.0)
                     mwpf_scale = {int(i): float(s) for i, s in enumerate(scale_full)}
                 fault_ids_global = None
-                if mwpf_teacher is not None:
+                if use_mwpf and mwpf_teacher is not None:
                     try:
                         out_mwpf = mwpf_teacher.decode_batch(dets_global, mwpf_scale=mwpf_scale)
                         fid_arr = _np.asarray(out_mwpf.get("fault_ids"), dtype=_np.int32)
@@ -550,12 +731,28 @@ def train_inprocess(ns) -> str:
                             fault_ids_global = fid_arr[0]
                     except Exception:
                         fault_ids_global = None
-                for side in ("Z","X"):
+
+                # Compute LSD once per sample (reuse for all components)
+                ex_glob = ez_glob = None
+                if use_lsd and lsd_teacher is not None:
+                    try:
+                        ex_arr, ez_arr = lsd_teacher.decode_batch_xz(
+                            syndromes_x=sample["synX"][None, :],
+                            syndromes_z=sample["synZ"][None, :],
+                            llr_overrides=llr_overrides,
+                        )
+                        ex_glob, ez_glob = ex_arr[0], ez_arr[0]
+                    except Exception:
+                        ex_glob = ez_glob = None
+                for side in ("Z", "X"):
                     comps = split_components_for_side(
                         side=side,
-                        Hx=sample["Hx"], Hz=sample["Hz"],
-                        synZ=sample["synZ"], synX=sample["synX"],
-                        coords_q=sample["coords_q"], coords_c=sample["coords_c"],
+                        Hx=sample["Hx"],
+                        Hz=sample["Hz"],
+                        synZ=sample["synZ"],
+                        synX=sample["synX"],
+                        coords_q=sample["coords_q"],
+                        coords_c=sample["coords_c"],
                     )
                     for comp in comps:
                         H_sub = comp["H_sub"]
@@ -571,34 +768,31 @@ def train_inprocess(ns) -> str:
                                 mask = _np.isin(qubit_indices, valid_ids)
                                 local_bits[mask] = 1
                             outputs["mwpf"] = (local_bits, int(local_bits.sum()))
-                        # MWPM fallback
-                        bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
-                        outputs["mwpm"] = (bits_pm.astype(_np.uint8), int(w_pm))
+                        # MWPM fallback (only if enabled)
+                        if use_mwpm and mwpm_ctx is not None:
+                            bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
+                            outputs["mwpm"] = (bits_pm.astype(_np.uint8), int(w_pm))
                         # LSD global converted to local
-                        if lsd_teacher is not None:
-                            try:
-                                ex_glob, ez_glob = lsd_teacher.decode_batch_xz(
-                                    syndromes_x=sample["synX"][None,:],
-                                    syndromes_z=sample["synZ"][None,:],
-                                    llr_overrides=llr_overrides,
-                                )
-                                bits_global = ex_glob[0] if side=="Z" else ez_glob[0]
-                                if qubit_indices.size and bits_global.size > qubit_indices.max():
-                                    bits_local = bits_global[qubit_indices].astype(_np.uint8)
-                                    outputs["lsd"] = (bits_local, int(bits_local.sum()))
-                            except Exception:
-                                pass
+                        if (
+                            use_lsd
+                            and lsd_teacher is not None
+                            and (ex_glob is not None and ez_glob is not None)
+                        ):
+                            bits_global = ex_glob if side == "Z" else ez_glob
+                            if qubit_indices.size and bits_global.size > qubit_indices.max():
+                                bits_local = bits_global[qubit_indices].astype(_np.uint8)
+                                outputs["lsd"] = (bits_local, int(bits_local.sum()))
                         # choose teacher by weighted random among valid
                         weighted = []
-                        for name,(bits, w) in outputs.items():
-                            if teacher_mix.get(name,0.0) > 0:
+                        for name, (bits, w) in outputs.items():
+                            if teacher_mix.get(name, 0.0) > 0:
                                 weighted.append((name, bits, w, teacher_mix[name]))
                         chosen_bits = None
                         if weighted:
                             total_w = sum(w for *_, w in weighted)
-                            r = float(rng.random() * max(total_w,1e-9))
-                            acc=0.0
-                            for name,bits,w,tw in weighted:
+                            r = float(rng.random() * max(total_w, 1e-9))
+                            acc = 0.0
+                            for name, bits, w, tw in weighted:
                                 acc += tw
                                 if r <= acc:
                                     chosen_bits = bits
@@ -619,12 +813,17 @@ def train_inprocess(ns) -> str:
                             d=args.distance,
                             p=args.p,
                             seed=seed,
-                            N_max=args.N_max if hasattr(args,"N_max") else 512,
-                            E_max=args.E_max if hasattr(args,"E_max") else 4096,
-                            S_max=args.S_max if hasattr(args,"S_max") else 512,
+                            N_max=args.N_max if hasattr(args, "N_max") else 512,
+                            E_max=args.E_max if hasattr(args, "E_max") else 4096,
+                            S_max=args.S_max if hasattr(args, "S_max") else 512,
                             g_extra=ctx_vec,
-                            erase_local=(erase_data_mask[qubit_indices] if erase_data_mask is not None and qubit_indices.size else None),
+                            erase_local=(
+                                erase_data_mask[qubit_indices]
+                                if erase_data_mask is not None and qubit_indices.size
+                                else None
+                            ),
                         )
+                        _validate_packed_contract(pack, expected_node_dim, expected_edge_dim)
                         batch_buf.append(move_to(pack, device))
                         if len(batch_buf) >= args.batch:
                             # run a step
@@ -636,7 +835,9 @@ def train_inprocess(ns) -> str:
                                 logits = logits.squeeze(0)
                                 node_mask = node_mask.squeeze(0)
                                 hard = 1.0
-                                sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
+                                sample_weight = torch.tensor(
+                                    hard, dtype=torch.float32, device=device
+                                )
                                 loss_bce = bce_binary_head_loss(
                                     logits,
                                     node_mask,
@@ -656,34 +857,54 @@ def train_inprocess(ns) -> str:
                                     data_mask = (packed.node_type == 0) & node_mask
                                     proj_bits = projection_aware_logits_to_bits(
                                         logits,
-                                        projector_kwargs={"H_sub": packed.H_sub, "side": getattr(packed.meta, "side", "Z")},
+                                        projector_kwargs={
+                                            "H_sub": packed.H_sub,
+                                            "side": getattr(packed.meta, "side", "Z"),
+                                        },
                                         data_mask=data_mask,
                                     )
                                     with torch.no_grad():
                                         mask_data = data_mask.detach().cpu().numpy()
-                                        target_full = packed.y_bits.detach().cpu().numpy().clip(0,1).astype(_np.uint8)
+                                        target_full = (
+                                            packed.y_bits.detach()
+                                            .cpu()
+                                            .numpy()
+                                            .clip(0, 1)
+                                            .astype(_np.uint8)
+                                        )
                                         target_data = target_full[mask_data]
                                     proj_target = torch.from_numpy(target_data).to(device)
-                                    proj_pred = torch.from_numpy(proj_bits.astype(_np.int64)).to(device)
-                                    raw_bits = (torch.sigmoid(logits[:,1]-logits[:,0])[data_mask] > 0.5).long()
-                                    loss_proj = 0.5*F.l1_loss(proj_pred.float(), proj_target.float()) + 0.2*F.l1_loss(proj_pred.float(), raw_bits.float())
-                                sample_loss = loss_bce + loss_par + 0.5*loss_proj
+                                    proj_pred = torch.from_numpy(proj_bits.astype(_np.int64)).to(
+                                        device
+                                    )
+                                    raw_bits = (
+                                        torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5
+                                    ).long()
+                                    loss_proj = 0.5 * F.l1_loss(
+                                        proj_pred.float(), proj_target.float()
+                                    ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+                                sample_loss = loss_bce + loss_par + 0.5 * loss_proj
                                 batch_loss = batch_loss + sample_loss
                             batch_size = len(moved)
                             batch_loss = batch_loss / batch_size
                             batch_loss.backward()
-                            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
-                            opt.step(); opt.zero_grad(set_to_none=True)
+                            nn.utils.clip_grad_norm_(
+                                model.parameters(), max_norm=float(args.grad_clip)
+                            )
+                            opt.step()
+                            opt.zero_grad(set_to_none=True)
                             total_loss += batch_loss.item() * batch_size
                             n_items += batch_size
                             shots_done += 1
                             # Periodic progress print within epoch
                             if prog_stride and (shots_done % prog_stride == 0):
-                                prog = {"epoch": epoch,
-                                        "step": int(shots_done),
-                                        "steps": int(shots_target),
-                                        "avg": float(total_loss / max(n_items, 1)),
-                                        "secs": float(time.time() - t0)}
+                                prog = {
+                                    "epoch": epoch,
+                                    "step": int(shots_done),
+                                    "steps": int(shots_target),
+                                    "avg": float(total_loss / max(n_items, 1)),
+                                    "secs": float(time.time() - t0),
+                                }
                                 if p_epoch is not None:
                                     prog["p"] = float(p_epoch)
                                 print(json.dumps(prog, separators=(",", ":")), flush=True)
@@ -694,12 +915,34 @@ def train_inprocess(ns) -> str:
         else:
             steps_done = 0
             steps_total = len(loader) if hasattr(loader, "__len__") else 0
-            prog_stride = (max(1, steps_total // int(getattr(args, "progress_prints", 1)))
-                           if steps_total and int(getattr(args, "progress_prints", 1)) > 1 else 0)
+            prog_stride = (
+                max(1, steps_total // int(getattr(args, "progress_prints", 1)))
+                if steps_total and int(getattr(args, "progress_prints", 1)) > 1
+                else 0
+            )
+            global _TEACHER_POOL
+            if _TEACHER_POOL is None:
+                workers = max(1, int(getattr(args, "teacher_workers", 4)))
+                _TEACHER_POOL = ThreadPoolExecutor(max_workers=workers)
+
+            def _teacher_prefetch(packed: PackedCrop) -> dict:
+                return {
+                    "valid": bool(getattr(packed, "teacher_valid", True)),
+                    "matched_local_ml": bool(getattr(packed, "teacher_matched_local_ml", False)),
+                }
+
+            futures: list = []
+            teacher_outs: list = []
             for batch in loader:
                 if not batch:
                     continue
-                moved = [move_to(packed, device) for packed in batch]
+                futures.clear()
+                moved = []
+                for packed in batch:
+                    futures.append(_TEACHER_POOL.submit(_teacher_prefetch, packed))
+                    _validate_packed_contract(packed, expected_node_dim, expected_edge_dim)
+                    moved.append(move_to(packed, device))
+                teacher_outs = [f.result() for f in futures]
                 if args.noise_injection > 0.0:
                     std = float(args.noise_injection)
                     for packed in moved:
@@ -707,12 +950,14 @@ def train_inprocess(ns) -> str:
                 opt.zero_grad(set_to_none=True)
 
             batch_loss = torch.zeros((), device=device)
-            for packed in moved:
+            for packed, teach in zip(moved, teacher_outs):
                 logits, node_mask = model(packed=packed)
                 logits = logits.squeeze(0)
                 node_mask = node_mask.squeeze(0)
 
-                hard = (0.5 if packed.teacher_valid else 1.5) + (0.5 if packed.teacher_matched_local_ml else 1.0)
+                hard = (0.5 if teach.get("valid", True) else 1.5) + (
+                    0.5 if teach.get("matched_local_ml", False) else 1.0
+                )
                 sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
 
                 loss_bce = bce_binary_head_loss(
@@ -736,19 +981,26 @@ def train_inprocess(ns) -> str:
                     data_mask = (packed.node_type == 0) & node_mask
                     proj_bits = projection_aware_logits_to_bits(
                         logits,
-                        projector_kwargs={"H_sub": packed.H_sub, "side": getattr(packed.meta, "side", "Z")},
+                        projector_kwargs={
+                            "H_sub": packed.H_sub,
+                            "side": getattr(packed.meta, "side", "Z"),
+                        },
                         data_mask=data_mask,
                     )
                     with torch.no_grad():
                         mask_data = data_mask.detach().cpu().numpy()
-                        target_full = packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
+                        target_full = (
+                            packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
+                        )
                         target_data = target_full[mask_data]
 
                     proj_target = torch.from_numpy(target_data).to(device)
                     proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
 
                     raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
-                    loss_proj = 0.5 * F.l1_loss(proj_pred.float(), proj_target.float()) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+                    loss_proj = 0.5 * F.l1_loss(
+                        proj_pred.float(), proj_target.float()
+                    ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
 
                 sample_loss = loss_bce + loss_par + 0.5 * loss_proj
                 batch_loss = batch_loss + sample_loss
@@ -763,11 +1015,13 @@ def train_inprocess(ns) -> str:
             n_items += batch_size
             steps_done += 1
             if prog_stride and (steps_done % prog_stride == 0):
-                prog = {"epoch": epoch,
-                        "step": int(steps_done),
-                        "steps": int(steps_total),
-                        "avg": float(total_loss / max(n_items, 1)),
-                        "secs": float(time.time() - t0)}
+                prog = {
+                    "epoch": epoch,
+                    "step": int(steps_done),
+                    "steps": int(steps_total),
+                    "avg": float(total_loss / max(n_items, 1)),
+                    "secs": float(time.time() - t0),
+                }
                 print(json.dumps(prog, separators=(",", ":")), flush=True)
 
         sched.step()
@@ -781,40 +1035,84 @@ def train_inprocess(ns) -> str:
         prev_epoch_loss = avg
 
         torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
-        if avg < best_loss:
+        if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
             best_loss = avg
-            torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt")
+            torch.save(
+                {"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt"
+            )
 
         log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
         if use_online:
-            log_obj["p"] = float(p_epoch if 'p_epoch' in locals() else getattr(args, "p", 0.0))
-        print(json.dumps(log_obj, separators=(",", ":")))
+            log_obj["p"] = float(p_epoch if "p_epoch" in locals() else getattr(args, "p", 0.0))
+        # Print epoch summary and flush so users see it promptly
+        print(json.dumps(log_obj, separators=(",", ":")), flush=True)
 
-    (save_dir / "train_log.json").write_text(json.dumps(history, indent=2))
+        # Persist logs incrementally each epoch (JSONL + JSON snapshot)
+        try:
+            with (save_dir / "train_log.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(log_obj, separators=(",", ":")) + "\n")
+            (save_dir / "train_log.json").write_text(
+                json.dumps(history, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+        # Early stopping check
+        patience = int(getattr(args, "early_stop_patience", 0))
+        min_delta = float(getattr(args, "early_stop_min_delta", 0.0))
+        if patience > 0:
+            if avg <= best_loss + 1e-12:
+                last_improve_epoch = epoch
+            if (epoch - last_improve_epoch) >= patience:
+                print(
+                    json.dumps(
+                        {"early_stop": True, "epoch": epoch, "best_loss": best_loss},
+                        separators=(",", ":"),
+                    )
+                )
+                break
+
+    # Final snapshot (in case of early termination without last write)
+    try:
+        (save_dir / "train_log.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
     # Optional teacher comparison report
     if hasattr(args, "post_eval") and bool(getattr(args, "post_eval", False)):
         try:
             import subprocess, sys as _sys, os as _os
+
             shots = int(getattr(args, "post_eval_shots_per_batch", 16))
             batches = int(getattr(args, "post_eval_batches", 2))
             sampler = str(getattr(args, "post_eval_sampler", "stim"))
             cmd = [
-                _sys.executable, "-m", "mghd.tools.teacher_eval",
-                "--families", str(args.family),
-                "--distances", str(args.distance),
-                "--sampler", sampler,
-                "--shots-per-batch", str(shots),
-                "--batches", str(batches),
+                _sys.executable,
+                "-m",
+                "mghd.tools.teacher_eval",
+                "--families",
+                str(args.family),
+                "--distances",
+                str(args.distance),
+                "--sampler",
+                sampler,
+                "--shots-per-batch",
+                str(shots),
+                "--batches",
+                str(batches),
             ]
             env = _os.environ.copy()
             env.setdefault("PYTHONPATH", _os.getcwd())
             cp = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            (save_dir / "teacher_eval.txt").write_text(cp.stdout + ("\n--- STDERR ---\n" + cp.stderr if cp.stderr else ""))
+            (save_dir / "teacher_eval.txt").write_text(
+                cp.stdout + ("\n--- STDERR ---\n" + cp.stderr if cp.stderr else "")
+            )
         except Exception:
             pass
 
     return os.path.join(args.save, "best.pt")
+
+
 def move_to(p: PackedCrop, device):
     """Move all tensors in a PackedCrop to a target device (in place)."""
     p.x_nodes = p.x_nodes.to(device)
@@ -829,12 +1127,19 @@ def move_to(p: PackedCrop, device):
     p.y_bits = p.y_bits.to(device)
     return p
 
-def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float = 1e-4):
+
+def sanity_train(
+    crop_root: str,
+    epochs: int = 2,
+    batch_size: int = 2,
+    lr: float = 1e-4,
+    hparams: str | None = None,
+):
     """Quick sanity training over a small offline crop dir (for tests/demos)."""
     import os
     import tempfile
     from types import SimpleNamespace
-    
+
     ns = SimpleNamespace()
     ns.data_root = crop_root  # Changed from crop_root to data_root to match arg parser
     ns.epochs = epochs
@@ -846,23 +1151,27 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
     ns.parity_lambda = 0.03
     ns.projection_aware = 1
     ns.seed = 42
-    ns.label_smoothing = 0.13831652882929857
-    ns.noise_injection = 0.009883059279379016
-    ns.grad_clip = 0.8545326095750816
-    
+    ns.label_smoothing = 0.1
+    ns.noise_injection = 0.0
+    ns.grad_clip = 1.0
+    ns.node_feat_dim = 8
+    ns.edge_feat_dim = 3
+    ns.hparams = hparams
+
     # Create temporary directory for save path
     temp_dir = tempfile.mkdtemp()
     ns.save = os.path.join(temp_dir, "sanity_test")
-    
+
     print(f"Running sanity training with {epochs} epochs, batch_size={batch_size}, lr={lr}")
     print(f"Temporary save path: {ns.save}")
-    
+
     try:
         result_path = train_inprocess(ns)
         print(f"Training completed, result: {result_path}")
-        
+
         # Return the trained model for inspection
         from mghd.core.core import MGHDv2
+
         model = MGHDv2(profile=ns.profile)
         if torch.cuda.is_available():
             model = model.cuda()
@@ -870,8 +1179,10 @@ def sanity_train(crop_root: str, epochs: int = 2, batch_size: int = 2, lr: float
     finally:
         # Clean up temp directory
         import shutil
+
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+
 
 def main():
     """Unified CLI entrypoint supporting offline and online modes.
@@ -880,8 +1191,10 @@ def main():
     and online (``--online``) training paths with TAD/RL/erasure options.
     """
     from types import SimpleNamespace
+
     # Passing a dummy namespace will make train_inprocess parse sys.argv
     train_inprocess(SimpleNamespace())
+
 
 if __name__ == "__main__":
     main()

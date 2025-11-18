@@ -5,6 +5,7 @@ This module exposes small, reproducible builders for common CSS families
 logical operators, and construct lightweight CSSCode carriers used by
 samplers/teachers.
 """
+
 from __future__ import annotations
 
 import json
@@ -36,6 +37,7 @@ def check_css_commutation(hx: np.ndarray, hz: np.ndarray) -> None:
 @dataclass(frozen=True)
 class CodeSpec:
     """Immutable spec describing a concrete CSS code instance."""
+
     name: str
     n: int
     hx: np.ndarray
@@ -84,12 +86,12 @@ class CSSCode:
                 np.zeros((B, mz), dtype=np.uint8),
             )
         sx = dets[:, :mx].astype(np.uint8)
-        sz = dets[:, mx:mx + mz].astype(np.uint8)
+        sz = dets[:, mx : mx + mz].astype(np.uint8)
         return sx, sz
 
-    def data_to_observables(self,
-                            ex: np.ndarray | None,
-                            ez: np.ndarray | None) -> np.ndarray | None:
+    def data_to_observables(
+        self, ex: np.ndarray | None, ez: np.ndarray | None
+    ) -> np.ndarray | None:
         """Map data-space corrections to logical observable flips."""
 
         if self.Lx is None or self.Lz is None or self.num_observables is None:
@@ -207,7 +209,9 @@ def _gf2_nullspace_dense(A: np.ndarray) -> np.ndarray:
     return np.stack(basis, axis=1)
 
 
-def _reduce_mod_rowspace(vec: np.ndarray, R: np.ndarray, pivots: list[tuple[int, int]]) -> np.ndarray:
+def _reduce_mod_rowspace(
+    vec: np.ndarray, R: np.ndarray, pivots: list[tuple[int, int]]
+) -> np.ndarray:
     """Reduce a vector mod rowspace represented by (R, pivots) over GF(2)."""
     res = (np.asarray(vec, dtype=np.uint8) & 1).copy()
     for r, c in pivots:
@@ -254,7 +258,9 @@ def _select_css_logicals(stab: np.ndarray, dual: np.ndarray, target: int) -> np.
     return np.stack(basis, axis=0)
 
 
-def _compute_css_logicals(Hx: np.ndarray, Hz: np.ndarray, target: int) -> tuple[np.ndarray, np.ndarray]:
+def _compute_css_logicals(
+    Hx: np.ndarray, Hz: np.ndarray, target: int
+) -> tuple[np.ndarray, np.ndarray]:
     """Derive (Lx, Lz) bases for a CSS pair by symmetric reduction."""
     Lx_auto = _select_css_logicals(Hx, Hz, target)
     Lz_auto = _select_css_logicals(Hz, Hx, target)
@@ -372,7 +378,10 @@ def bccb_from_taps(n1: int, n2: int, taps_2d: Iterable[tuple[int, int]]) -> np.n
         mat ^= np.kron(Ax, Ay).astype(np.uint8)
     return mat
 
-def save_npz(hx: np.ndarray, hz: np.ndarray, path: str | np.ndarray, meta: dict[str, Any], **extras: Any) -> None:
+
+def save_npz(
+    hx: np.ndarray, hz: np.ndarray, path: str | np.ndarray, meta: dict[str, Any], **extras: Any
+) -> None:
     data: dict[str, Any] = {
         "hx": _ensure_binary(hx),
         "hz": _ensure_binary(hz),
@@ -524,6 +533,7 @@ def build_surface(distance: int, *, rotated: bool = True) -> CSSCode:
 # ---------------------------------------------------------------------------
 # BB (Bravyi-Bacon) families
 # ---------------------------------------------------------------------------
+
 
 def _bb_indices(size_x: int, size_y: int):
     def wrap_x(x: int) -> int:
@@ -688,6 +698,7 @@ def build_bb(
 # HGP (Tillich–Zémor) construction
 # ---------------------------------------------------------------------------
 
+
 def hgp_from_classical(H1: np.ndarray, H2: np.ndarray) -> CodeSpec:
     H1 = _ensure_binary(H1)
     H2 = _ensure_binary(H2)
@@ -700,8 +711,13 @@ def hgp_from_classical(H1: np.ndarray, H2: np.ndarray) -> CodeSpec:
     block4 = np.kron(H1.T, np.eye(m2, dtype=np.uint8))
     hz = np.concatenate((block3, block4), axis=1)
     n = n1 * n2 + m1 * m2
-    return CodeSpec(name="hgp", n=n, hx=hx, hz=hz,
-                    meta={"H1_shape": H1.shape, "H2_shape": H2.shape, "syndrome_order": "Z_first_then_X"})
+    return CodeSpec(
+        name="hgp",
+        n=n,
+        hx=hx,
+        hz=hz,
+        meta={"H1_shape": H1.shape, "H2_shape": H2.shape, "syndrome_order": "Z_first_then_X"},
+    )
 
 
 def build_hgp(H1: np.ndarray, H2: np.ndarray, *, name: str = "hgp") -> CSSCode:
@@ -727,21 +743,30 @@ def build_hgp(H1: np.ndarray, H2: np.ndarray, *, name: str = "hgp") -> CSSCode:
 # QRM / Hamming families
 # ---------------------------------------------------------------------------
 
+
 def qrm_steane() -> CodeSpec:
-    H = np.array([
-        [1, 1, 1, 0, 1, 0, 0],
-        [1, 1, 0, 1, 0, 1, 0],
-        [1, 0, 1, 1, 0, 0, 1],
-    ], dtype=np.uint8)
-    return CodeSpec(name="steane", n=7, hx=H, hz=H, k=1, d=3, meta={"syndrome_order": "Z_first_then_X"})
+    H = np.array(
+        [
+            [1, 1, 1, 0, 1, 0, 0],
+            [1, 1, 0, 1, 0, 1, 0],
+            [1, 0, 1, 1, 0, 0, 1],
+        ],
+        dtype=np.uint8,
+    )
+    return CodeSpec(
+        name="steane", n=7, hx=H, hz=H, k=1, d=3, meta={"syndrome_order": "Z_first_then_X"}
+    )
 
 
 def build_steane() -> CSSCode:
-    H = np.array([
-        [1, 0, 0, 1, 0, 1, 1],
-        [0, 1, 0, 1, 1, 0, 1],
-        [0, 0, 1, 0, 1, 1, 1],
-    ], dtype=np.uint8)
+    H = np.array(
+        [
+            [1, 0, 0, 1, 0, 1, 1],
+            [0, 1, 0, 1, 1, 0, 1],
+            [0, 0, 1, 0, 1, 1, 1],
+        ],
+        dtype=np.uint8,
+    )
     layout = {"family": "steane"}
     Lz = np.array([[1, 0, 0, 0, 0, 0, 1]], dtype=np.uint8)
     Lx = Lz.copy()
@@ -773,14 +798,23 @@ def qrm_hamming(m: int) -> CodeSpec:
     H = _hamming_parity_matrix(m)
     n = H.shape[1]
     k = n - 2 * m
-    return CodeSpec(name=f"qrm_hamming_m{m}", n=n, hx=H, hz=H, k=k, d=3,
-                    meta={"m": m, "syndrome_order": "Z_first_then_X"})
+    return CodeSpec(
+        name=f"qrm_hamming_m{m}",
+        n=n,
+        hx=H,
+        hz=H,
+        k=k,
+        d=3,
+        meta={"m": m, "syndrome_order": "Z_first_then_X"},
+    )
 
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "color_cache"
 
 
-def _load_cached_color(kind: str, distance: int) -> tuple[np.ndarray, np.ndarray, int, dict[str, Any]] | None:
+def _load_cached_color(
+    kind: str, distance: int
+) -> tuple[np.ndarray, np.ndarray, int, dict[str, Any]] | None:
     path = DATA_DIR / f"color_{kind}_d{distance}.npz"
     if not path.exists():
         return None
@@ -803,7 +837,9 @@ def _load_cached_color(kind: str, distance: int) -> tuple[np.ndarray, np.ndarray
     return Hx, Hz, n, layout
 
 
-def _write_color_cache(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: dict[str, Any]) -> None:
+def _write_color_cache(
+    kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: dict[str, Any]
+) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = DATA_DIR / f"color_{kind}_d{distance}.npz"
     payload = dict(layout)
@@ -816,22 +852,29 @@ def _write_color_cache(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray,
     )
 
 
-def _build_color_via_external(kind: str, distance: int) -> tuple[np.ndarray, np.ndarray, int, dict[str, Any]]:
+def _build_color_via_external(
+    kind: str, distance: int
+) -> tuple[np.ndarray, np.ndarray, int, dict[str, Any]]:
     if kind == "666":
         try:
             from mghd.core import codes_external as cx
         except ImportError:
             import importlib
+
             cx = importlib.import_module("codes_external")
         builder = getattr(cx, "build_color_666_qecsim", None)
         if builder is None:
-            raise RuntimeError("codes_external missing 'build_color_666_qecsim'. Install optional deps or update cache.")
+            raise RuntimeError(
+                "codes_external missing 'build_color_666_qecsim'. Install optional deps or update cache."
+            )
         return builder(distance)
     if kind == "488":
         try:
             from mghd.core import codes_external_488 as cx488
         except ImportError as exc:
-            raise RuntimeError("codes_external_488 unavailable; install panqec or quantum-pecos.") from exc
+            raise RuntimeError(
+                "codes_external_488 unavailable; install panqec or quantum-pecos."
+            ) from exc
         return cx488.build_color_488(distance)
     raise ValueError(f"Unsupported color code kind '{kind}'")
 
@@ -888,9 +931,15 @@ REGISTRY = {
     "color": lambda distance, tiling="6.6.6", **kw: build_color(distance, tiling=tiling, **kw),
     "color_666": lambda distance, **kw: build_color_666_triangle(distance),
     "color_488": lambda distance, **kw: build_color_488_triangle(distance),
-    "gb": lambda distance=None, n=47, taps_a=(0, 1, 3), taps_b=(0, 2, 5), **kw: build_gb_two_block(n, taps_a, taps_b, name="gb"),
-    "bb": lambda distance=None, n1=17, n2=17, taps_a_2d=((0, 0), (1, 0), (0, 1)),
-           taps_b_2d=((0, 0), (2, 0), (0, 2)), **kw: build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d),
+    "gb": lambda distance=None, n=47, taps_a=(0, 1, 3), taps_b=(0, 2, 5), **kw: build_gb_two_block(
+        n, taps_a, taps_b, name="gb"
+    ),
+    "bb": lambda distance=None,
+    n1=17,
+    n2=17,
+    taps_a_2d=((0, 0), (1, 0), (0, 1)),
+    taps_b_2d=((0, 0), (2, 0), (0, 2)),
+    **kw: build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d),
     "hgp": lambda distance=None, H1=None, H2=None, name="hgp", **kw: build_hgp(H1, H2, name=name),
 }
 
@@ -910,6 +959,7 @@ def get_code(family: str, distance: int | None = None, **kw) -> CSSCode:
 # Repetition family
 # ---------------------------------------------------------------------------
 
+
 def repetition(n_data: int) -> CodeSpec:
     if n_data < 2:
         raise ValueError("repetition code requires n_data >= 2")
@@ -919,8 +969,15 @@ def repetition(n_data: int) -> CodeSpec:
         hx[i, i] = 1
         hx[i, i + 1] = 1
     hz = np.ones((1, n_data), dtype=np.uint8)
-    return CodeSpec(name=f"repetition_{n_data}", n=n_data, hx=hx, hz=hz, k=1, d=n_data,
-                    meta={"syndrome_order": "Z_first_then_X"})
+    return CodeSpec(
+        name=f"repetition_{n_data}",
+        n=n_data,
+        hx=hx,
+        hz=hz,
+        k=1,
+        d=n_data,
+        meta={"syndrome_order": "Z_first_then_X"},
+    )
 
 
 def build_repetition(distance: int, *, basis: str = "Z") -> CSSCode:
@@ -962,6 +1019,7 @@ def build_repetition(distance: int, *, basis: str = "Z") -> CSSCode:
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
+
 def load_matrix(path: str) -> np.ndarray:
     path = str(path)
     if path.endswith(".npz"):
@@ -981,6 +1039,7 @@ def load_matrix(path: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Sanity checks
 # ---------------------------------------------------------------------------
+
 
 def _random_css_check(spec: CodeSpec, samples: int = 5) -> None:
     rng = np.random.default_rng(0)

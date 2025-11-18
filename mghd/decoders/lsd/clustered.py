@@ -5,8 +5,10 @@ import scipy.sparse as sp
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Iterable, Optional, Any, Sequence
+
 try:  # Optional GPU acceleration
     import torch  # type: ignore
+
     _TORCH_OK = True
 except Exception:  # pragma: no cover
     _TORCH_OK = False
@@ -15,6 +17,7 @@ except Exception:  # pragma: no cover
 @dataclass
 class Cluster:
     """Simple cluster container for legacy API compatibility."""
+
     check_indices: np.ndarray
     qubit_indices: Optional[np.ndarray] = None
     side: Optional[str] = None
@@ -26,7 +29,7 @@ def _as_dense_uint8(M) -> np.ndarray:
         A = M.toarray()
     else:
         A = np.asarray(M)
-    return (A.astype(np.uint8) & 1)
+    return A.astype(np.uint8) & 1
 
 
 def gf2_row_echelon(A: np.ndarray):
@@ -138,7 +141,7 @@ def gf2_project_to_coset(
     N = gf2_nullspace(Hs)  # n x r
     if e_hint is None or N.shape[1] == 0:
         return e0.astype(np.uint8)
-    d = (np.asarray(e_hint, dtype=np.uint8).ravel() ^ e0)  # desired delta within coset
+    d = np.asarray(e_hint, dtype=np.uint8).ravel() ^ e0  # desired delta within coset
     try:
         # Solve N t = d (mod 2); returns a length-r vector t
         t = gf2_solve_particular(sp.csr_matrix(N), d)
@@ -208,7 +211,9 @@ def _delta_cost(e: np.ndarray, column: np.ndarray, w: np.ndarray) -> float:
     return float(np.dot(w[mask], 1.0 - 2.0 * bits))
 
 
-def greedy_parity_project(H_sub: sp.csr_matrix, s_sub: np.ndarray, p_flip: np.ndarray, thresh: float = 0.5) -> np.ndarray:
+def greedy_parity_project(
+    H_sub: sp.csr_matrix, s_sub: np.ndarray, p_flip: np.ndarray, thresh: float = 0.5
+) -> np.ndarray:
     """Greedy correction that reduces parity residual using weighted heuristic.
 
     Not exact ML, but cheap and effective when exact search is too large.
@@ -256,7 +261,7 @@ def ml_parity_project(
     w = np.log((1 - p) / p)
 
     e0 = gf2_solve_particular(sp.csr_matrix(H_sub), s_sub)  # particular
-    N = gf2_nullspace(sp.csr_matrix(H_sub))                  # n_sub × r
+    N = gf2_nullspace(sp.csr_matrix(H_sub))  # n_sub × r
     r = N.shape[1]
 
     if r == 0:
@@ -268,7 +273,7 @@ def ml_parity_project(
             stats_out.update(states_visited=0, states_pruned=0)
         return greedy_parity_project(sp.csr_matrix(H_sub), s_sub, p_flip)
 
-    N_bool = (N != 0)
+    N_bool = N != 0
     columns = [N[:, idx].astype(np.uint8) for idx in range(r)]
     suffix_cover = np.zeros((r + 1, N.shape[0]), dtype=bool)
     for idx in range(r - 1, -1, -1):
@@ -451,7 +456,8 @@ def active_components(
         # share[i,j] = number of shared data qubits between checks i and j
         share = (Hc @ Hc.T).tocsr()
         share.data[:] = 1
-        share.setdiag(0); share.eliminate_zeros()
+        share.setdiag(0)
+        share.eliminate_zeros()
         active = set(map(int, rows.tolist()))
         seen: set[int] = set()
         clusters: list[Cluster] = []
@@ -465,7 +471,7 @@ def active_components(
             while dq:
                 u = dq.popleft()
                 comp.append(u)
-                lo, hi = share.indptr[u], share.indptr[u+1]
+                lo, hi = share.indptr[u], share.indptr[u + 1]
                 for v in share.indices[lo:hi]:
                     vi = int(v)
                     if vi in active and vi not in seen:
@@ -556,6 +562,7 @@ class MGHDPrimaryClustered:
         flush_ms: float = 1.0,
     ):
         import time  # local import to avoid test-time deps unless used
+
         self._time = time
 
         self.H = H.tocsr()
@@ -632,6 +639,7 @@ class MGHDPrimaryClustered:
     def _sync_cuda(self) -> None:
         try:
             import torch
+
             if torch.cuda.is_available() and getattr(self.mghd, "device", None) is not None:
                 if getattr(self.mghd.device, "type", "cpu") == "cuda":
                     torch.cuda.synchronize(self.mghd.device)
@@ -662,7 +670,13 @@ class MGHDPrimaryClustered:
                 "seed": 0,
             }
             subproblems.append(
-                {"H_sub": H_sub, "s_sub": s_sub, "q_l2g": q_l2g, "c_l2g": c_l2g, "extra": extra_meta}
+                {
+                    "H_sub": H_sub,
+                    "s_sub": s_sub,
+                    "q_l2g": q_l2g,
+                    "c_l2g": c_l2g,
+                    "extra": extra_meta,
+                }
             )
 
         e = np.zeros(H.shape[1], dtype=np.uint8)
@@ -675,7 +689,8 @@ class MGHDPrimaryClustered:
             self._sync_cuda()
             t1 = self._time.perf_counter()
             items = [
-                (entry["H_sub"], entry["s_sub"], entry["q_l2g"], entry["c_l2g"], entry["extra"]) for entry in subproblems
+                (entry["H_sub"], entry["s_sub"], entry["q_l2g"], entry["c_l2g"], entry["extra"])
+                for entry in subproblems
             ]
             probs_list, mb_report = self.mghd.priors_from_subgraphs_batched(
                 items,
@@ -691,7 +706,14 @@ class MGHDPrimaryClustered:
         else:
             probs_list = []
             t_mghd = 0.0
-            mb_report = {"fast_path_batches": 0, "fixed_d3_batches": 0, "fallback_loops": 0, "batch_sizes": [], "graph_used": False, "device": {"device": str(getattr(self.mghd, "device", "cpu"))}}
+            mb_report = {
+                "fast_path_batches": 0,
+                "fixed_d3_batches": 0,
+                "fallback_loops": 0,
+                "batch_sizes": [],
+                "graph_used": False,
+                "device": {"device": str(getattr(self.mghd, "device", "cpu"))},
+            }
             for entry in subproblems:
                 H_sub = entry["H_sub"]
                 s_sub = entry["s_sub"]
@@ -715,7 +737,9 @@ class MGHDPrimaryClustered:
                         mb_report["batch_sizes"].extend(value)
                     elif key in {"fast_path_batches", "fixed_d3_batches", "fallback_loops"}:
                         mb_report[key] = mb_report.get(key, 0) + value
-                mb_report["graph_used"] = mb_report.get("graph_used", False) or sub_report.get("graph_used", False)
+                mb_report["graph_used"] = mb_report.get("graph_used", False) or sub_report.get(
+                    "graph_used", False
+                )
                 self._sync_cuda()
                 t_mghd += (self._time.perf_counter() - t1) * 1e6
                 probs_list.append(probs)
@@ -727,14 +751,14 @@ class MGHDPrimaryClustered:
             q_l2g = entry["q_l2g"]
             if probs.shape[0] != H_sub.shape[1]:
                 raise AssertionError("Probability vector length mismatch for subgraph")
-        t_p0 = self._time.perf_counter()
-        if _TORCH_OK:
-            try:
-                e_sub = ml_parity_project_torch(H_sub, s_sub, probs, r_cap=self.r_cap)
-            except Exception:
+            t_p0 = self._time.perf_counter()
+            if _TORCH_OK:
+                try:
+                    e_sub = ml_parity_project_torch(H_sub, s_sub, probs, r_cap=self.r_cap)
+                except Exception:
+                    e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
+            else:
                 e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
-        else:
-            e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
             t_proj += (self._time.perf_counter() - t_p0) * 1e6
             parity = (H_sub @ e_sub) % 2
             parity = np.asarray(parity).ravel().astype(np.uint8) % 2
@@ -747,6 +771,7 @@ class MGHDPrimaryClustered:
             "sizes_hist": sizes_hist,
             "mghd_invoked": t_mghd,
             "proj_us": t_proj,
+            "mghd_clusters": int(len(subproblems)),
         }
 
 

@@ -8,6 +8,7 @@ the global token to bias training.
 
 Note: CUDA/CUDA‑Q are initialized only inside ``main()``.
 """
+
 # NOTE: Initialize CUDA/CUDA-Q only in main().
 from __future__ import annotations
 
@@ -44,6 +45,7 @@ class TeacherOutput:
     teacher: name tag (e.g., 'mwpf', 'lsd', 'mwpm')
     valid:  parity/coset validation flag for this crop
     """
+
     bits: np.ndarray
     weight: int
     teacher: str
@@ -70,6 +72,7 @@ def _build_schedule_ir(context_source: str, code_obj: object):
     circuit/adapter is available. ``context_source`` chooses among qiskit/cirq/cudaq.
     """
     import sys
+
     native = None
     for attr in ("native_circuit", "reference_circuit", "circuit", "qc", "quantum_circuit"):
         if hasattr(code_obj, attr):
@@ -81,12 +84,15 @@ def _build_schedule_ir(context_source: str, code_obj: object):
     try:
         if context_source == "qiskit" and "qiskit" in sys.modules:
             from mghd.qpu.adapters import qiskit_adapter
+
             return qiskit_adapter.to_schedule_ir(native)
         if context_source == "cirq" and "cirq" in sys.modules:
             from mghd.qpu.adapters import cirq_adapter  # type: ignore
+
             return cirq_adapter.to_schedule_ir(native)
         if context_source == "cudaq" and "cudaq" in sys.modules:
             from mghd.qpu.adapters import cudaq_adapter  # type: ignore
+
             return cudaq_adapter.to_schedule_ir(native)
     except Exception:
         pass
@@ -228,7 +234,9 @@ def run(args) -> None:
                 except Exception:
                     n_qubits = 0
                 try:
-                    weight_maps = tad_weighting.schedule_to_weight_maps(schedule_ir, qpu_profile, n_qubits)
+                    weight_maps = tad_weighting.schedule_to_weight_maps(
+                        schedule_ir, qpu_profile, n_qubits
+                    )
                     feats = tad_weighting.feature_vector(schedule_ir)
                     sorted_gates = sorted(feats.get("gate_hist", {}).keys())
                     gate_vocab = {gate: idx for idx, gate in enumerate(sorted_gates)}
@@ -258,7 +266,12 @@ def run(args) -> None:
                 shard_items: List[Dict[str, object]] = []
                 for _ in range(shots_per):
                     seed = int(rng.integers(0, 2**31 - 1))
-                    sample = sample_round(d=d, p=p, seed=seed, profile_path=args.qpu_profile if args.qpu_profile else None)
+                    sample = sample_round(
+                        d=d,
+                        p=p,
+                        seed=seed,
+                        profile_path=args.qpu_profile if args.qpu_profile else None,
+                    )
 
                     lsd_preds: Dict[str, np.ndarray] = {}
                     if lsd_teacher is not None:
@@ -296,21 +309,28 @@ def run(args) -> None:
 
                             if mwpf_teacher is not None:
                                 # Use global MWPF fault_ids and map to local bits
-                                dets_global = np.concatenate([
-                                    sample["synX"][np.newaxis, :].astype(np.uint8),
-                                    sample["synZ"][np.newaxis, :].astype(np.uint8),
-                                ], axis=1)
+                                dets_global = np.concatenate(
+                                    [
+                                        sample["synX"][np.newaxis, :].astype(np.uint8),
+                                        sample["synZ"][np.newaxis, :].astype(np.uint8),
+                                    ],
+                                    axis=1,
+                                )
                                 # Per-fault scaling from LLR overrides if available
                                 mwpf_scale = None
                                 if llr_overrides is not None:
                                     try:
                                         probs = 1.0 / (1.0 + np.exp(llr_overrides))
                                         scale_full = np.clip(probs / 0.5, 0.1, 10.0)
-                                        mwpf_scale = {int(i): float(s) for i, s in enumerate(scale_full)}
+                                        mwpf_scale = {
+                                            int(i): float(s) for i, s in enumerate(scale_full)
+                                        }
                                     except Exception:
                                         mwpf_scale = None
                                 try:
-                                    out_mwpf = mwpf_teacher.decode_batch(dets_global, mwpf_scale=mwpf_scale)
+                                    out_mwpf = mwpf_teacher.decode_batch(
+                                        dets_global, mwpf_scale=mwpf_scale
+                                    )
                                     fid_arr = np.asarray(out_mwpf.get("fault_ids"), dtype=np.int32)
                                     bits_pf_local = np.zeros(H_sub.shape[1], dtype=np.uint8)
                                     if fid_arr.ndim == 2 and fid_arr.shape[0] >= 1:
@@ -411,7 +431,9 @@ def run(args) -> None:
                         "sha": shard_sha,
                     }
                 )
-                print(json.dumps({"written": str(outp), "count": len(shard_items), "sha": shard_sha}))
+                print(
+                    json.dumps({"written": str(outp), "count": len(shard_items), "sha": shard_sha})
+                )
 
     (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -420,7 +442,9 @@ def main() -> None:
     """CLI entry point for ``mghd-make-crops``."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--families", type=str, default="surface", help="Comma-separated code families")
-    ap.add_argument("--distances", type=str, default="3", help="Distance spec (e.g., '3,5,7' or '3-9:2')")
+    ap.add_argument(
+        "--distances", type=str, default="3", help="Distance spec (e.g., '3,5,7' or '3-9:2')"
+    )
     ap.add_argument("--ps", type=float, nargs="+", required=True, help="Physical error rates")
     ap.add_argument("--shots-per-grid", type=int, default=64)
     ap.add_argument("--teacher-mix", type=str, default="mwpf=1.0,mwpm=0.0,lsd=0.0")

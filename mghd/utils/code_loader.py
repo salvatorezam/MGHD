@@ -9,6 +9,7 @@ Returned object should expose, when available:
   - optional mapping: detectors_per_fault / to_fault_hypergraph()
   - optional: stim_circuit (benchmarks only)
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace

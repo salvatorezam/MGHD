@@ -11,6 +11,7 @@ Providers
 
 When providers are missing, the script logs a warning and skips those entries.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -29,7 +30,9 @@ def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _save_npz(kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: dict) -> None:
+def _save_npz(
+    kind: str, distance: int, Hx: np.ndarray, Hz: np.ndarray, n: int, layout: dict
+) -> None:
     """Write a color code instance to ``color_cache/color_{kind}_d{distance}.npz``.
 
     Stores uint8 Hx/Hz, the data‑qubit count ``n``, and a JSON‑encoded layout
@@ -53,9 +56,15 @@ def main(argv: List[str] | None = None) -> int:
     - argv: optional list of CLI arguments for programmatic invocation.
     """
     parser = argparse.ArgumentParser(description="Precompute triangular color-code parity checks")
-    parser.add_argument("--max-d", type=int, default=31, help="Maximum odd distance to precompute (>=3).")
-    parser.add_argument("--which", choices=["666", "488", "both"], default="both",
-                        help="Which tilings to precompute.")
+    parser.add_argument(
+        "--max-d", type=int, default=31, help="Maximum odd distance to precompute (>=3)."
+    )
+    parser.add_argument(
+        "--which",
+        choices=["666", "488", "both"],
+        default="both",
+        help="Which tilings to precompute.",
+    )
     args = parser.parse_args(argv)
 
     wanted = {"666", "488"} if args.which == "both" else {args.which}
@@ -81,7 +90,9 @@ def main(argv: List[str] | None = None) -> int:
             if builder is None:
                 if kind == "488":
                     if not warned_488:
-                        print("[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation.")
+                        print(
+                            "[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation."
+                        )
                         failures.append((kind, d, "provider unavailable"))
                         warned_488 = True
                 else:
@@ -92,7 +103,9 @@ def main(argv: List[str] | None = None) -> int:
             except ImportError as exc:  # pragma: no cover - informative logging
                 if kind == "488":
                     if not warned_488:
-                        print("[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation.")
+                        print(
+                            "[color_488] Missing provider (install panqec or quantum-pecos); skipping cache generation."
+                        )
                         failures.append((kind, d, str(exc)))
                         warned_488 = True
                 else:

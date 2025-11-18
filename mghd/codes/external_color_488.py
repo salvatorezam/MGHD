@@ -10,6 +10,7 @@ Each builder returns a tuple ``(Hx, Hz, n, layout)`` where ``Hx/Hz`` are uint8
 parity‑check matrices, ``n`` is the number of data qubits (columns), and
 ``layout`` is a small dict describing the provenance and geometry.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Tuple
@@ -145,4 +146,6 @@ def build_color_488(distance: int) -> Tuple[np.ndarray, np.ndarray, int, Dict[st
         return build_color_488_pecos(distance)
     except Exception as exc:
         errors.append(str(exc))
-        raise ImportError("No 4.8.8 color code provider available (install panqec or quantum-pecos)") from exc
+        raise ImportError(
+            "No 4.8.8 color code provider available (install panqec or quantum-pecos)"
+        ) from exc

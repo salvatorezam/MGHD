@@ -86,7 +86,10 @@ def test_route_batch_passes_mwpf_scale(monkeypatch):
 
         def decode_batch(self, dets, *, mwpf_scale=None):
             captured_scale["scale"] = mwpf_scale
-            return {"fault_ids": np.zeros((1, 1), dtype=np.int32), "weights": np.zeros(1, dtype=np.float32)}
+            return {
+                "fault_ids": np.zeros((1, 1), dtype=np.int32),
+                "weights": np.zeros(1, dtype=np.float32),
+            }
 
     monkeypatch.setattr("mghd.decoders.mix.MWPFTeacher", StubMWPF)
 
