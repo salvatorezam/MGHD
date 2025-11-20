@@ -800,7 +800,8 @@ def train_inprocess(ns) -> str:
                 batch_size=args.batch,
                 num_workers=workers,
                 collate_fn=collate_packed,
-                pin_memory=True if torch.cuda.is_available() else False
+                pin_memory=True if torch.cuda.is_available() else False,
+                persistent_workers=True if workers > 0 else False,
             )
             
             steps_done = 0
@@ -1197,6 +1198,9 @@ def sanity_train(
             shutil.rmtree(temp_dir)
 
 
+# Global cache for workers to avoid rebuilding teachers every epoch/iteration
+_WORKER_TEACHERS_CACHE = {}
+
 class OnlineSurfaceDataset(IterableDataset):
     """
     Iterable dataset for online surface code simulation.
@@ -1230,10 +1234,8 @@ class OnlineSurfaceDataset(IterableDataset):
         seed = self.args.seed + self.epoch * 1000 + worker_id
         rng = np.random.default_rng(seed)
         
-        # Initialize teachers
-        # Note: Teachers depend on distance. If we have multiple distances, we need multiple teachers.
-        # For efficiency, we will lazily initialize teachers for each distance.
-        self.teachers_cache = {} # d -> (mwpf, mwpm_ctx, lsd)
+        # Use global cache for teachers to persist across epochs in persistent workers
+        global _WORKER_TEACHERS_CACHE
         
         shots_done = 0
         while shots_done < self.shots_to_do:
@@ -1251,10 +1253,10 @@ class OnlineSurfaceDataset(IterableDataset):
             )
             
             # Get or create teachers for this distance
-            if d not in self.teachers_cache:
-                self.teachers_cache[d] = self._init_teachers_for_d(d)
+            if d not in _WORKER_TEACHERS_CACHE:
+                _WORKER_TEACHERS_CACHE[d] = self._init_teachers_for_d(d)
             
-            mwpf_teacher, mwpm_ctx, lsd_teacher = self.teachers_cache[d]
+            mwpf_teacher, mwpm_ctx, lsd_teacher = _WORKER_TEACHERS_CACHE[d]
             
             # Handle erasure
             erase_local = None

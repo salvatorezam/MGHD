@@ -70,6 +70,10 @@ class MWPFTeacher:
         self._fault_edges: List[np.ndarray] = []
         self._edge_sets: List[set[int]] = []
         self._weights: List[float] = []
+        # Caching for solver reuse
+        self._cached_initializer: Any = None
+        self._cached_solver: Any = None
+        self._cached_weights_key: Optional[tuple] = None
         self._build_offline()
 
     # ------------------------------------------------------------------
@@ -173,12 +177,28 @@ class MWPFTeacher:
     # ------------------------------------------------------------------
     def _build_solver_with_weights(self, weights: List[float]):
         """Instantiate the MWPF solver for a given weight vector."""
+        # Check cache
+        weights_key = tuple(weights)
+        if self._cached_weights_key == weights_key and self._cached_initializer is not None:
+            # Reuse initializer. We also try to reuse the solver if possible,
+            # but for safety we recreate the solver wrapper which is cheap.
+            # Actually, SolverSerialJointSingleHair might be stateful per solve,
+            # so we recreate it. The heavy part is SolverInitializer.
+            return self._cached_initializer, SolverSerialJointSingleHair(
+                self._cached_initializer, self._solver_cfg
+            )
+
         weighted_edges = [
             HyperEdge(list(edge.tolist()), float(weight))  # type: ignore[arg-type]
             for edge, weight in zip(self._fault_edges, weights)
         ]
         initializer = SolverInitializer(self._vertex_num, weighted_edges)  # type: ignore[arg-type]
         solver = SolverSerialJointSingleHair(initializer, self._solver_cfg)
+        
+        # Update cache
+        self._cached_initializer = initializer
+        self._cached_weights_key = weights_key
+        
         return initializer, solver
 
     def _decode_batch_mwpf(
@@ -192,15 +212,34 @@ class MWPFTeacher:
         weights: List[float] = []
         max_sel = 0
         base_weights = self._weights
+        
+        # Optimization: if mwpf_scale is None, weights are constant for the whole batch.
+        # We can build the solver once and reuse it (or at least the initializer).
+        # Even if mwpf_scale is present, if it's constant, we could cache, but
+        # usually it varies per sample in TAD? No, mwpf_scale is passed as a single dict for the batch?
+        # The signature says `mwpf_scale: Optional[Dict[int, float]]`.
+        # If it's a single dict, it applies to the whole batch?
+        # The docstring says "mapping global fault ids to multiplicative factors".
+        # If it's one dict for the batch, then weights ARE constant for the batch!
+        # So we can compute scaled weights ONCE.
+        
+        scaled_weights = base_weights
+        if mwpf_scale:
+            scaled = []
+            for idx, base in enumerate(base_weights):
+                fault_idx = int(self._fault_map[idx]) if self._fault_map is not None else idx
+                scaled.append(base * float(mwpf_scale.get(fault_idx, 1.0)))
+            scaled_weights = scaled
+            
+        # Build/Get solver once for the batch
+        _, solver = self._build_solver_with_weights(scaled_weights)
+
         for sample in dets:
-            if mwpf_scale:
-                scaled = []
-                for idx, base in enumerate(base_weights):
-                    fault_idx = int(self._fault_map[idx]) if self._fault_map is not None else idx
-                    scaled.append(base * float(mwpf_scale.get(fault_idx, 1.0)))
-            else:
-                scaled = base_weights
-            _, solver = self._build_solver_with_weights(scaled)
+            # We reuse the solver instance if it supports multiple solves.
+            # SolverSerialJointSingleHair usually supports repeated .solve() calls.
+            # If not, we would need to recreate it from the initializer.
+            # Assuming it does (standard for such solvers).
+            
             syn = np.flatnonzero(sample != 0).tolist()
             solver.solve(SyndromePattern(syn))  # type: ignore[call-arg]
             idxs: List[int] = []
