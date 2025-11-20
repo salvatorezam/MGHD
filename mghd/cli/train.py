@@ -39,6 +39,9 @@ from mghd.tad import weighting as tad_weighting
 from mghd.tad import context as tad_context
 from mghd.codes.qpu_profile import load_qpu_profile
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 _TEACHER_POOL: ThreadPoolExecutor | None = None
 
@@ -470,6 +473,24 @@ def train_inprocess(ns) -> str:
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
 
+    # DDP Setup
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    is_distributed = False
+    
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        is_distributed = True
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            
+        dist.init_process_group(backend="nccl", init_method="env://")
+        print(f"Initialized DDP: rank {rank}/{world_size}, local_rank {local_rank}")
+
     # Handle sampler selection and environment variable
     sampler_choice = str(getattr(args, "sampler", "cudaq"))
     if getattr(args, "phenomenological", False):
@@ -580,7 +601,7 @@ def train_inprocess(ns) -> str:
     # Prefer CUDA when available; optionally require it via MGHD_REQUIRE_CUDA=1.
     require_cuda = os.getenv("MGHD_REQUIRE_CUDA", "").lower() in {"1", "true", "yes"}
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        device = torch.device(f"cuda:{local_rank}")
     elif require_cuda:
         raise RuntimeError(
             "CUDA GPU is required but not available (MGHD_REQUIRE_CUDA=1). "
@@ -603,6 +624,10 @@ def train_inprocess(ns) -> str:
         "edge_feat_dim": expected_edge_dim,
     }
     model = MGHDv2(profile=args.profile, **m_kwargs).to(device)
+    
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
@@ -791,9 +816,14 @@ def train_inprocess(ns) -> str:
             # Setup DataLoader for parallel generation
             workers = max(1, int(getattr(args, "workers", 4)))
             shots_target = int(getattr(args, "shots_per_epoch", args.batch))
+            
+            # Divide shots among ranks
+            if is_distributed:
+                shots_target = shots_target // world_size
+                
             shots_per_worker = (shots_target + workers - 1) // workers
             
-            dataset = OnlineSurfaceDataset(args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec, llr_overrides)
+            dataset = OnlineSurfaceDataset(args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec, llr_overrides, rank=rank)
             
             loader = DataLoader(
                 dataset,
@@ -916,7 +946,7 @@ def train_inprocess(ns) -> str:
                 n_items += batch_size
                 steps_done += 1
                 
-                if prog_stride and (steps_done % prog_stride == 0):
+                if prog_stride and (steps_done % prog_stride == 0) and rank == 0:
                     prog = {
                         "epoch": epoch,
                         "step": int(steps_done),
@@ -1048,52 +1078,61 @@ def train_inprocess(ns) -> str:
             bandit.update(ctx_vec, reward)
         prev_epoch_loss = avg
 
-        torch.save({"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
-        if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
-            best_loss = avg
-            torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt"
-            )
+        if rank == 0:
+            torch.save({"model": model.module.state_dict() if is_distributed else model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
+            if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
+                best_loss = avg
+                torch.save(
+                    {"model": model.module.state_dict() if is_distributed else model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt"
+                )
 
-        log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
-        if use_online:
-            log_obj["p"] = float(p_epoch if "p_epoch" in locals() else getattr(args, "p", 0.0))
-        # Print epoch summary and flush so users see it promptly
-        print(json.dumps(log_obj, separators=(",", ":")), flush=True)
+            log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
+            if use_online:
+                log_obj["p"] = float(p_epoch if "p_epoch" in locals() else getattr(args, "p", 0.0))
+            # Print epoch summary and flush so users see it promptly
+            print(json.dumps(log_obj, separators=(",", ":")), flush=True)
 
-        # Persist logs incrementally each epoch (JSONL + JSON snapshot)
-        try:
-            with (save_dir / "train_log.jsonl").open("a", encoding="utf-8") as f:
-                f.write(json.dumps(log_obj, separators=(",", ":")) + "\n")
-            (save_dir / "train_log.json").write_text(
-                json.dumps(history, indent=2), encoding="utf-8"
-            )
-        except Exception:
-            pass
+            # Persist logs incrementally each epoch (JSONL + JSON snapshot)
+            try:
+                with (save_dir / "train_log.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_obj, separators=(",", ":")) + "\n")
+                (save_dir / "train_log.json").write_text(
+                    json.dumps(history, indent=2), encoding="utf-8"
+                )
+            except Exception:
+                pass
 
         # Early stopping check
         patience = int(getattr(args, "early_stop_patience", 0))
         min_delta = float(getattr(args, "early_stop_min_delta", 0.0))
         if patience > 0:
+            # Broadcast best_loss to all ranks to ensure consistent stopping
+            if is_distributed:
+                best_loss_tensor = torch.tensor(best_loss, device=device)
+                dist.all_reduce(best_loss_tensor, op=dist.ReduceOp.MIN)
+                best_loss = best_loss_tensor.item()
+                
             if avg <= best_loss + 1e-12:
                 last_improve_epoch = epoch
             if (epoch - last_improve_epoch) >= patience:
-                print(
-                    json.dumps(
-                        {"early_stop": True, "epoch": epoch, "best_loss": best_loss},
-                        separators=(",", ":"),
+                if rank == 0:
+                    print(
+                        json.dumps(
+                            {"early_stop": True, "epoch": epoch, "best_loss": best_loss},
+                            separators=(",", ":"),
+                        )
                     )
-                )
                 break
 
     # Final snapshot (in case of early termination without last write)
-    try:
-        (save_dir / "train_log.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    if rank == 0:
+        try:
+            (save_dir / "train_log.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     # Optional teacher comparison report
-    if hasattr(args, "post_eval") and bool(getattr(args, "post_eval", False)):
+    if hasattr(args, "post_eval") and bool(getattr(args, "post_eval", False)) and rank == 0:
         try:
             import subprocess, sys as _sys, os as _os
 
@@ -1123,6 +1162,9 @@ def train_inprocess(ns) -> str:
             )
         except Exception:
             pass
+            
+    if is_distributed:
+        dist.destroy_process_group()
 
     return os.path.join(args.save, "best.pt")
 
@@ -1206,7 +1248,7 @@ class OnlineSurfaceDataset(IterableDataset):
     Iterable dataset for online surface code simulation.
     Generates crops on-the-fly using multiple workers.
     """
-    def __init__(self, args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec=None, llr_overrides=None):
+    def __init__(self, args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec=None, llr_overrides=None, rank=0):
         self.args = args
         self.p_epoch = p_epoch
         self.epoch = epoch
@@ -1214,6 +1256,7 @@ class OnlineSurfaceDataset(IterableDataset):
         self.teacher_mix = teacher_mix
         self.ctx_vec = ctx_vec
         self.llr_overrides = llr_overrides
+        self.rank = rank
         
         # Parse distance curriculum
         self.distances = [self.args.distance]
@@ -1231,7 +1274,8 @@ class OnlineSurfaceDataset(IterableDataset):
             worker_id = worker_info.id
         
         # Seed RNG for this worker
-        seed = self.args.seed + self.epoch * 1000 + worker_id
+        # Ensure distinct seeds across ranks and workers
+        seed = self.args.seed + self.epoch * 10000 + self.rank * 100 + worker_id
         rng = np.random.default_rng(seed)
         
         # Use global cache for teachers to persist across epochs in persistent workers
