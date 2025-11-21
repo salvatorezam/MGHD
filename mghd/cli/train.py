@@ -470,6 +470,12 @@ def train_inprocess(ns) -> str:
         default=0.0,
         help="Minimum loss improvement to reset patience",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from (loads model weights and sets start epoch)",
+    )
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
 
@@ -631,6 +637,56 @@ def train_inprocess(ns) -> str:
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
+    start_epoch = 1
+    if getattr(args, "resume", None):
+        ckpt_path = args.resume
+        if os.path.isfile(ckpt_path):
+            if rank == 0:
+                print(f"Resuming from checkpoint: {ckpt_path}")
+            # Map location to CPU first to avoid GPU OOM or device mismatch, then load_state_dict handles move
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            
+            # The saved state_dict is unwrapped (see save logic below).
+            # If current model is DDP, we load into model.module.
+            state_dict = checkpoint["model"]
+
+            # Check if g_proj needs initialization
+            if "g_proj.weight" in state_dict:
+                g_dim = state_dict["g_proj.weight"].shape[1]
+                if is_distributed:
+                    model.module.ensure_g_proj(g_dim, device)
+                else:
+                    model.ensure_g_proj(g_dim, device)
+                if rank == 0:
+                    print(f"Initialized g_proj with input dim {g_dim} from checkpoint.")
+
+            if is_distributed:
+                model.module.load_state_dict(state_dict)
+            else:
+                model.load_state_dict(state_dict)
+            
+            if "optimizer" in checkpoint:
+                try:
+                    opt.load_state_dict(checkpoint["optimizer"])
+                    if rank == 0:
+                        print("Loaded optimizer state.")
+                except Exception as e:
+                    if rank == 0:
+                        print(f"Failed to load optimizer state: {e}")
+
+            start_epoch = checkpoint.get("epoch", 0) + 1
+            
+            # Fast-forward scheduler if needed
+            if start_epoch > 1:
+                for _ in range(start_epoch - 1):
+                    sched.step()
+                    
+            if rank == 0:
+                print(f"Resumed model at epoch {start_epoch - 1}. Next epoch: {start_epoch}")
+        else:
+            if rank == 0:
+                print(f"Checkpoint not found at {ckpt_path}, starting from scratch.")
+
     loader = None
     use_online = bool(getattr(args, "online", False))
     if not use_online:
@@ -776,7 +832,7 @@ def train_inprocess(ns) -> str:
             p_list = [float(x) for x in str(args.p_curriculum).split(",") if x.strip()]
         except Exception:
             p_list = None
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0 = time.time()
         total_loss = 0.0
@@ -1079,12 +1135,20 @@ def train_inprocess(ns) -> str:
         prev_epoch_loss = avg
 
         if rank == 0:
-            torch.save({"model": model.module.state_dict() if is_distributed else model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
+            torch.save({
+                "model": model.module.state_dict() if is_distributed else model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "epoch": epoch,
+                "loss": avg
+            }, save_dir / "last.pt")
             if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
                 best_loss = avg
-                torch.save(
-                    {"model": model.module.state_dict() if is_distributed else model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt"
-                )
+                torch.save({
+                    "model": model.module.state_dict() if is_distributed else model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "epoch": epoch,
+                    "loss": avg
+                }, save_dir / "best.pt")
 
             log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
             if use_online:
