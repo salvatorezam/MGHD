@@ -942,10 +942,10 @@ def _ensure_array(array: np.ndarray | sp.csr_matrix) -> np.ndarray:
 class MGHDDecoderPublic:
     """Thin wrapper that keeps only the MGHD v2 inference surface."""
 
-    def __init__(self, ckpt_path: str, device: str = "cpu", *, profile: str = "S") -> None:
+    def __init__(self, ckpt_path: str, device: str = "cpu", *, profile: str = "S", node_feat_dim: int = 8) -> None:
         self.device = torch.device(device)
         state_dict = _load_state_dict(ckpt_path)
-        self.model = MGHDv2(profile=profile)
+        self.model = MGHDv2(profile=profile, node_feat_dim=node_feat_dim)
         self.model.load_state_dict(state_dict, strict=False)
         self.model.to(self.device).eval()
 
