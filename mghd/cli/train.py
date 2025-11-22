@@ -18,6 +18,7 @@ import random
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -451,6 +452,19 @@ def train_inprocess(ns) -> str:
         default=4,
         help="Number of data loading workers for online training",
     )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=8,
+        help="DataLoader prefetch factor (batches per worker). Increase if GPU idle waiting for data.",
+    )
+    parser.add_argument(
+        "--amp",
+        type=str,
+        default="bf16",
+        choices=["off", "fp16", "bf16", "auto"],
+        help="Mixed precision mode for speed: off/fp16/bf16/auto (default bf16 on H100)",
+    )
     # Early stopping
     parser.add_argument(
         "--distance-curriculum",
@@ -508,6 +522,17 @@ def train_inprocess(ns) -> str:
         os.environ["MGHD_SYNTHETIC"] = "1"
     elif sampler_choice == "cudaq":
         os.environ.pop("MGHD_SYNTHETIC", None)
+
+    # Auto-scale pad limits for large distances if not provided
+    if not hasattr(args, "N_max"):
+        d_param = int(getattr(args, "distance", 3))
+        # Base 512 is good for d<=15. For d=31, we need ~2000.
+        # We use a safe scaling: N_max ~ 3*d^2, E_max ~ 12*d^2
+        args.N_max = max(512, int(3.0 * d_param**2))
+        args.E_max = max(4096, int(12.0 * d_param**2))
+        args.S_max = max(512, int(2.0 * d_param**2))
+        if rank == 0:
+            print(f"Auto-scaled pad limits for d={d_param}: N_max={args.N_max}, E_max={args.E_max}")
 
     # Default structural hyperparameters (can be overridden via JSON/CLI namespace)
     defaults = {
@@ -615,6 +640,28 @@ def train_inprocess(ns) -> str:
         )
     else:
         device = torch.device("cpu")
+    # Mixed precision + TF32 tuning for H100 throughput
+    amp_mode = str(getattr(args, "amp", "bf16")).lower()
+    use_amp = False
+    amp_dtype = torch.float32
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if amp_mode != "off":
+            if amp_mode == "fp16":
+                amp_dtype = torch.float16
+            elif amp_mode == "auto":
+                bf16_ok = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+                amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+            else:
+                amp_dtype = torch.bfloat16
+            use_amp = amp_dtype != torch.float32
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+
+    def _autocast():
+        if device.type == "cuda":
+            return torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
+        return nullcontext()
     # Build model with optional hyperparameters from JSON/data contract
     m_kwargs = {
         "d_model": int(getattr(args, "d_model", 192)),
@@ -637,6 +684,20 @@ def train_inprocess(ns) -> str:
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
+    def _backward_and_step(loss: torch.Tensor):
+        """Handle AMP-aware backward/step with grad clipping."""
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+
     start_epoch = 1
     if getattr(args, "resume", None):
         ckpt_path = args.resume
@@ -644,7 +705,7 @@ def train_inprocess(ns) -> str:
             if rank == 0:
                 print(f"Resuming from checkpoint: {ckpt_path}")
             # Map location to CPU first to avoid GPU OOM or device mismatch, then load_state_dict handles move
-            checkpoint = torch.load(ckpt_path, map_location=device)
+            checkpoint = torch.load(ckpt_path, map_location='cpu')
             
             # The saved state_dict is unwrapped (see save logic below).
             # If current model is DDP, we load into model.module.
@@ -676,10 +737,9 @@ def train_inprocess(ns) -> str:
 
             start_epoch = checkpoint.get("epoch", 0) + 1
             
-            # Fast-forward scheduler if needed
+            # Align scheduler without stepping before first optimizer step
             if start_epoch > 1:
-                for _ in range(start_epoch - 1):
-                    sched.step()
+                sched.last_epoch = start_epoch - 1
                     
             if rank == 0:
                 print(f"Resumed model at epoch {start_epoch - 1}. Next epoch: {start_epoch}")
@@ -876,18 +936,21 @@ def train_inprocess(ns) -> str:
             # Divide shots among ranks
             if is_distributed:
                 shots_target = shots_target // world_size
-                
-            shots_per_worker = (shots_target + workers - 1) // workers
             
-            dataset = OnlineSurfaceDataset(args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec, llr_overrides, rank=rank)
+            # Pass per-rank shot budget; dataset will split this across workers to avoid duplication
+            dataset = OnlineSurfaceDataset(args, p_epoch, epoch, shots_target, teacher_mix, ctx_vec, llr_overrides, rank=rank)
+            
+            # In DDP mode, divide batch size across GPUs
+            effective_batch = args.batch // world_size if is_distributed else args.batch
             
             loader = DataLoader(
                 dataset,
-                batch_size=args.batch,
+                batch_size=effective_batch,
                 num_workers=workers,
                 collate_fn=collate_packed,
                 pin_memory=True if torch.cuda.is_available() else False,
                 persistent_workers=True if workers > 0 else False,
+                prefetch_factor=int(getattr(args, "prefetch_factor", 2)) if workers > 0 else None,
             )
             
             steps_done = 0
@@ -907,98 +970,95 @@ def train_inprocess(ns) -> str:
                 _validate_packed_contract(packed, expected_node_dim, expected_edge_dim)
                 packed = move_to(packed, device)
                 
-                logits, node_mask = model(packed=packed)
-                # logits: (B*N, 2), node_mask: (B*N,)
-                
-                # Reshape for structured losses
-                B = packed.x_nodes.shape[0]
-                N = packed.x_nodes.shape[1]
-                logits_reshaped = logits.view(B, N, 2)
-                node_mask_reshaped = node_mask.view(B, N)
-                node_type_reshaped = packed.node_type # (B, N)
-                
-                hard = 1.0
-                sample_weight = torch.tensor(
-                    hard, dtype=torch.float32, device=device
-                )
-                
-                loss_bce = bce_binary_head_loss(
-                    logits, # flattened
-                    node_mask, # flattened
-                    packed.node_type.view(-1),
-                    packed.y_bits.view(-1),
-                    sample_weight=sample_weight,
-                    label_smoothing=args.label_smoothing,
-                )
-                
-                loss_par = args.parity_lambda * parity_auxiliary_loss(
-                    logits_reshaped,
-                    node_mask_reshaped,
-                    node_type_reshaped,
-                    H_sub=packed.H_sub,
-                )
-                
-                loss_proj = torch.tensor(0.0, device=device)
-                if args.projection_aware:
-                    proj_loss_sum = 0.0
-                    for i in range(B):
-                        l = logits_reshaped[i]
-                        nm = node_mask_reshaped[i]
-                        nt = node_type_reshaped[i]
-                        yb = packed.y_bits[i]
-                        h = packed.H_sub[i] if isinstance(packed.H_sub, list) else packed.H_sub
-                        
-                        data_mask = (nt == 0) & nm
-                        
-                        side = "Z"
-                        if hasattr(packed.meta, "batch_metas"):
-                             side = getattr(packed.meta.batch_metas[i], "side", "Z")
-                        elif hasattr(packed.meta, "side"):
-                             side = packed.meta.side
-
-                        proj_bits = projection_aware_logits_to_bits(
-                            l,
-                            projector_kwargs={
-                                "H_sub": h,
-                                "side": side,
-                            },
-                            data_mask=data_mask,
-                        )
-                        with torch.no_grad():
-                            mask_data = data_mask.detach().cpu().numpy()
-                            target_full = (
-                                yb.detach()
-                                .cpu()
-                                .numpy()
-                                .clip(0, 1)
-                                .astype(np.uint8)
-                            )
-                            target_data = target_full[mask_data]
-                        proj_target = torch.from_numpy(target_data).to(device)
-                        proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(
-                            device
-                        )
-                        raw_bits = (
-                            torch.sigmoid(l[:, 1] - l[:, 0])[data_mask] > 0.5
-                        ).long()
-                        p_loss = 0.5 * F.l1_loss(
-                            proj_pred.float(), proj_target.float()
-                        ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
-                        proj_loss_sum += p_loss
-                    loss_proj = proj_loss_sum / B
+                with _autocast():
+                    logits, node_mask = model(packed=packed)
+                    # logits: (B*N, 2), node_mask: (B*N,)
                     
-                sample_loss = loss_bce + loss_par + 0.5 * loss_proj
+                    # Reshape for structured losses
+                    B = packed.x_nodes.shape[0]
+                    N = packed.x_nodes.shape[1]
+                    logits_reshaped = logits.view(B, N, 2)
+                    node_mask_reshaped = node_mask.view(B, N)
+                    node_type_reshaped = packed.node_type # (B, N)
+                    
+                    hard = 1.0
+                    sample_weight = torch.tensor(
+                        hard, dtype=torch.float32, device=device
+                    )
+                    
+                    loss_bce = bce_binary_head_loss(
+                        logits, # flattened
+                        node_mask, # flattened
+                        packed.node_type.view(-1),
+                        packed.y_bits.view(-1),
+                        sample_weight=sample_weight,
+                        label_smoothing=args.label_smoothing,
+                    )
+                    
+                    loss_par = args.parity_lambda * parity_auxiliary_loss(
+                        logits_reshaped,
+                        node_mask_reshaped,
+                        node_type_reshaped,
+                        H_sub=packed.H_sub,
+                    )
+                    
+                    loss_proj = torch.tensor(0.0, device=device)
+                    if args.projection_aware:
+                        proj_loss_sum = 0.0
+                        for i in range(B):
+                            l = logits_reshaped[i]
+                            nm = node_mask_reshaped[i]
+                            nt = node_type_reshaped[i]
+                            yb = packed.y_bits[i]
+                            h = packed.H_sub[i] if isinstance(packed.H_sub, list) else packed.H_sub
+                            
+                            data_mask = (nt == 0) & nm
+                            
+                            side = "Z"
+                            if hasattr(packed.meta, "batch_metas"):
+                                 side = getattr(packed.meta.batch_metas[i], "side", "Z")
+                            elif hasattr(packed.meta, "side"):
+                                 side = packed.meta.side
+
+                            proj_bits = projection_aware_logits_to_bits(
+                                l,
+                                projector_kwargs={
+                                    "H_sub": h,
+                                    "side": side,
+                                },
+                                data_mask=data_mask,
+                            )
+                            with torch.no_grad():
+                                mask_data = data_mask.detach().cpu().numpy()
+                                target_full = (
+                                    yb.detach()
+                                    .cpu()
+                                    .numpy()
+                                    .clip(0, 1)
+                                    .astype(np.uint8)
+                                )
+                                target_data = target_full[mask_data]
+                            proj_target = torch.from_numpy(target_data).to(device)
+                            proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(
+                                device
+                            )
+                            raw_bits = (
+                                torch.sigmoid(l[:, 1] - l[:, 0])[data_mask] > 0.5
+                            ).long()
+                            p_loss = 0.5 * F.l1_loss(
+                                proj_pred.float(), proj_target.float()
+                            ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+                            proj_loss_sum += p_loss
+                        loss_proj = proj_loss_sum / B
+                        
+                    sample_loss = loss_bce + loss_par + 0.5 * loss_proj
+                    
+                    batch_loss = sample_loss
                 
-                batch_loss = sample_loss
-                batch_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=float(args.grad_clip)
-                )
-                opt.step()
-                opt.zero_grad(set_to_none=True)
+                _backward_and_step(batch_loss)
                 
                 batch_size = B
-                total_loss += batch_loss.item() * batch_size
+                total_loss += batch_loss.detach().item() * batch_size
                 n_items += batch_size
                 steps_done += 1
                 
@@ -1047,82 +1107,80 @@ def train_inprocess(ns) -> str:
                     std = float(args.noise_injection)
                     for packed in moved:
                         packed.x_nodes = packed.x_nodes + torch.randn_like(packed.x_nodes) * std
-                opt.zero_grad(set_to_none=True)
+                
+                batch_loss = torch.zeros((), device=device)
+                for packed, teach in zip(moved, teacher_outs):
+                    with _autocast():
+                        logits, node_mask = model(packed=packed)
+                        logits = logits.squeeze(0)
+                        node_mask = node_mask.squeeze(0)
 
-            batch_loss = torch.zeros((), device=device)
-            for packed, teach in zip(moved, teacher_outs):
-                logits, node_mask = model(packed=packed)
-                logits = logits.squeeze(0)
-                node_mask = node_mask.squeeze(0)
-
-                hard = (0.5 if teach.get("valid", True) else 1.5) + (
-                    0.5 if teach.get("matched_local_ml", False) else 1.0
-                )
-                sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
-
-                loss_bce = bce_binary_head_loss(
-                    logits,
-                    node_mask,
-                    packed.node_type,
-                    packed.y_bits,
-                    sample_weight=sample_weight,
-                    label_smoothing=args.label_smoothing,
-                )
-
-                loss_par = args.parity_lambda * parity_auxiliary_loss(
-                    logits,
-                    node_mask,
-                    packed.node_type,
-                    H_sub=packed.H_sub,
-                )
-
-                loss_proj = torch.tensor(0.0, device=device)
-                if args.projection_aware:
-                    data_mask = (packed.node_type == 0) & node_mask
-                    proj_bits = projection_aware_logits_to_bits(
-                        logits,
-                        projector_kwargs={
-                            "H_sub": packed.H_sub,
-                            "side": getattr(packed.meta, "side", "Z"),
-                        },
-                        data_mask=data_mask,
-                    )
-                    with torch.no_grad():
-                        mask_data = data_mask.detach().cpu().numpy()
-                        target_full = (
-                            packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
+                        hard = (0.5 if teach.get("valid", True) else 1.5) + (
+                            0.5 if teach.get("matched_local_ml", False) else 1.0
                         )
-                        target_data = target_full[mask_data]
+                        sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
 
-                    proj_target = torch.from_numpy(target_data).to(device)
-                    proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
+                        loss_bce = bce_binary_head_loss(
+                            logits,
+                            node_mask,
+                            packed.node_type,
+                            packed.y_bits,
+                            sample_weight=sample_weight,
+                            label_smoothing=args.label_smoothing,
+                        )
 
-                    raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
-                    loss_proj = 0.5 * F.l1_loss(
-                        proj_pred.float(), proj_target.float()
-                    ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+                        loss_par = args.parity_lambda * parity_auxiliary_loss(
+                            logits,
+                            node_mask,
+                            packed.node_type,
+                            H_sub=packed.H_sub,
+                        )
 
-                sample_loss = loss_bce + loss_par + 0.5 * loss_proj
-                batch_loss = batch_loss + sample_loss
+                        loss_proj = torch.tensor(0.0, device=device)
+                        if args.projection_aware:
+                            data_mask = (packed.node_type == 0) & node_mask
+                            proj_bits = projection_aware_logits_to_bits(
+                                logits,
+                                projector_kwargs={
+                                    "H_sub": packed.H_sub,
+                                    "side": getattr(packed.meta, "side", "Z"),
+                                },
+                                data_mask=data_mask,
+                            )
+                            with torch.no_grad():
+                                mask_data = data_mask.detach().cpu().numpy()
+                                target_full = (
+                                    packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
+                                )
+                                target_data = target_full[mask_data]
 
-            batch_size = len(moved)
-            batch_loss = batch_loss / batch_size
-            batch_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
-            opt.step()
+                            proj_target = torch.from_numpy(target_data).to(device)
+                            proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
 
-            total_loss += batch_loss.item() * batch_size
-            n_items += batch_size
-            steps_done += 1
-            if prog_stride and (steps_done % prog_stride == 0):
-                prog = {
-                    "epoch": epoch,
-                    "step": int(steps_done),
-                    "steps": int(steps_total),
-                    "avg": float(total_loss / max(n_items, 1)),
-                    "secs": float(time.time() - t0),
-                }
-                print(json.dumps(prog, separators=(",", ":")), flush=True)
+                            raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
+                            loss_proj = 0.5 * F.l1_loss(
+                                proj_pred.float(), proj_target.float()
+                            ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+
+                        sample_loss = loss_bce + loss_par + 0.5 * loss_proj
+                        batch_loss = batch_loss + sample_loss
+
+                batch_size = len(moved)
+                batch_loss = batch_loss / batch_size
+                _backward_and_step(batch_loss)
+
+                total_loss += batch_loss.detach().item() * batch_size
+                n_items += batch_size
+                steps_done += 1
+                if prog_stride and (steps_done % prog_stride == 0):
+                    prog = {
+                        "epoch": epoch,
+                        "step": int(steps_done),
+                        "steps": int(steps_total),
+                        "avg": float(total_loss / max(n_items, 1)),
+                        "secs": float(time.time() - t0),
+                    }
+                    print(json.dumps(prog, separators=(",", ":")), flush=True)
 
         sched.step()
         dt = time.time() - t0
@@ -1312,11 +1370,12 @@ class OnlineSurfaceDataset(IterableDataset):
     Iterable dataset for online surface code simulation.
     Generates crops on-the-fly using multiple workers.
     """
-    def __init__(self, args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec=None, llr_overrides=None, rank=0):
+    def __init__(self, args, p_epoch, epoch, shots_total, teacher_mix, ctx_vec=None, llr_overrides=None, rank=0):
         self.args = args
         self.p_epoch = p_epoch
         self.epoch = epoch
-        self.shots_to_do = shots_per_worker
+        # shots_total refers to the per-rank budget; workers will partition this in __iter__
+        self.shots_to_do = shots_total
         self.teacher_mix = teacher_mix
         self.ctx_vec = ctx_vec
         self.llr_overrides = llr_overrides
@@ -1334,8 +1393,17 @@ class OnlineSurfaceDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             worker_id = 0
+            num_workers = 1
         else:
             worker_id = worker_info.id
+            num_workers = max(1, worker_info.num_workers)
+        
+        # Split the per-rank shot budget across workers to avoid duplicating work
+        base = self.shots_to_do // num_workers
+        remainder = self.shots_to_do % num_workers
+        shots_for_this_worker = base + (1 if worker_id < remainder else 0)
+        if shots_for_this_worker <= 0:
+            return
         
         # Seed RNG for this worker
         # Ensure distinct seeds across ranks and workers
@@ -1346,7 +1414,7 @@ class OnlineSurfaceDataset(IterableDataset):
         global _WORKER_TEACHERS_CACHE
         
         shots_done = 0
-        while shots_done < self.shots_to_do:
+        while shots_done < shots_for_this_worker:
             # Pick a distance for this shot
             d = int(rng.choice(self.distances))
             
@@ -1581,5 +1649,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
