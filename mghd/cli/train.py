@@ -907,8 +907,6 @@ def train_inprocess(ns) -> str:
                 p_epoch = float(getattr(args, "p", 0.005))
             # Teacher setup per epoch
             family = args.family
-            if family != "surface":
-                raise NotImplementedError("Online training currently supports family='surface'")
             # Build code object
             from mghd.codes.registry import get_code
 

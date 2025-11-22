@@ -12,14 +12,17 @@ import numpy as np
 import scipy.sparse as sp
 from pathlib import Path
 from collections import defaultdict
+import matplotlib.pyplot as plt
 
 from mghd.core.core import MGHDDecoderPublic
 from mghd.decoders.lsd.clustered import MGHDPrimaryClustered
 from mghd.samplers.stim_sampler import StimSampler
+from mghd.samplers.cudaq_sampler import CudaQSampler
 from mghd.codes.registry import get_code
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.utils.metrics import logical_error_rate
+from mghd.utils.graphlike import is_graphlike
 
 def align_preds(preds, obs_true):
     """Align predictions with ground truth observables."""
@@ -76,17 +79,44 @@ def evaluate(args):
         
         # MWPM
         mwpm_ctx = MWPMatchingContext()
+        mwpm_enabled = True
         
         # LSD
         lsd = LSDTeacher(Hx_dense, Hz_dense)
         
         for p in p_values:
             print(f"  Testing p={p}...")
-            sampler = StimSampler(rounds=d, dep=p) # rounds=d for phenomenological/circuit
+            if args.sampler == "stim":
+                sampler = StimSampler(rounds=d, dep=p) # rounds=d for phenomenological/circuit
+            elif args.sampler == "cudaq":
+                # CudaQSampler expects phys_p in profile_kwargs
+                sampler = CudaQSampler(device_profile="garnet", profile_kwargs={"phys_p": p, "rounds": d})
+            else:
+                raise ValueError(f"Unknown sampler: {args.sampler}")
             
+            # Setup Pymatching for Surface Code (Stim-based)
+            mwpm_stim_matcher = None
+            if args.family == "surface":
+                try:
+                    import stim
+                    import pymatching
+                    # Re-generate circuit to match StimSampler's configuration
+                    circuit = stim.Circuit.generated(
+                        "surface_code:rotated_memory_x",
+                        distance=d,
+                        rounds=d,
+                        after_clifford_depolarization=p,
+                    )
+                    dem = circuit.detector_error_model(decompose_errors=True)
+                    mwpm_stim_matcher = pymatching.Matching.from_detector_error_model(dem)
+                except ImportError:
+                    print("  Stim/Pymatching not available for optimized MWPM.")
+                except Exception as e:
+                    print(f"  Failed to setup Stim MWPM: {e}")
+
             total_shots = 0
             failures_mghd = 0
-            failures_mwpm = 0
+            failures_mwpm = 0 if mwpm_enabled else None
             failures_lsd = 0
             
             # Batched evaluation
@@ -126,24 +156,32 @@ def evaluate(args):
                 failures_mghd += ler_res_mghd.ler_mean * args.batch_size
                 
                 # --- MWPM Decoding ---
-                preds_mwpm = []
-                for i in range(args.batch_size):
-                    # Z errors
-                    ez_pm, _ = mwpm_ctx.decode(Hx_dense, sx[i], "Z")
-                    # X errors
-                    ex_pm, _ = mwpm_ctx.decode(Hz_dense, sz[i], "X")
-                    obs_pred = code.data_to_observables(ex_pm, ez_pm)
-                    preds_mwpm.append(obs_pred)
-                
-                preds_mwpm = np.array(preds_mwpm, dtype=np.uint8)
-                preds_mwpm = align_preds(preds_mwpm, obs_true)
-                
-                ler_res_mwpm = logical_error_rate(obs_true, preds_mwpm)
-                if ler_res_mwpm.ler_mean is None:
-                    print(f"MWPM LER Error: {ler_res_mwpm.notes}")
-                    print(f"obs_true shape: {obs_true.shape}, preds_mwpm shape: {preds_mwpm.shape}")
-                    sys.exit(1)
-                failures_mwpm += ler_res_mwpm.ler_mean * args.batch_size
+                if mwpm_stim_matcher is not None:
+                    # Use Stim-based matching (fast and correct for surface code)
+                    preds_mwpm = mwpm_stim_matcher.decode_batch(batch.dets)
+                    # Align preds if necessary (usually Stim DEM obs match Stim sampler obs)
+                    preds_mwpm = align_preds(preds_mwpm, obs_true)
+                    
+                    ler_res_mwpm = logical_error_rate(obs_true, preds_mwpm)
+                    if ler_res_mwpm.ler_mean is None:
+                        print(f"MWPM LER Error: {ler_res_mwpm.notes}")
+                        sys.exit(1)
+                    failures_mwpm += ler_res_mwpm.ler_mean * args.batch_size
+                elif mwpm_enabled and mwpm_ctx is not None:
+                    preds_mwpm = []
+                    for i in range(args.batch_size):
+                        ez_pm, _ = mwpm_ctx.decode(Hx_dense, sx[i], "Z")
+                        ex_pm, _ = mwpm_ctx.decode(Hz_dense, sz[i], "X")
+                        obs_pred = code.data_to_observables(ex_pm, ez_pm)
+                        preds_mwpm.append(obs_pred)
+                    preds_mwpm = np.array(preds_mwpm, dtype=np.uint8)
+                    preds_mwpm = align_preds(preds_mwpm, obs_true)
+                    ler_res_mwpm = logical_error_rate(obs_true, preds_mwpm)
+                    if ler_res_mwpm.ler_mean is None:
+                        print(f"MWPM LER Error: {ler_res_mwpm.notes}")
+                        print(f"obs_true shape: {obs_true.shape}, preds_mwpm shape: {preds_mwpm.shape}")
+                        sys.exit(1)
+                    failures_mwpm += ler_res_mwpm.ler_mean * args.batch_size
                 
                 # --- LSD Decoding ---
                 ex_lsd, ez_lsd = lsd.decode_batch_xz(sx, sz)
@@ -162,16 +200,28 @@ def evaluate(args):
                 failures_lsd += ler_res_lsd.ler_mean * args.batch_size
                 
                 total_shots += args.batch_size
-                print(f"    Batch {b+1}/{n_batches}: MGHD={failures_mghd/total_shots:.4f} MWPM={failures_mwpm/total_shots:.4f} LSD={failures_lsd/total_shots:.4f}", end="\r")
+                
+                mwpm_ratio = None if failures_mwpm is None else failures_mwpm / total_shots
+                mwpm_str = f"{mwpm_ratio:.4f}" if mwpm_ratio is not None else "NA"
+                print(
+                    f"    Batch {b+1}/{n_batches}: MGHD={failures_mghd/total_shots:.4f} "
+                    f"MWPM={mwpm_str} LSD={failures_lsd/total_shots:.4f}",
+                    end="\r",
+                )
             
-            print(f"    Final: MGHD={failures_mghd/total_shots:.4f} MWPM={failures_mwpm/total_shots:.4f} LSD={failures_lsd/total_shots:.4f}")
+            mwpm_final = None if failures_mwpm is None else failures_mwpm / total_shots
+            mwpm_final_str = f"{mwpm_final:.4f}" if mwpm_final is not None else "NA"
+            print(
+                f"    Final: MGHD={failures_mghd/total_shots:.4f} "
+                f"MWPM={mwpm_final_str} LSD={failures_lsd/total_shots:.4f}"
+            )
             
             results.append({
                 "distance": d,
                 "p": p,
                 "shots": total_shots,
                 "ler_mghd": failures_mghd / total_shots,
-                "ler_mwpm": failures_mwpm / total_shots,
+                "ler_mwpm": mwpm_final,
                 "ler_lsd": failures_lsd / total_shots
             })
             
@@ -179,6 +229,69 @@ def evaluate(args):
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved to {args.output}")
+    
+    # Plot results
+    plot_results(results, args.output)
+    
+    # Plot results
+    plot_results(results, args.output)
+
+def plot_results(results, output_path):
+    """Generate and save a clean LER plot from results."""
+    # Organize data by distance
+    data_by_d = defaultdict(lambda: {"p": [], "mghd": [], "mwpm": [], "lsd": []})
+    
+    for res in results:
+        d = res["distance"]
+        data_by_d[d]["p"].append(res["p"])
+        data_by_d[d]["mghd"].append(res["ler_mghd"])
+        if res["ler_mwpm"] is not None:
+            data_by_d[d]["mwpm"].append(res["ler_mwpm"])
+        if res["ler_lsd"] is not None:
+            data_by_d[d]["lsd"].append(res["ler_lsd"])
+            
+    # Use a professional style
+    plt.style.use('seaborn-v0_8-paper')
+    plt.figure(figsize=(10, 8))
+    
+    # Use a qualitative colormap
+    cmap = plt.get_cmap('tab10')
+    colors = [cmap(i) for i in np.linspace(0, 1, len(data_by_d))]
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*']
+    
+    for i, (d, data) in enumerate(sorted(data_by_d.items())):
+        p_vals = np.array(data["p"])
+        color = colors[i % len(colors)]
+        marker = markers[i % len(markers)]
+        
+        # Sort by p
+        idx = np.argsort(p_vals)
+        p_vals = p_vals[idx]
+        
+        # MGHD
+        mghd_vals = np.array(data["mghd"])[idx]
+        plt.loglog(p_vals, mghd_vals, marker=marker, linestyle='-', color=color, label=f'MGHD d={d}', linewidth=2, markersize=8)
+        
+        # MWPM
+        if data["mwpm"]:
+            mwpm_vals = np.array(data["mwpm"])[idx]
+            plt.loglog(p_vals, mwpm_vals, marker=marker, linestyle='--', color=color, alpha=0.6, label=f'MWPM d={d}', linewidth=1.5, markersize=6)
+            
+        # LSD
+        if data["lsd"]:
+            lsd_vals = np.array(data["lsd"])[idx]
+            plt.loglog(p_vals, lsd_vals, marker=marker, linestyle=':', color=color, alpha=0.4, label=f'LSD d={d}', linewidth=1.5, markersize=6)
+
+    plt.grid(True, which="major", ls="-", alpha=0.5)
+    plt.grid(True, which="minor", ls=":", alpha=0.2)
+    plt.xlabel("Physical Error Rate (p)", fontsize=12)
+    plt.ylabel("Logical Error Rate (LER)", fontsize=12)
+    plt.title("Logical Error Rate vs Physical Error Rate", fontsize=14)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    
+    plot_file = str(Path(output_path).with_suffix('.png'))
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    print(f"Plot saved to {plot_file}")
 
 def _resolve_syndromes(code_obj, dets):
     """Helper to map detectors to syndromes (copied from teacher_eval.py)"""
@@ -211,6 +324,7 @@ if __name__ == "__main__":
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--profile", default="S")
     parser.add_argument("--node-feat-dim", type=int, default=8)
+    parser.add_argument("--sampler", default="stim", choices=["stim", "cudaq"], help="Sampler to use (stim or cudaq)")
     
     args = parser.parse_args()
     evaluate(args)
