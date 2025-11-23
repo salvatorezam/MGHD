@@ -29,9 +29,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Iterable
+import multiprocessing as mp
 
 import numpy as np
 from relay_bp.stim.noise import insert_uniform_academic_circuit_noise
@@ -104,6 +104,46 @@ def _pack_shot(
     return packed
 
 
+# Multiprocessing helpers
+_H = None
+_p = None
+_d = None
+_n_errors = None
+_priors_sum = None
+_N_max = None
+_E_max = None
+_S_max = None
+
+
+def _init_worker(H, p, d, n_errors, priors_sum, N_max, E_max, S_max):
+    global _H, _p, _d, _n_errors, _priors_sum, _N_max, _E_max, _S_max
+    _H = H
+    _p = p
+    _d = d
+    _n_errors = n_errors
+    _priors_sum = priors_sum
+    _N_max = N_max
+    _E_max = E_max
+    _S_max = S_max
+
+
+def _pack_shot_worker(args):
+    dets_row, err_row, seed = args
+    return _pack_shot(
+        _H,
+        dets_row,
+        err_row,
+        p=_p,
+        seed=seed,
+        d=_d,
+        n_errors=_n_errors,
+        priors_sum=_priors_sum,
+        N_max=_N_max,
+        E_max=_E_max,
+        S_max=_S_max,
+    )
+
+
 def _load_base_circuit(relay_tests_path: Path, distance: int) -> stim.Circuit:
     """Load a gross Z-basis circuit from testdata, ignoring baked error_rate."""
     get_test_circuit, filter_detectors_by_basis = _import_testdata(relay_tests_path)
@@ -137,8 +177,10 @@ def generate_for_p(
     p: float,
     shots: int,
     distance: int = 12,
-) -> tuple[np.ndarray, list[object], dict]:
-    """Generate packed crops for a single p."""
+    shard_size: int = 5000,
+    workers: int = 1,
+    ) -> tuple[np.ndarray, list[object], dict]:
+    """Generate packed crops for a single p (sharded, optional multiprocessing)."""
     base = _load_base_circuit(relay_tests_path, distance)
     noisy = insert_uniform_academic_circuit_noise(base.without_noise(), p)
 
@@ -149,24 +191,39 @@ def generate_for_p(
     priors_sum = float(dm.priors.sum())
 
     sampler = dem.compile_sampler()
-    dets, obs, err = sampler.sample(shots=shots, return_errors=True, bit_packed=False)
 
-    crops = []
+    # Shard generation to keep memory bounded
+    shards = []
     rng = np.random.default_rng(1234)
-    for b in range(shots):
-        seed = int(rng.integers(0, 2**31 - 1))
-        crops.append(
-            _pack_shot(
-                H,
-                dets[b],
-                err[b],
-                p=p,
-                seed=seed,
-                d=distance,
-                n_errors=n_errors,
-                priors_sum=priors_sum,
-            )
-        )
+    idx = 0
+    while idx < shots:
+        this_shots = min(shard_size, shots - idx)
+        dets, obs, err = sampler.sample(shots=this_shots, return_errors=True, bit_packed=False)
+        seeds = [int(rng.integers(0, 2**31 - 1)) for _ in range(this_shots)]
+
+        if workers > 1:
+            with mp.Pool(
+                processes=workers,
+                initializer=_init_worker,
+                initargs=(H, p, distance, n_errors, priors_sum, 4096, 20000, 4096),
+            ) as pool:
+                packed = pool.map(_pack_shot_worker, zip(dets, err, seeds))
+        else:
+            packed = [
+                _pack_shot(
+                    H,
+                    dets[b],
+                    err[b],
+                    p=p,
+                    seed=seeds[b],
+                    d=distance,
+                    n_errors=n_errors,
+                    priors_sum=priors_sum,
+                )
+                for b in range(this_shots)
+            ]
+        shards.append(np.array(packed, dtype=object))
+        idx += this_shots
 
     meta = {
         "p": p,
@@ -176,12 +233,13 @@ def generate_for_p(
         "shots": shots,
         "priors_sum": priors_sum,
     }
-    return np.array(crops, dtype=object), meta
+    return shards, meta
 
 
-def save_shard(out_dir: Path, p: float, packed_crops: np.ndarray, meta: dict):
+def save_shard(out_dir: Path, p: float, packed_crops: np.ndarray, meta: dict, part: int | None = None):
     out_dir.mkdir(parents=True, exist_ok=True)
-    shard_path = out_dir / f"gross_d12_p{p:.6f}.npz"
+    suffix = "" if part is None else f"_part{part:02d}"
+    shard_path = out_dir / f"gross_d12_p{p:.6f}{suffix}.npz"
     np.savez(shard_path, packed=packed_crops)
     return shard_path, meta
 
@@ -202,6 +260,8 @@ def main():
         default="/u/home/kulp/MGHD-data/external-projects/relay-main/tests",
         help="Path to relay-main/tests (contains testdata/ with circuits)",
     )
+    parser.add_argument("--workers", type=int, default=1, help="Packing workers (CPU)")
+    parser.add_argument("--shard-size", type=int, default=5000, help="Shots per shard to limit memory")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -211,10 +271,17 @@ def main():
     manifest = []
     for p in p_vals:
         print(f"Generating p={p} shots={args.shots} ...", flush=True)
-        packed, meta = generate_for_p(relay_tests_path, p, args.shots)
-        shard_path, meta = save_shard(out_dir, p, packed, meta)
-        manifest.append({"p": p, "path": shard_path.name, **meta})
-        print(f"  -> {shard_path}")
+        shards, meta = generate_for_p(
+            relay_tests_path,
+            p,
+            args.shots,
+            shard_size=args.shard_size,
+            workers=max(1, args.workers),
+        )
+        for i, arr in enumerate(shards):
+            shard_path, meta = save_shard(out_dir, p, arr, meta, part=i if len(shards) > 1 else None)
+            manifest.append({"p": p, "path": shard_path.name, "part": i, **meta})
+            print(f"  -> {shard_path}")
 
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
