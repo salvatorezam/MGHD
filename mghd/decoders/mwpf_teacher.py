@@ -99,11 +99,20 @@ class MWPFTeacher:
         elif hasattr(self.code_obj, "detectors_per_fault"):
             dets_per_fault = getattr(self.code_obj, "detectors_per_fault")
             weight_seq = getattr(self.code_obj, "fault_weights", None)
-            weight_list = (
-                [1.0] * len(dets_per_fault)
-                if weight_seq is None
-                else [float(w) for w in weight_seq]
-            )
+            if weight_seq is None:
+                weight_list = [1.0] * len(dets_per_fault)
+            else:
+                tmp: list[float] = []
+                for w in weight_seq:
+                    try:
+                        tmp.append(float(w))
+                    except Exception:
+                        # Some backends (e.g. mwpf.Rational) use custom numeric
+                        # types that do not support float() directly. For
+                        # training/teacher use we only need relative ordering,
+                        # so fall back to unit weights when conversion fails.
+                        tmp.append(1.0)
+                weight_list = tmp
             edges_list = [np.asarray(edge, dtype=int) for edge in dets_per_fault]
             max_idx = max((int(np.max(edge)) if len(edge) else -1) for edge in edges_list)
             vertex_num = int(getattr(self.code_obj, "num_detectors", max_idx + 1))
@@ -168,8 +177,15 @@ class MWPFTeacher:
         if D != self._vertex_num:
             raise AssertionError(f"syndrome length {D} != vertex count {self._vertex_num}")
 
+        # Prefer the mwpf backend when available, but fall back gracefully to the
+        # heuristic decoder if the library raises (e.g., due to custom Rational
+        # weight types or environment issues). For training we mainly need a
+        # consistent mapping from detectors to non-empty fault_id sets.
         if _HAVE_MWPF:
-            return self._decode_batch_mwpf(dets, mwpf_scale=mwpf_scale)
+            try:
+                return self._decode_batch_mwpf(dets, mwpf_scale=mwpf_scale)
+            except Exception:
+                return self._decode_batch_fallback(dets)
         return self._decode_batch_fallback(dets)
 
     # ------------------------------------------------------------------

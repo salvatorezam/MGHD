@@ -36,6 +36,9 @@ def cudaq_sample_surface_wrapper(
     bitpack: bool = False,
     surface_layout: str = "planar",
     profile_json: str | None = None,
+    *,
+    phys_p: float | None = None,
+    noise_scale: float | None = None,
 ) -> np.ndarray:
     """Sample one CUDA-Q surface-code round with circuit-level noise.
 
@@ -71,6 +74,8 @@ def cudaq_sample_surface_wrapper(
         rng=rng,
         bitpack=bitpack,
         surface_layout=surface_layout,
+        phys_p=phys_p,
+        noise_scale=noise_scale,
         profile_json=profile_json,
     )
     expected_x = len(layout.get("ancilla_x", []))
