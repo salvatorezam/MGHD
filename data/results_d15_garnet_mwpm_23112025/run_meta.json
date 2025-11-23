@@ -1,0 +1,23 @@
+{
+  "family": "surface",
+  "distance": 15,
+  "online": true,
+  "p": 0.005,
+  "p_curriculum": [
+    0.011,
+    0.009,
+    0.007,
+    0.005,
+    0.003,
+    0.001
+  ],
+  "epochs_per_p": 20,
+  "teacher_mix": "mwpm=1.0",
+  "qpu_profile": "/u/home/kulp/MGHD/mghd/qpu/profiles/iqm_garnet_example.json",
+  "context_source": "none",
+  "erasure_frac": 0.05,
+  "shots_per_epoch": 32768,
+  "epochs": 200,
+  "batch": 1152,
+  "seed": 42
+}
