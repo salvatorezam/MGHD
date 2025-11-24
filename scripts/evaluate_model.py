@@ -21,6 +21,7 @@ from mghd.core.core import MGHDDecoderPublic
 from mghd.decoders.lsd.clustered import MGHDPrimaryClustered
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
+from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.samplers.cudaq_sampler import CudaQSampler
 from mghd.samplers.stim_sampler import StimSampler
 from mghd.utils.graphlike import is_graphlike
@@ -113,6 +114,13 @@ def evaluate(args):
         
         # LSD
         lsd = LSDTeacher(Hx_dense, Hz_dense)
+
+        # MWPF (hypergraph) — optional; may fall back internally if mwpf not available
+        mwpf_teacher = None
+        try:
+            mwpf_teacher = MWPFTeacher(code)
+        except Exception as exc:
+            print(f"  MWPFTeacher unavailable for d={d}: {exc}")
         
         for p in p_values:
             # Check if already computed
@@ -159,6 +167,7 @@ def evaluate(args):
             failures_mghd = 0.0
             failures_mwpm = 0.0 if mwpm_enabled else None
             failures_lsd = 0.0
+            failures_mwpf = 0.0 if mwpf_teacher is not None else None
             
             # Batched evaluation (ceil division so we always process >0 when shots>0)
             n_batches = (args.shots + args.batch_size - 1) // args.batch_size
@@ -244,22 +253,60 @@ def evaluate(args):
                     print(f"obs_true shape: {obs_true.shape}, preds_lsd shape: {preds_lsd.shape}")
                     sys.exit(1)
                 failures_lsd += float(ler_res_lsd.ler_mean) * this_batch
+
+                # --- MWPF Decoding (approximate ex/ez from fault_ids) ---
+                if mwpf_teacher is not None:
+                    try:
+                        out_mwpf = mwpf_teacher.decode_batch(batch.dets)
+                        fault_ids = np.asarray(out_mwpf.get("fault_ids"), dtype=np.int32)
+                        if fault_ids.ndim == 2:
+                            B = fault_ids.shape[0]
+                            n = Hx_dense.shape[1]
+                            ex_pf = np.zeros((B, n), dtype=np.uint8)
+                            ez_pf = np.zeros((B, n), dtype=np.uint8)
+                            for bi in range(B):
+                                fids = fault_ids[bi]
+                                fids = fids[fids >= 0]
+                                if fids.size:
+                                    # Interpret each fault id as a data-qubit index; flip both X and Z.
+                                    ex_pf[bi, fids] ^= 1
+                                    ez_pf[bi, fids] ^= 1
+
+                            preds_mwpf = []
+                            for i in range(this_batch):
+                                obs_pred = code.data_to_observables(ex_pf[i], ez_pf[i])
+                                preds_mwpf.append(obs_pred)
+                            preds_mwpf = np.array(preds_mwpf, dtype=np.uint8)
+                            preds_mwpf = align_preds(preds_mwpf, obs_true)
+
+                            ler_res_mwpf = logical_error_rate(obs_true, preds_mwpf)
+                            if ler_res_mwpf.ler_mean is None:
+                                print(f"MWPF LER Error: {ler_res_mwpf.notes}")
+                                sys.exit(1)
+                            failures_mwpf += float(ler_res_mwpf.ler_mean) * this_batch
+                    except Exception as exc:
+                        print(f"  MWPF decode failed at p={p}, d={d}: {exc}")
+                        mwpf_teacher = None
                 
                 total_shots += this_batch
                 
                 mwpm_ratio = None if failures_mwpm is None or total_shots == 0 else failures_mwpm / total_shots
                 mwpm_str = f"{mwpm_ratio:.10f}" if mwpm_ratio is not None else "NA"
+                mwpf_ratio = None if failures_mwpf is None or total_shots == 0 else failures_mwpf / total_shots
+                mwpf_str = f"{mwpf_ratio:.10f}" if mwpf_ratio is not None else "NA"
                 print(
                     f"    Batch {b+1}/{n_batches}: MGHD={failures_mghd/total_shots:.10f} "
-                    f"MWPM={mwpm_str} LSD={failures_lsd/total_shots:.10f}",
+                    f"MWPM={mwpm_str} MWPF={mwpf_str} LSD={failures_lsd/total_shots:.10f}",
                     end="\r",
                 )
             
             mwpm_final = None if failures_mwpm is None or total_shots == 0 else failures_mwpm / total_shots
             mwpm_final_str = f"{mwpm_final:.10f}" if mwpm_final is not None else "NA"
+            mwpf_final = None if failures_mwpf is None or total_shots == 0 else failures_mwpf / total_shots
+            mwpf_final_str = f"{mwpf_final:.10f}" if mwpf_final is not None else "NA"
             print(
                 f"    Final: MGHD={failures_mghd/total_shots:.10f} "
-                f"MWPM={mwpm_final_str} LSD={failures_lsd/total_shots:.10f}"
+                f"MWPM={mwpm_final_str} MWPF={mwpf_final_str} LSD={failures_lsd/total_shots:.10f}"
             )
             
             results.append({
@@ -268,6 +315,7 @@ def evaluate(args):
                 "shots": total_shots,
                 "ler_mghd": failures_mghd / total_shots,
                 "ler_mwpm": mwpm_final,
+                "ler_mwpf": mwpf_final,
                 "ler_lsd": failures_lsd / total_shots
             })
             
@@ -287,15 +335,17 @@ def evaluate(args):
 def plot_results(results, output_path):
     """Generate and save a clean LER plot from results."""
     # Organize data by distance
-    data_by_d = defaultdict(lambda: {"p": [], "mghd": [], "mwpm": [], "lsd": []})
+    data_by_d = defaultdict(lambda: {"p": [], "mghd": [], "mwpm": [], "mwpf": [], "lsd": []})
     
     for res in results:
         d = res["distance"]
         data_by_d[d]["p"].append(res["p"])
         data_by_d[d]["mghd"].append(res["ler_mghd"])
-        if res["ler_mwpm"] is not None:
+        if res.get("ler_mwpm") is not None:
             data_by_d[d]["mwpm"].append(res["ler_mwpm"])
-        if res["ler_lsd"] is not None:
+        if res.get("ler_mwpf") is not None:
+            data_by_d[d]["mwpf"].append(res["ler_mwpf"])
+        if res.get("ler_lsd") is not None:
             data_by_d[d]["lsd"].append(res["ler_lsd"])
             
     # Use a professional style
@@ -336,6 +386,11 @@ def plot_results(results, output_path):
         if data["mwpm"]:
             mwpm_vals = np.array(data["mwpm"])[idx]
             plt.loglog(p_vals, mwpm_vals, marker=marker, linestyle='--', color=color, alpha=0.6, label=f'MWPM d={d}')
+
+        # MWPF
+        if data["mwpf"]:
+            mwpf_vals = np.array(data["mwpf"])[idx]
+            plt.loglog(p_vals, mwpf_vals, marker=marker, linestyle='-.', color=color, alpha=0.6, label=f'MWPF d={d}')
             
         # LSD
         if data["lsd"]:

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch a fresh online training run capped at distance 15.
+# Launch a fresh online training run for depolarizing noise (Stim sampler).
 # Adjust BATCH/WORKERS/PREFETCH below if you hit OOM or see dataloader stalls.
 
 set -euo pipefail
@@ -30,25 +30,25 @@ WORKERS=${WORKERS:-40}
 BATCH=${BATCH:-1152}
 PREFETCH=${PREFETCH:-24}
 
+# Standard depolarizing-noise benchmark:
+# - Sampler: Stim (surface_code:rotated_memory_x)
+# - Teachers: MWPM (0.7) + LSD (0.3)
+# - Distance: 7 (set pads via --distance)
+# - P-curriculum: 0.007 -> 0.001, 30 epochs each (total 210 epochs)
+
 torchrun --nproc_per_node=2 mghd/cli/train.py \
-  --online \
   --sampler stim \
-  --online-rl \
   --family surface \
-  --distance 15 \
-  --distance-curriculum "3,5,7,9,11,13,15" \
-  --p-curriculum "0.011,0.009,0.007,0.005,0.003,0.001" \
-  --epochs-per-p 20 \
-  --teacher-mix "mwpm=1.0" \
-  --qpu-profile "/u/home/kulp/MGHD/mghd/qpu/profiles/iqm_garnet_example.json" \
-  --context-source "none" \
-  --erasure-frac 0.05 \
+  --distance 7 \
+  --p-curriculum "0.007,0.006,0.005,0.004,0.003,0.002,0.001" \
+  --epochs-per-p 30 \
+  --epochs 210 \
+  --teacher-mix "mwpm=0.7,lsd=0.3" \
+  --erasure-frac 0.0 \
   --shots-per-epoch 32768 \
-  --epochs 200 \
-  --batch ${BATCH} \
-  --workers ${WORKERS} \
-  --prefetch-factor ${PREFETCH} \
+  --batch "${BATCH}" \
+  --workers "${WORKERS}" \
+  --prefetch-factor "${PREFETCH}" \
   --progress-prints 50 \
   --amp bf16 \
-  --save "/u/home/kulp/MGHD/data/results_d15_run" \
-  --resume "/u/home/kulp/MGHD/data/results_d15_run/last.pt"
+  --save "/u/home/kulp/MGHD/data/results_DepNoiseOnly_24112015"

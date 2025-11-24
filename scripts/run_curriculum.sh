@@ -12,7 +12,7 @@ DISTANCES=$(seq -s, 3 2 31)
 # "Nature-Level" Run Configuration
 # - Distances: 3 to 31 (Curriculum)
 # - p-Curriculum: 0.012 down to 0.004 (Threshold region)
-# - Batch: 2048 (Aggressive H100 utilization)
+# - Batch: 1024 (Safe H100 utilization, 2048 OOMs at d=31)
 # - Shots: 32k/epoch (High statistics)
 # - Epochs: 25 per p-value (Convergence)
 # - Features: Erasure (5%) + Online RL (using IQM Garnet profile)
@@ -28,9 +28,9 @@ CUDA_VISIBLE_DEVICES=0 python -m mghd.cli.train \
     --distance-curriculum "3,5,7,9,11,13,15,17,19,21,23,25,27,29,31" \
     --p-curriculum "0.012,0.011,0.010,0.009,0.008,0.007,0.006,0.005,0.004" \
     --epochs-per-p 25 \
-    --batch 2048 \
+    --batch 1024 \
     --shots-per-epoch 32768 \
-    --workers 32 \
+    --workers 64 \
     --online-rl \
     --qpu-profile "/u/home/kulp/MGHD/mghd/qpu/profiles/iqm_garnet_example.json" \
     --erasure-frac 0.05 \

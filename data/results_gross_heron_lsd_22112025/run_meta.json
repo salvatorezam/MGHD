@@ -1,0 +1,23 @@
+{
+  "family": "gross",
+  "distance": 3,
+  "online": true,
+  "p": 0.005,
+  "p_curriculum": [
+    0.009,
+    0.006,
+    0.003,
+    0.001,
+    0.0007,
+    0.0004
+  ],
+  "epochs_per_p": 20,
+  "teacher_mix": "lsd=1.0",
+  "qpu_profile": "mghd/qpu/profiles/ibm_heron_r3.json",
+  "context_source": "none",
+  "erasure_frac": 0.05,
+  "shots_per_epoch": 32768,
+  "epochs": 120,
+  "batch": 512,
+  "seed": 42
+}

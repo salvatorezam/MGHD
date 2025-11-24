@@ -19,11 +19,7 @@ tmux send-keys -t "${SESSION_NAME}" "source /u/home/kulp/miniconda3/bin/activate
 tmux send-keys -t "${SESSION_NAME}" "cd /u/home/kulp/MGHD" C-m
 tmux send-keys -t "${SESSION_NAME}" 'export PYTHONPATH="/u/home/kulp/MGHD:${PYTHONPATH:-}"' C-m
 
-# Standard Benchmark Run:
-# - Sampler: Stim (standard circuit-level depolarizing noise)
-# - Teachers: MWPM (0.7) + LSD (0.3)
-# - Distance curriculum: 3,5,7
-# - P curriculum: 0.007 -> 0.001
+
 tmux send-keys -t "${SESSION_NAME}" \
   "MASTER_PORT=29500 CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 mghd/cli/train.py \
     --online \

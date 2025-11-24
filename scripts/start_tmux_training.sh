@@ -13,7 +13,7 @@ if [ $? != 0 ]; then
   # Send the run command to the tmux session
   # We assume the user is in the root of the workspace, so we use the relative path
   tmux send-keys -t $SESSION_NAME "source /u/home/kulp/miniconda3/bin/activate mlqec-env" C-m
-  tmux send-keys -t $SESSION_NAME "./scripts/run_curriculum.sh" C-m
+  tmux send-keys -t $SESSION_NAME "./scripts/run_final_d15.sh" C-m
   
   echo "----------------------------------------------------------------"
   echo "Training started in tmux session: '$SESSION_NAME'"

@@ -20,6 +20,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -28,17 +29,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, Sampler, DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler
 
-from mghd.decoders.lsd import clustered as cc  # uses projector functions
+from mghd.codes.qpu_profile import load_qpu_profile
 from mghd.core.core import MGHDv2, PackedCrop, pack_cluster
+from mghd.decoders.lsd import clustered as cc  # uses projector functions
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
+from mghd.decoders.nvqldpc_teacher import NvQldpcTeacher
 from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_side
-from mghd.tad import weighting as tad_weighting
 from mghd.tad import context as tad_context
-from mghd.codes.qpu_profile import load_qpu_profile
+from mghd.tad import weighting as tad_weighting
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -1429,8 +1431,8 @@ class OnlineSurfaceDataset(IterableDataset):
             # Get or create teachers for this distance
             if d not in _WORKER_TEACHERS_CACHE:
                 _WORKER_TEACHERS_CACHE[d] = self._init_teachers_for_d(d)
-            
-            mwpf_teacher, mwpm_ctx, lsd_teacher = _WORKER_TEACHERS_CACHE[d]
+
+            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher = _WORKER_TEACHERS_CACHE[d]
             
             # Handle erasure
             erase_local = None
@@ -1467,17 +1469,57 @@ class OnlineSurfaceDataset(IterableDataset):
                     additional_synX = (Hx @ erasure_err_z) % 2
                     sample["synX"] = (sample["synX"] ^ additional_synX).astype(np.uint8)
 
-            yield from self._process_sample(sample, shot_seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local)
+            yield from self._process_sample(
+                sample,
+                shot_seed,
+                mwpf_teacher,
+                mwpm_ctx,
+                lsd_teacher,
+                rng,
+                d,
+                erase_local,
+                nvqldpc_teacher=nvqldpc_teacher,
+            )
             
             shots_done += 1
 
     def _init_teachers_for_d(self, d):
-        from mghd.codes.registry import get_code
-        code = get_code(self.args.family, distance=d)
-        
-        use_mwpf = self.teacher_mix.get("mwpf", 0.0) > 0.0
+        # Build Hx/Hz directly from a CUDA-Q sample so that
+        # - parity-check dimensions match the online sampler's syndromes, and
+        # - nvqldpc (and other teachers) see a consistent PCM.
+        base_p = float(getattr(self.args, "p", 0.005))
+        sample = sample_round(
+            d=d,
+            p=base_p,
+            seed=0,
+            profile_path=self.args.qpu_profile if getattr(self.args, "qpu_profile", None) else None,
+        )
+        Hx = np.asarray(sample["Hx"], dtype=np.uint8)
+        Hz = np.asarray(sample["Hz"], dtype=np.uint8)
+
+        mx = Hx.shape[0]
+        mz = Hz.shape[0]
+        dets_per_fault = []
+        for col in range(Hx.shape[1]):
+            dets = []
+            dets.extend(np.flatnonzero(Hx[:, col]).tolist())
+            dets.extend((mx + np.flatnonzero(Hz[:, col])).tolist())
+            dets_per_fault.append(dets)
+
+        code = SimpleNamespace(
+            Hx=Hx,
+            Hz=Hz,
+            detectors_per_fault=dets_per_fault,
+            fault_weights=[1.0] * Hx.shape[1],
+            num_detectors=mx + mz,
+            n=Hx.shape[1],
+        )
+
+        commutes = not np.any((Hx % 2) @ (Hz.T % 2) % 2)
+        use_mwpf = self.teacher_mix.get("mwpf", 0.0) > 0.0 and commutes
         use_mwpm = self.teacher_mix.get("mwpm", 0.0) > 0.0
         use_lsd = self.teacher_mix.get("lsd", 0.0) > 0.0
+        use_nvqldpc = self.teacher_mix.get("nvqldpc", 0.0) > 0.0
 
         mwpf_teacher = None
         if use_mwpf:
@@ -1494,10 +1536,16 @@ class OnlineSurfaceDataset(IterableDataset):
                 lsd_teacher = LSDTeacher(code.Hx, code.Hz)
             except Exception:
                 lsd_teacher = None
-                
-        return mwpf_teacher, mwpm_ctx, lsd_teacher
 
-    def _process_sample(self, sample, seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local=None):
+        nvqldpc_teacher = None
+        if use_nvqldpc:
+            # For nvqldpc we enforce strict behavior: construction errors
+            # should propagate rather than silently disabling the teacher.
+            nvqldpc_teacher = NvQldpcTeacher(code.Hx, code.Hz)
+
+        return mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher
+
+    def _process_sample(self, sample, seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local=None, nvqldpc_teacher=None):
         # Logic extracted from the main loop
         # Pack detectors in canonical Z→X order for MWPFTeacher
         dets_global = np.concatenate(
@@ -1538,6 +1586,15 @@ class OnlineSurfaceDataset(IterableDataset):
             except Exception:
                 ex_glob = ez_glob = None
 
+        # Compute NvQldpc once per sample (GPU BP+OSD teacher, strict)
+        ex_nq = ez_nq = None
+        if nvqldpc_teacher is not None:
+            ex_arr, ez_arr = nvqldpc_teacher.decode_batch_xz(
+                syndromes_x=sample["synX"][None, :],
+                syndromes_z=sample["synZ"][None, :],
+            )
+            ex_nq, ez_nq = ex_arr[0], ez_arr[0]
+
         for side in ("Z", "X"):
             comps = split_components_for_side(
                 side=side,
@@ -1567,13 +1624,20 @@ class OnlineSurfaceDataset(IterableDataset):
                 if mwpm_ctx is not None:
                     bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
                     outputs["mwpm"] = (bits_pm.astype(np.uint8), int(w_pm))
-                
+
                 # LSD
                 if lsd_teacher is not None and (ex_glob is not None and ez_glob is not None):
                     bits_global = ex_glob if side == "Z" else ez_glob
                     if qubit_indices.size and bits_global.size > qubit_indices.max():
                         bits_local = bits_global[qubit_indices].astype(np.uint8)
                         outputs["lsd"] = (bits_local, int(bits_local.sum()))
+
+                # NvQldpc (GPU BP+OSD)
+                if nvqldpc_teacher is not None and (ex_nq is not None and ez_nq is not None):
+                    bits_global = ex_nq if side == "Z" else ez_nq
+                    if qubit_indices.size and bits_global.size > qubit_indices.max():
+                        bits_local = bits_global[qubit_indices].astype(np.uint8)
+                        outputs["nvqldpc"] = (bits_local, int(bits_local.sum()))
                 
                 # Choose teacher
                 weighted = []

@@ -1,0 +1,362 @@
+[
+  {
+    "distance": 3,
+    "p": 0.011,
+    "shots": 10000,
+    "ler_mghd": 0.1518,
+    "ler_mwpm": 0.026,
+    "ler_lsd": 0.1333
+  },
+  {
+    "distance": 3,
+    "p": 0.009,
+    "shots": 10000,
+    "ler_mghd": 0.1239,
+    "ler_mwpm": 0.0202,
+    "ler_lsd": 0.1097
+  },
+  {
+    "distance": 3,
+    "p": 0.007,
+    "shots": 10000,
+    "ler_mghd": 0.1005,
+    "ler_mwpm": 0.0111,
+    "ler_lsd": 0.0879
+  },
+  {
+    "distance": 3,
+    "p": 0.005,
+    "shots": 10000,
+    "ler_mghd": 0.0729,
+    "ler_mwpm": 0.0064,
+    "ler_lsd": 0.0654
+  },
+  {
+    "distance": 3,
+    "p": 0.003,
+    "shots": 10000,
+    "ler_mghd": 0.0488,
+    "ler_mwpm": 0.0026,
+    "ler_lsd": 0.0419
+  },
+  {
+    "distance": 3,
+    "p": 0.001,
+    "shots": 10000,
+    "ler_mghd": 0.0179,
+    "ler_mwpm": 0.0005,
+    "ler_lsd": 0.0149
+  },
+  {
+    "distance": 5,
+    "p": 0.011,
+    "shots": 10000,
+    "ler_mghd": 0.3656,
+    "ler_mwpm": 0.0404,
+    "ler_lsd": 0.3897
+  },
+  {
+    "distance": 5,
+    "p": 0.009,
+    "shots": 10000,
+    "ler_mghd": 0.3284,
+    "ler_mwpm": 0.0238,
+    "ler_lsd": 0.3524
+  },
+  {
+    "distance": 5,
+    "p": 0.007,
+    "shots": 10000,
+    "ler_mghd": 0.2842,
+    "ler_mwpm": 0.0138,
+    "ler_lsd": 0.3008
+  },
+  {
+    "distance": 5,
+    "p": 0.005,
+    "shots": 10000,
+    "ler_mghd": 0.224,
+    "ler_mwpm": 0.0043,
+    "ler_lsd": 0.2448
+  },
+  {
+    "distance": 5,
+    "p": 0.003,
+    "shots": 10000,
+    "ler_mghd": 0.1464,
+    "ler_mwpm": 0.0009,
+    "ler_lsd": 0.1602
+  },
+  {
+    "distance": 5,
+    "p": 0.001,
+    "shots": 10000,
+    "ler_mghd": 0.0589,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0633
+  },
+  {
+    "distance": 7,
+    "p": 0.011,
+    "shots": 10000,
+    "ler_mghd": 0.4587,
+    "ler_mwpm": 0.0515,
+    "ler_lsd": 0.4565
+  },
+  {
+    "distance": 7,
+    "p": 0.009,
+    "shots": 10000,
+    "ler_mghd": 0.4402,
+    "ler_mwpm": 0.0254,
+    "ler_lsd": 0.4301
+  },
+  {
+    "distance": 7,
+    "p": 0.007,
+    "shots": 10000,
+    "ler_mghd": 0.3976,
+    "ler_mwpm": 0.0109,
+    "ler_lsd": 0.3904
+  },
+  {
+    "distance": 7,
+    "p": 0.005,
+    "shots": 10000,
+    "ler_mghd": 0.3445,
+    "ler_mwpm": 0.0035,
+    "ler_lsd": 0.3304
+  },
+  {
+    "distance": 7,
+    "p": 0.003,
+    "shots": 10000,
+    "ler_mghd": 0.2568,
+    "ler_mwpm": 0.0002,
+    "ler_lsd": 0.249
+  },
+  {
+    "distance": 7,
+    "p": 0.001,
+    "shots": 10000,
+    "ler_mghd": 0.1005,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.098
+  },
+  {
+    "distance": 3,
+    "p": 0.002,
+    "shots": 10000,
+    "ler_mghd": 0.0346,
+    "ler_mwpm": 0.0012,
+    "ler_lsd": 0.0283
+  },
+  {
+    "distance": 3,
+    "p": 0.0005,
+    "shots": 10000,
+    "ler_mghd": 0.0081,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0067
+  },
+  {
+    "distance": 3,
+    "p": 0.0003,
+    "shots": 10000,
+    "ler_mghd": 0.0042,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0028
+  },
+  {
+    "distance": 3,
+    "p": 0.0001,
+    "shots": 10000,
+    "ler_mghd": 0.0017,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0014
+  },
+  {
+    "distance": 5,
+    "p": 0.002,
+    "shots": 10000,
+    "ler_mghd": 0.1059,
+    "ler_mwpm": 0.0002,
+    "ler_lsd": 0.116
+  },
+  {
+    "distance": 5,
+    "p": 0.0005,
+    "shots": 10000,
+    "ler_mghd": 0.0282,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.032
+  },
+  {
+    "distance": 5,
+    "p": 0.0003,
+    "shots": 10000,
+    "ler_mghd": 0.0206,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0215
+  },
+  {
+    "distance": 5,
+    "p": 0.0001,
+    "shots": 10000,
+    "ler_mghd": 0.0047,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0061
+  },
+  {
+    "distance": 7,
+    "p": 0.002,
+    "shots": 10000,
+    "ler_mghd": 0.1886,
+    "ler_mwpm": 0.0001,
+    "ler_lsd": 0.1776
+  },
+  {
+    "distance": 7,
+    "p": 0.0005,
+    "shots": 10000,
+    "ler_mghd": 0.0552,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0509
+  },
+  {
+    "distance": 7,
+    "p": 0.0003,
+    "shots": 10000,
+    "ler_mghd": 0.032,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0302
+  },
+  {
+    "distance": 7,
+    "p": 0.0001,
+    "shots": 10000,
+    "ler_mghd": 0.0118,
+    "ler_mwpm": 0.0,
+    "ler_lsd": 0.0114
+  },
+  {
+    "distance": 3,
+    "p": 0.013,
+    "shots": 10000,
+    "ler_mghd": 0.1764,
+    "ler_mwpm": 0.0352,
+    "ler_lsd": 0.1561
+  },
+  {
+    "distance": 3,
+    "p": 0.015,
+    "shots": 10000,
+    "ler_mghd": 0.1957,
+    "ler_mwpm": 0.0476,
+    "ler_lsd": 0.1744
+  },
+  {
+    "distance": 3,
+    "p": 0.017,
+    "shots": 10000,
+    "ler_mghd": 0.2116,
+    "ler_mwpm": 0.0538,
+    "ler_lsd": 0.1955
+  },
+  {
+    "distance": 3,
+    "p": 0.019,
+    "shots": 10000,
+    "ler_mghd": 0.2264,
+    "ler_mwpm": 0.0713,
+    "ler_lsd": 0.2067
+  },
+  {
+    "distance": 3,
+    "p": 0.021,
+    "shots": 10000,
+    "ler_mghd": 0.2425,
+    "ler_mwpm": 0.083,
+    "ler_lsd": 0.2307
+  },
+  {
+    "distance": 5,
+    "p": 0.013,
+    "shots": 10000,
+    "ler_mghd": 0.3953,
+    "ler_mwpm": 0.0598,
+    "ler_lsd": 0.4108
+  },
+  {
+    "distance": 5,
+    "p": 0.015,
+    "shots": 10000,
+    "ler_mghd": 0.4155,
+    "ler_mwpm": 0.0884,
+    "ler_lsd": 0.4381
+  },
+  {
+    "distance": 5,
+    "p": 0.017,
+    "shots": 10000,
+    "ler_mghd": 0.4382,
+    "ler_mwpm": 0.1137,
+    "ler_lsd": 0.4486
+  },
+  {
+    "distance": 5,
+    "p": 0.019,
+    "shots": 10000,
+    "ler_mghd": 0.4437,
+    "ler_mwpm": 0.1489,
+    "ler_lsd": 0.457
+  },
+  {
+    "distance": 5,
+    "p": 0.021,
+    "shots": 10000,
+    "ler_mghd": 0.4612,
+    "ler_mwpm": 0.1774,
+    "ler_lsd": 0.4679
+  },
+  {
+    "distance": 7,
+    "p": 0.013,
+    "shots": 10000,
+    "ler_mghd": 0.474,
+    "ler_mwpm": 0.0903,
+    "ler_lsd": 0.4701
+  },
+  {
+    "distance": 7,
+    "p": 0.015,
+    "shots": 10000,
+    "ler_mghd": 0.4768,
+    "ler_mwpm": 0.1207,
+    "ler_lsd": 0.4783
+  },
+  {
+    "distance": 7,
+    "p": 0.017,
+    "shots": 10000,
+    "ler_mghd": 0.4838,
+    "ler_mwpm": 0.1715,
+    "ler_lsd": 0.4917
+  },
+  {
+    "distance": 7,
+    "p": 0.019,
+    "shots": 10000,
+    "ler_mghd": 0.4929,
+    "ler_mwpm": 0.2247,
+    "ler_lsd": 0.491
+  },
+  {
+    "distance": 7,
+    "p": 0.021,
+    "shots": 10000,
+    "ler_mghd": 0.4919,
+    "ler_mwpm": 0.2679,
+    "ler_lsd": 0.5001
+  }
+]
