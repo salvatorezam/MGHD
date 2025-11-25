@@ -606,6 +606,9 @@ def bb_from_shifts(
 def bb_gross() -> CodeSpec:
     return bb_from_shifts(size_x=12, size_y=6, a=(3, -1), b=(-1, -3))
 
+def bb_double_gross() -> CodeSpec:
+    """[[288, 12, 18]] bivariate-bicycle 'two-gross' code (ℓ=12, m=12)."""
+    return bb_from_shifts(size_x=12, size_y=12, a=(3, -1), b=(-1, -3))
 
 def build_gb_two_block(
     n: int,
@@ -692,6 +695,46 @@ def build_bb(
     taps_b_2d: Iterable[tuple[int, int]] = ((0, 0), (2, 0), (0, 2)),
 ) -> CSSCode:
     return build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d)
+
+
+def build_gross(distance: int | None = None, **kw: Any) -> CSSCode:
+    """CSSCode wrapper for the [[144, 12, 12]] gross BB code."""
+    if distance not in (None, 12):
+        raise ValueError("Gross code has fixed distance 12")
+    spec = bb_gross()
+    Hx, Hz = spec.hx, spec.hz
+    dets_per_fault = _fault_map(Hx, Hz)
+    layout = {"family": "bb", **(spec.meta or {})}
+    return _make_css(
+        name="gross",
+        distance=12,
+        Hx=Hx,
+        Hz=Hz,
+        layout=layout,
+        detectors_per_fault=dets_per_fault,
+        fault_weights=[1.0] * spec.n,
+        num_observables=12,
+    )
+
+
+def build_double_gross(distance: int | None = None, **kw: Any) -> CSSCode:
+    """CSSCode wrapper for the [[288, 12, 18]] two-gross BB code."""
+    if distance not in (None, 18):
+        raise ValueError("Double-gross code has fixed distance 18")
+    spec = bb_double_gross()
+    Hx, Hz = spec.hx, spec.hz
+    dets_per_fault = _fault_map(Hx, Hz)
+    layout = {"family": "bb", **(spec.meta or {})}
+    return _make_css(
+        name="double_gross",
+        distance=18,
+        Hx=Hx,
+        Hz=Hz,
+        layout=layout,
+        detectors_per_fault=dets_per_fault,
+        fault_weights=[1.0] * spec.n,
+        num_observables=12,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -935,15 +978,17 @@ REGISTRY = {
         n, taps_a, taps_b, name="gb"
     ),
     "bb": lambda distance=None,
-    n1=17,
-    n2=17,
-    taps_a_2d=((0, 0), (1, 0), (0, 1)),
-    taps_b_2d=((0, 0), (2, 0), (0, 2)),
-    **kw: build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d),
+           n1=17,
+           n2=17,
+           taps_a_2d=((0, 0), (1, 0), (0, 1)),
+           taps_b_2d=((0, 0), (2, 0), (0, 2)),
+           **kw: build_bb_bivariate(n1, n2, taps_a_2d, taps_b_2d),
+    "gross": lambda distance=None, **kw: build_gross(distance=distance, **kw),
+    "double_gross": lambda distance=None, **kw: build_double_gross(distance=distance, **kw),
     "hgp": lambda distance=None, H1=None, H2=None, name="hgp", **kw: build_hgp(H1, H2, name=name),
 }
 
-_OPTIONAL_DISTANCE = {"steane", "gb", "bb", "hgp"}
+_OPTIONAL_DISTANCE = {"steane", "gb", "bb", "gross", "double_gross", "hgp"}
 
 
 def get_code(family: str, distance: int | None = None, **kw) -> CSSCode:
@@ -1054,6 +1099,7 @@ def _random_css_check(spec: CodeSpec, samples: int = 5) -> None:
 def _self_test() -> None:
     specs: Iterable[CodeSpec] = [
         bb_gross(),
+        bb_double_gross(),
         surface_rotated_spec(3),
         qrm_steane(),
         qrm_hamming(3),

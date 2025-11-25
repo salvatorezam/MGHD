@@ -13,6 +13,7 @@ except ImportError:
 class MWPMatchingContext:
     def __init__(self):
         self._matcher_cache = {}
+        self._failed_once = False
 
     def decode(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str):
         """
@@ -30,8 +31,7 @@ class MWPMatchingContext:
                 # Create pymatching Matching object
                 # Convert to binary matrix for pymatching
                 H_binary = (H_sub % 2).astype(np.uint8)
-                if not is_graphlike(H_binary):
-                    raise ValueError("mwpm_not_graphlike")
+                # We allow non-graphlike codes (pymatching 2+ supports them)
                 self._matcher_cache[cache_key] = pm.Matching(H_binary)
 
             matcher = self._matcher_cache[cache_key]
@@ -47,8 +47,11 @@ class MWPMatchingContext:
             return correction_uint8, weight
 
         except BaseException as e:
-            # Fallback on any error
-            print(f"Warning: MWPM decode failed ({e}), using fallback")
+            # Fallback on any error; suppress noisy prints for non-graphlike cases.
+            if not self._failed_once:
+                if "mwpm_not_graphlike" not in str(e):
+                    print(f"Warning: MWPM decode failed ({e}), using fallback (suppressing further warnings)")
+                self._failed_once = True
             return self._decode_fallback(H_sub, synd_bits, side)
 
     def _decode_fallback(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str):

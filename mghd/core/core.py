@@ -643,6 +643,10 @@ class SequenceEncoder(nn.Module):
         except Exception:
             y_chk = x_chk
         y_chk = self.out_norm(y_chk)
+        # Ensure dtype alignment for index_copy in mixed precision
+        if y_chk.dtype != x.dtype:
+            y_chk = y_chk.to(x.dtype)
+            x_chk = x_chk.to(x.dtype)
         x_scatter = x.clone()
         x_scatter.index_copy_(0, idx, x_chk + y_chk)
         return x_scatter

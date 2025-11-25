@@ -18,7 +18,9 @@ import random
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -27,17 +29,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, Sampler, DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler
 
-from mghd.decoders.lsd import clustered as cc  # uses projector functions
+from mghd.codes.qpu_profile import load_qpu_profile
 from mghd.core.core import MGHDv2, PackedCrop, pack_cluster
+from mghd.decoders.lsd import clustered as cc  # uses projector functions
 from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
+from mghd.decoders.nvqldpc_teacher import NvQldpcTeacher
 from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_side
-from mghd.tad import weighting as tad_weighting
 from mghd.tad import context as tad_context
-from mghd.codes.qpu_profile import load_qpu_profile
+from mghd.tad import weighting as tad_weighting
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -451,6 +454,19 @@ def train_inprocess(ns) -> str:
         default=4,
         help="Number of data loading workers for online training",
     )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=8,
+        help="DataLoader prefetch factor (batches per worker). Increase if GPU idle waiting for data.",
+    )
+    parser.add_argument(
+        "--amp",
+        type=str,
+        default="bf16",
+        choices=["off", "fp16", "bf16", "auto"],
+        help="Mixed precision mode for speed: off/fp16/bf16/auto (default bf16 on H100)",
+    )
     # Early stopping
     parser.add_argument(
         "--distance-curriculum",
@@ -469,6 +485,12 @@ def train_inprocess(ns) -> str:
         type=float,
         default=0.0,
         help="Minimum loss improvement to reset patience",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from (loads model weights and sets start epoch)",
     )
     if not hasattr(args, "data_root"):
         args = parser.parse_args()
@@ -502,6 +524,17 @@ def train_inprocess(ns) -> str:
         os.environ["MGHD_SYNTHETIC"] = "1"
     elif sampler_choice == "cudaq":
         os.environ.pop("MGHD_SYNTHETIC", None)
+
+    # Auto-scale pad limits for large distances if not provided
+    if not hasattr(args, "N_max"):
+        d_param = int(getattr(args, "distance", 3))
+        # Base 512 is good for d<=15. For d=31, we need ~2000.
+        # We use a safe scaling: N_max ~ 3*d^2, E_max ~ 12*d^2
+        args.N_max = max(512, int(3.0 * d_param**2))
+        args.E_max = max(4096, int(12.0 * d_param**2))
+        args.S_max = max(512, int(2.0 * d_param**2))
+        if rank == 0:
+            print(f"Auto-scaled pad limits for d={d_param}: N_max={args.N_max}, E_max={args.E_max}")
 
     # Default structural hyperparameters (can be overridden via JSON/CLI namespace)
     defaults = {
@@ -609,6 +642,28 @@ def train_inprocess(ns) -> str:
         )
     else:
         device = torch.device("cpu")
+    # Mixed precision + TF32 tuning for H100 throughput
+    amp_mode = str(getattr(args, "amp", "bf16")).lower()
+    use_amp = False
+    amp_dtype = torch.float32
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if amp_mode != "off":
+            if amp_mode == "fp16":
+                amp_dtype = torch.float16
+            elif amp_mode == "auto":
+                bf16_ok = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+                amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+            else:
+                amp_dtype = torch.bfloat16
+            use_amp = amp_dtype != torch.float32
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+
+    def _autocast():
+        if device.type == "cuda":
+            return torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
+        return nullcontext()
     # Build model with optional hyperparameters from JSON/data contract
     m_kwargs = {
         "d_model": int(getattr(args, "d_model", 192)),
@@ -630,6 +685,69 @@ def train_inprocess(ns) -> str:
         
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+
+    def _backward_and_step(loss: torch.Tensor):
+        """Handle AMP-aware backward/step with grad clipping."""
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    start_epoch = 1
+    if getattr(args, "resume", None):
+        ckpt_path = args.resume
+        if os.path.isfile(ckpt_path):
+            if rank == 0:
+                print(f"Resuming from checkpoint: {ckpt_path}")
+            # Map location to CPU first to avoid GPU OOM or device mismatch, then load_state_dict handles move
+            checkpoint = torch.load(ckpt_path, map_location='cpu')
+            
+            # The saved state_dict is unwrapped (see save logic below).
+            # If current model is DDP, we load into model.module.
+            state_dict = checkpoint["model"]
+
+            # Check if g_proj needs initialization
+            if "g_proj.weight" in state_dict:
+                g_dim = state_dict["g_proj.weight"].shape[1]
+                if is_distributed:
+                    model.module.ensure_g_proj(g_dim, device)
+                else:
+                    model.ensure_g_proj(g_dim, device)
+                if rank == 0:
+                    print(f"Initialized g_proj with input dim {g_dim} from checkpoint.")
+
+            if is_distributed:
+                model.module.load_state_dict(state_dict)
+            else:
+                model.load_state_dict(state_dict)
+            
+            if "optimizer" in checkpoint:
+                try:
+                    opt.load_state_dict(checkpoint["optimizer"])
+                    if rank == 0:
+                        print("Loaded optimizer state.")
+                except Exception as e:
+                    if rank == 0:
+                        print(f"Failed to load optimizer state: {e}")
+
+            start_epoch = checkpoint.get("epoch", 0) + 1
+            
+            # Align scheduler without stepping before first optimizer step
+            if start_epoch > 1:
+                sched.last_epoch = start_epoch - 1
+                    
+            if rank == 0:
+                print(f"Resumed model at epoch {start_epoch - 1}. Next epoch: {start_epoch}")
+        else:
+            if rank == 0:
+                print(f"Checkpoint not found at {ckpt_path}, starting from scratch.")
 
     loader = None
     use_online = bool(getattr(args, "online", False))
@@ -776,7 +894,7 @@ def train_inprocess(ns) -> str:
             p_list = [float(x) for x in str(args.p_curriculum).split(",") if x.strip()]
         except Exception:
             p_list = None
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0 = time.time()
         total_loss = 0.0
@@ -791,8 +909,6 @@ def train_inprocess(ns) -> str:
                 p_epoch = float(getattr(args, "p", 0.005))
             # Teacher setup per epoch
             family = args.family
-            if family != "surface":
-                raise NotImplementedError("Online training currently supports family='surface'")
             # Build code object
             from mghd.codes.registry import get_code
 
@@ -820,18 +936,21 @@ def train_inprocess(ns) -> str:
             # Divide shots among ranks
             if is_distributed:
                 shots_target = shots_target // world_size
-                
-            shots_per_worker = (shots_target + workers - 1) // workers
             
-            dataset = OnlineSurfaceDataset(args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec, llr_overrides, rank=rank)
+            # Pass per-rank shot budget; dataset will split this across workers to avoid duplication
+            dataset = OnlineSurfaceDataset(args, p_epoch, epoch, shots_target, teacher_mix, ctx_vec, llr_overrides, rank=rank)
+            
+            # In DDP mode, divide batch size across GPUs
+            effective_batch = args.batch // world_size if is_distributed else args.batch
             
             loader = DataLoader(
                 dataset,
-                batch_size=args.batch,
+                batch_size=effective_batch,
                 num_workers=workers,
                 collate_fn=collate_packed,
                 pin_memory=True if torch.cuda.is_available() else False,
                 persistent_workers=True if workers > 0 else False,
+                prefetch_factor=int(getattr(args, "prefetch_factor", 2)) if workers > 0 else None,
             )
             
             steps_done = 0
@@ -851,98 +970,95 @@ def train_inprocess(ns) -> str:
                 _validate_packed_contract(packed, expected_node_dim, expected_edge_dim)
                 packed = move_to(packed, device)
                 
-                logits, node_mask = model(packed=packed)
-                # logits: (B*N, 2), node_mask: (B*N,)
-                
-                # Reshape for structured losses
-                B = packed.x_nodes.shape[0]
-                N = packed.x_nodes.shape[1]
-                logits_reshaped = logits.view(B, N, 2)
-                node_mask_reshaped = node_mask.view(B, N)
-                node_type_reshaped = packed.node_type # (B, N)
-                
-                hard = 1.0
-                sample_weight = torch.tensor(
-                    hard, dtype=torch.float32, device=device
-                )
-                
-                loss_bce = bce_binary_head_loss(
-                    logits, # flattened
-                    node_mask, # flattened
-                    packed.node_type.view(-1),
-                    packed.y_bits.view(-1),
-                    sample_weight=sample_weight,
-                    label_smoothing=args.label_smoothing,
-                )
-                
-                loss_par = args.parity_lambda * parity_auxiliary_loss(
-                    logits_reshaped,
-                    node_mask_reshaped,
-                    node_type_reshaped,
-                    H_sub=packed.H_sub,
-                )
-                
-                loss_proj = torch.tensor(0.0, device=device)
-                if args.projection_aware:
-                    proj_loss_sum = 0.0
-                    for i in range(B):
-                        l = logits_reshaped[i]
-                        nm = node_mask_reshaped[i]
-                        nt = node_type_reshaped[i]
-                        yb = packed.y_bits[i]
-                        h = packed.H_sub[i] if isinstance(packed.H_sub, list) else packed.H_sub
-                        
-                        data_mask = (nt == 0) & nm
-                        
-                        side = "Z"
-                        if hasattr(packed.meta, "batch_metas"):
-                             side = getattr(packed.meta.batch_metas[i], "side", "Z")
-                        elif hasattr(packed.meta, "side"):
-                             side = packed.meta.side
-
-                        proj_bits = projection_aware_logits_to_bits(
-                            l,
-                            projector_kwargs={
-                                "H_sub": h,
-                                "side": side,
-                            },
-                            data_mask=data_mask,
-                        )
-                        with torch.no_grad():
-                            mask_data = data_mask.detach().cpu().numpy()
-                            target_full = (
-                                yb.detach()
-                                .cpu()
-                                .numpy()
-                                .clip(0, 1)
-                                .astype(np.uint8)
-                            )
-                            target_data = target_full[mask_data]
-                        proj_target = torch.from_numpy(target_data).to(device)
-                        proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(
-                            device
-                        )
-                        raw_bits = (
-                            torch.sigmoid(l[:, 1] - l[:, 0])[data_mask] > 0.5
-                        ).long()
-                        p_loss = 0.5 * F.l1_loss(
-                            proj_pred.float(), proj_target.float()
-                        ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
-                        proj_loss_sum += p_loss
-                    loss_proj = proj_loss_sum / B
+                with _autocast():
+                    logits, node_mask = model(packed=packed)
+                    # logits: (B*N, 2), node_mask: (B*N,)
                     
-                sample_loss = loss_bce + loss_par + 0.5 * loss_proj
+                    # Reshape for structured losses
+                    B = packed.x_nodes.shape[0]
+                    N = packed.x_nodes.shape[1]
+                    logits_reshaped = logits.view(B, N, 2)
+                    node_mask_reshaped = node_mask.view(B, N)
+                    node_type_reshaped = packed.node_type # (B, N)
+                    
+                    hard = 1.0
+                    sample_weight = torch.tensor(
+                        hard, dtype=torch.float32, device=device
+                    )
+                    
+                    loss_bce = bce_binary_head_loss(
+                        logits, # flattened
+                        node_mask, # flattened
+                        packed.node_type.view(-1),
+                        packed.y_bits.view(-1),
+                        sample_weight=sample_weight,
+                        label_smoothing=args.label_smoothing,
+                    )
+                    
+                    loss_par = args.parity_lambda * parity_auxiliary_loss(
+                        logits_reshaped,
+                        node_mask_reshaped,
+                        node_type_reshaped,
+                        H_sub=packed.H_sub,
+                    )
+                    
+                    loss_proj = torch.tensor(0.0, device=device)
+                    if args.projection_aware:
+                        proj_loss_sum = 0.0
+                        for i in range(B):
+                            l = logits_reshaped[i]
+                            nm = node_mask_reshaped[i]
+                            nt = node_type_reshaped[i]
+                            yb = packed.y_bits[i]
+                            h = packed.H_sub[i] if isinstance(packed.H_sub, list) else packed.H_sub
+                            
+                            data_mask = (nt == 0) & nm
+                            
+                            side = "Z"
+                            if hasattr(packed.meta, "batch_metas"):
+                                 side = getattr(packed.meta.batch_metas[i], "side", "Z")
+                            elif hasattr(packed.meta, "side"):
+                                 side = packed.meta.side
+
+                            proj_bits = projection_aware_logits_to_bits(
+                                l,
+                                projector_kwargs={
+                                    "H_sub": h,
+                                    "side": side,
+                                },
+                                data_mask=data_mask,
+                            )
+                            with torch.no_grad():
+                                mask_data = data_mask.detach().cpu().numpy()
+                                target_full = (
+                                    yb.detach()
+                                    .cpu()
+                                    .numpy()
+                                    .clip(0, 1)
+                                    .astype(np.uint8)
+                                )
+                                target_data = target_full[mask_data]
+                            proj_target = torch.from_numpy(target_data).to(device)
+                            proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(
+                                device
+                            )
+                            raw_bits = (
+                                torch.sigmoid(l[:, 1] - l[:, 0])[data_mask] > 0.5
+                            ).long()
+                            p_loss = 0.5 * F.l1_loss(
+                                proj_pred.float(), proj_target.float()
+                            ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+                            proj_loss_sum += p_loss
+                        loss_proj = proj_loss_sum / B
+                        
+                    sample_loss = loss_bce + loss_par + 0.5 * loss_proj
+                    
+                    batch_loss = sample_loss
                 
-                batch_loss = sample_loss
-                batch_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=float(args.grad_clip)
-                )
-                opt.step()
-                opt.zero_grad(set_to_none=True)
+                _backward_and_step(batch_loss)
                 
                 batch_size = B
-                total_loss += batch_loss.item() * batch_size
+                total_loss += batch_loss.detach().item() * batch_size
                 n_items += batch_size
                 steps_done += 1
                 
@@ -991,82 +1107,80 @@ def train_inprocess(ns) -> str:
                     std = float(args.noise_injection)
                     for packed in moved:
                         packed.x_nodes = packed.x_nodes + torch.randn_like(packed.x_nodes) * std
-                opt.zero_grad(set_to_none=True)
+                
+                batch_loss = torch.zeros((), device=device)
+                for packed, teach in zip(moved, teacher_outs):
+                    with _autocast():
+                        logits, node_mask = model(packed=packed)
+                        logits = logits.squeeze(0)
+                        node_mask = node_mask.squeeze(0)
 
-            batch_loss = torch.zeros((), device=device)
-            for packed, teach in zip(moved, teacher_outs):
-                logits, node_mask = model(packed=packed)
-                logits = logits.squeeze(0)
-                node_mask = node_mask.squeeze(0)
-
-                hard = (0.5 if teach.get("valid", True) else 1.5) + (
-                    0.5 if teach.get("matched_local_ml", False) else 1.0
-                )
-                sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
-
-                loss_bce = bce_binary_head_loss(
-                    logits,
-                    node_mask,
-                    packed.node_type,
-                    packed.y_bits,
-                    sample_weight=sample_weight,
-                    label_smoothing=args.label_smoothing,
-                )
-
-                loss_par = args.parity_lambda * parity_auxiliary_loss(
-                    logits,
-                    node_mask,
-                    packed.node_type,
-                    H_sub=packed.H_sub,
-                )
-
-                loss_proj = torch.tensor(0.0, device=device)
-                if args.projection_aware:
-                    data_mask = (packed.node_type == 0) & node_mask
-                    proj_bits = projection_aware_logits_to_bits(
-                        logits,
-                        projector_kwargs={
-                            "H_sub": packed.H_sub,
-                            "side": getattr(packed.meta, "side", "Z"),
-                        },
-                        data_mask=data_mask,
-                    )
-                    with torch.no_grad():
-                        mask_data = data_mask.detach().cpu().numpy()
-                        target_full = (
-                            packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
+                        hard = (0.5 if teach.get("valid", True) else 1.5) + (
+                            0.5 if teach.get("matched_local_ml", False) else 1.0
                         )
-                        target_data = target_full[mask_data]
+                        sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
 
-                    proj_target = torch.from_numpy(target_data).to(device)
-                    proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
+                        loss_bce = bce_binary_head_loss(
+                            logits,
+                            node_mask,
+                            packed.node_type,
+                            packed.y_bits,
+                            sample_weight=sample_weight,
+                            label_smoothing=args.label_smoothing,
+                        )
 
-                    raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
-                    loss_proj = 0.5 * F.l1_loss(
-                        proj_pred.float(), proj_target.float()
-                    ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+                        loss_par = args.parity_lambda * parity_auxiliary_loss(
+                            logits,
+                            node_mask,
+                            packed.node_type,
+                            H_sub=packed.H_sub,
+                        )
 
-                sample_loss = loss_bce + loss_par + 0.5 * loss_proj
-                batch_loss = batch_loss + sample_loss
+                        loss_proj = torch.tensor(0.0, device=device)
+                        if args.projection_aware:
+                            data_mask = (packed.node_type == 0) & node_mask
+                            proj_bits = projection_aware_logits_to_bits(
+                                logits,
+                                projector_kwargs={
+                                    "H_sub": packed.H_sub,
+                                    "side": getattr(packed.meta, "side", "Z"),
+                                },
+                                data_mask=data_mask,
+                            )
+                            with torch.no_grad():
+                                mask_data = data_mask.detach().cpu().numpy()
+                                target_full = (
+                                    packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
+                                )
+                                target_data = target_full[mask_data]
 
-            batch_size = len(moved)
-            batch_loss = batch_loss / batch_size
-            batch_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
-            opt.step()
+                            proj_target = torch.from_numpy(target_data).to(device)
+                            proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
 
-            total_loss += batch_loss.item() * batch_size
-            n_items += batch_size
-            steps_done += 1
-            if prog_stride and (steps_done % prog_stride == 0):
-                prog = {
-                    "epoch": epoch,
-                    "step": int(steps_done),
-                    "steps": int(steps_total),
-                    "avg": float(total_loss / max(n_items, 1)),
-                    "secs": float(time.time() - t0),
-                }
-                print(json.dumps(prog, separators=(",", ":")), flush=True)
+                            raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
+                            loss_proj = 0.5 * F.l1_loss(
+                                proj_pred.float(), proj_target.float()
+                            ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
+
+                        sample_loss = loss_bce + loss_par + 0.5 * loss_proj
+                        batch_loss = batch_loss + sample_loss
+
+                batch_size = len(moved)
+                batch_loss = batch_loss / batch_size
+                _backward_and_step(batch_loss)
+
+                total_loss += batch_loss.detach().item() * batch_size
+                n_items += batch_size
+                steps_done += 1
+                if prog_stride and (steps_done % prog_stride == 0):
+                    prog = {
+                        "epoch": epoch,
+                        "step": int(steps_done),
+                        "steps": int(steps_total),
+                        "avg": float(total_loss / max(n_items, 1)),
+                        "secs": float(time.time() - t0),
+                    }
+                    print(json.dumps(prog, separators=(",", ":")), flush=True)
 
         sched.step()
         dt = time.time() - t0
@@ -1079,12 +1193,20 @@ def train_inprocess(ns) -> str:
         prev_epoch_loss = avg
 
         if rank == 0:
-            torch.save({"model": model.module.state_dict() if is_distributed else model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "last.pt")
+            torch.save({
+                "model": model.module.state_dict() if is_distributed else model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "epoch": epoch,
+                "loss": avg
+            }, save_dir / "last.pt")
             if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
                 best_loss = avg
-                torch.save(
-                    {"model": model.module.state_dict() if is_distributed else model.state_dict(), "epoch": epoch, "loss": avg}, save_dir / "best.pt"
-                )
+                torch.save({
+                    "model": model.module.state_dict() if is_distributed else model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "epoch": epoch,
+                    "loss": avg
+                }, save_dir / "best.pt")
 
             log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
             if use_online:
@@ -1248,11 +1370,12 @@ class OnlineSurfaceDataset(IterableDataset):
     Iterable dataset for online surface code simulation.
     Generates crops on-the-fly using multiple workers.
     """
-    def __init__(self, args, p_epoch, epoch, shots_per_worker, teacher_mix, ctx_vec=None, llr_overrides=None, rank=0):
+    def __init__(self, args, p_epoch, epoch, shots_total, teacher_mix, ctx_vec=None, llr_overrides=None, rank=0):
         self.args = args
         self.p_epoch = p_epoch
         self.epoch = epoch
-        self.shots_to_do = shots_per_worker
+        # shots_total refers to the per-rank budget; workers will partition this in __iter__
+        self.shots_to_do = shots_total
         self.teacher_mix = teacher_mix
         self.ctx_vec = ctx_vec
         self.llr_overrides = llr_overrides
@@ -1270,8 +1393,17 @@ class OnlineSurfaceDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
             worker_id = 0
+            num_workers = 1
         else:
             worker_id = worker_info.id
+            num_workers = max(1, worker_info.num_workers)
+        
+        # Split the per-rank shot budget across workers to avoid duplicating work
+        base = self.shots_to_do // num_workers
+        remainder = self.shots_to_do % num_workers
+        shots_for_this_worker = base + (1 if worker_id < remainder else 0)
+        if shots_for_this_worker <= 0:
+            return
         
         # Seed RNG for this worker
         # Ensure distinct seeds across ranks and workers
@@ -1282,7 +1414,7 @@ class OnlineSurfaceDataset(IterableDataset):
         global _WORKER_TEACHERS_CACHE
         
         shots_done = 0
-        while shots_done < self.shots_to_do:
+        while shots_done < shots_for_this_worker:
             # Pick a distance for this shot
             d = int(rng.choice(self.distances))
             
@@ -1299,8 +1431,8 @@ class OnlineSurfaceDataset(IterableDataset):
             # Get or create teachers for this distance
             if d not in _WORKER_TEACHERS_CACHE:
                 _WORKER_TEACHERS_CACHE[d] = self._init_teachers_for_d(d)
-            
-            mwpf_teacher, mwpm_ctx, lsd_teacher = _WORKER_TEACHERS_CACHE[d]
+
+            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher = _WORKER_TEACHERS_CACHE[d]
             
             # Handle erasure
             erase_local = None
@@ -1337,17 +1469,57 @@ class OnlineSurfaceDataset(IterableDataset):
                     additional_synX = (Hx @ erasure_err_z) % 2
                     sample["synX"] = (sample["synX"] ^ additional_synX).astype(np.uint8)
 
-            yield from self._process_sample(sample, shot_seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local)
+            yield from self._process_sample(
+                sample,
+                shot_seed,
+                mwpf_teacher,
+                mwpm_ctx,
+                lsd_teacher,
+                rng,
+                d,
+                erase_local,
+                nvqldpc_teacher=nvqldpc_teacher,
+            )
             
             shots_done += 1
 
     def _init_teachers_for_d(self, d):
-        from mghd.codes.registry import get_code
-        code = get_code(self.args.family, distance=d)
-        
-        use_mwpf = self.teacher_mix.get("mwpf", 0.0) > 0.0
+        # Build Hx/Hz directly from a CUDA-Q sample so that
+        # - parity-check dimensions match the online sampler's syndromes, and
+        # - nvqldpc (and other teachers) see a consistent PCM.
+        base_p = float(getattr(self.args, "p", 0.005))
+        sample = sample_round(
+            d=d,
+            p=base_p,
+            seed=0,
+            profile_path=self.args.qpu_profile if getattr(self.args, "qpu_profile", None) else None,
+        )
+        Hx = np.asarray(sample["Hx"], dtype=np.uint8)
+        Hz = np.asarray(sample["Hz"], dtype=np.uint8)
+
+        mx = Hx.shape[0]
+        mz = Hz.shape[0]
+        dets_per_fault = []
+        for col in range(Hx.shape[1]):
+            dets = []
+            dets.extend(np.flatnonzero(Hx[:, col]).tolist())
+            dets.extend((mx + np.flatnonzero(Hz[:, col])).tolist())
+            dets_per_fault.append(dets)
+
+        code = SimpleNamespace(
+            Hx=Hx,
+            Hz=Hz,
+            detectors_per_fault=dets_per_fault,
+            fault_weights=[1.0] * Hx.shape[1],
+            num_detectors=mx + mz,
+            n=Hx.shape[1],
+        )
+
+        commutes = not np.any((Hx % 2) @ (Hz.T % 2) % 2)
+        use_mwpf = self.teacher_mix.get("mwpf", 0.0) > 0.0 and commutes
         use_mwpm = self.teacher_mix.get("mwpm", 0.0) > 0.0
         use_lsd = self.teacher_mix.get("lsd", 0.0) > 0.0
+        use_nvqldpc = self.teacher_mix.get("nvqldpc", 0.0) > 0.0
 
         mwpf_teacher = None
         if use_mwpf:
@@ -1364,10 +1536,16 @@ class OnlineSurfaceDataset(IterableDataset):
                 lsd_teacher = LSDTeacher(code.Hx, code.Hz)
             except Exception:
                 lsd_teacher = None
-                
-        return mwpf_teacher, mwpm_ctx, lsd_teacher
 
-    def _process_sample(self, sample, seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local=None):
+        nvqldpc_teacher = None
+        if use_nvqldpc:
+            # For nvqldpc we enforce strict behavior: construction errors
+            # should propagate rather than silently disabling the teacher.
+            nvqldpc_teacher = NvQldpcTeacher(code.Hx, code.Hz)
+
+        return mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher
+
+    def _process_sample(self, sample, seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local=None, nvqldpc_teacher=None):
         # Logic extracted from the main loop
         # Pack detectors in canonical Z→X order for MWPFTeacher
         dets_global = np.concatenate(
@@ -1408,6 +1586,15 @@ class OnlineSurfaceDataset(IterableDataset):
             except Exception:
                 ex_glob = ez_glob = None
 
+        # Compute NvQldpc once per sample (GPU BP+OSD teacher, strict)
+        ex_nq = ez_nq = None
+        if nvqldpc_teacher is not None:
+            ex_arr, ez_arr = nvqldpc_teacher.decode_batch_xz(
+                syndromes_x=sample["synX"][None, :],
+                syndromes_z=sample["synZ"][None, :],
+            )
+            ex_nq, ez_nq = ex_arr[0], ez_arr[0]
+
         for side in ("Z", "X"):
             comps = split_components_for_side(
                 side=side,
@@ -1437,13 +1624,20 @@ class OnlineSurfaceDataset(IterableDataset):
                 if mwpm_ctx is not None:
                     bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
                     outputs["mwpm"] = (bits_pm.astype(np.uint8), int(w_pm))
-                
+
                 # LSD
                 if lsd_teacher is not None and (ex_glob is not None and ez_glob is not None):
                     bits_global = ex_glob if side == "Z" else ez_glob
                     if qubit_indices.size and bits_global.size > qubit_indices.max():
                         bits_local = bits_global[qubit_indices].astype(np.uint8)
                         outputs["lsd"] = (bits_local, int(bits_local.sum()))
+
+                # NvQldpc (GPU BP+OSD)
+                if nvqldpc_teacher is not None and (ex_nq is not None and ez_nq is not None):
+                    bits_global = ex_nq if side == "Z" else ez_nq
+                    if qubit_indices.size and bits_global.size > qubit_indices.max():
+                        bits_local = bits_global[qubit_indices].astype(np.uint8)
+                        outputs["nvqldpc"] = (bits_local, int(bits_local.sum()))
                 
                 # Choose teacher
                 weighted = []
@@ -1517,5 +1711,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

@@ -16,6 +16,7 @@ import os
 from typing import Any
 
 import numpy as np
+import warnings
 
 from . import SampleBatch
 from . import register_sampler
@@ -24,6 +25,68 @@ from . import register_sampler
 # ---------------------------------------------------------------------------
 # Local wrappers bridging CUDA-Q backend to sampler surface
 # ---------------------------------------------------------------------------
+
+
+def _try_cudaq_gpu_surface(
+    d: int,
+    batch_size: int,
+    T: int,
+    layout: dict[str, Any] | None,
+    *,
+    phys_p: float | None,
+    noise_scale: float | None,
+    profile_json: str | None,
+):
+    """
+    Best-effort GPU sampling via CUDA-Q if target 'nvidia' is available.
+    Falls back by raising on any error so the caller can use CPU path.
+    """
+    try:
+        import cudaq
+        import cudaq_qec as qec
+        cudaq.set_target("nvidia")
+    except Exception as exc:
+        raise RuntimeError(f"cudaq GPU target unavailable: {exc}") from exc
+
+    # Build code via CUDA-Q QEC helpers
+    try:
+        code = qec.qecrt.get_code("surface_code", distance=int(d))
+    except Exception as exc:
+        raise RuntimeError(f"cudaq_qec get_code failed: {exc}") from exc
+
+    # Minimal noise model: map phys_p/noise_scale into depolarizing channels.
+    # This is a coarse approximation; if more detailed mapping is needed,
+    # extend this section. If no noise params are provided, use noiseless.
+    noise = None
+    try:
+        if phys_p is not None or noise_scale is not None or profile_json is not None:
+            p_base = float(phys_p) if phys_p is not None else 0.001
+            if noise_scale is not None:
+                try:
+                    p_base *= float(noise_scale)
+                except Exception:
+                    pass
+            noise = cudaq.NoiseModel()
+            # Apply depolarizing channels to 1q and 2q gates as a rough proxy.
+            noise.add_all_qubit_channel("x", cudaq.DepolarizationChannel(p_base))
+            noise.add_all_qubit_channel("rx", cudaq.DepolarizationChannel(p_base))
+            noise.add_all_qubit_channel("cx", cudaq.DepolarizationChannel(min(0.1, 2 * p_base)))
+    except Exception:
+        # If noise construction fails, fall back to noiseless
+        noise = None
+
+    try:
+        res = qec.qecrt.sample_memory_circuit(code, int(batch_size), int(T), noise)
+    except Exception as exc:
+        raise RuntimeError(f"cudaq_qec.sample_memory_circuit failed: {exc}") from exc
+
+    # sample_memory_circuit returns a tuple; we expect first element to be a 2D array
+    if not isinstance(res, tuple) or len(res) == 0:
+        raise RuntimeError("cudaq_qec.sample_memory_circuit returned unexpected format")
+    arr = np.array(res[0])
+    if arr.ndim != 2:
+        raise RuntimeError(f"cudaq_qec.sample_memory_circuit returned array with ndim={arr.ndim}")
+    return arr.astype(np.uint8)
 
 
 def cudaq_sample_surface_wrapper(
@@ -36,6 +99,9 @@ def cudaq_sample_surface_wrapper(
     bitpack: bool = False,
     surface_layout: str = "planar",
     profile_json: str | None = None,
+    *,
+    phys_p: float | None = None,
+    noise_scale: float | None = None,
 ) -> np.ndarray:
     """Sample one CUDA-Q surface-code round with circuit-level noise.
 
@@ -63,16 +129,37 @@ def cudaq_sample_surface_wrapper(
         rng = np.random.default_rng()
     from mghd.samplers.cudaq_backend.syndrome_gen import sample_surface_cudaq
 
-    result = sample_surface_cudaq(
-        mode=mode,
-        batch_size=batch_size,
-        T=T,
-        layout=layout,
-        rng=rng,
-        bitpack=bitpack,
-        surface_layout=surface_layout,
-        profile_json=profile_json,
-    )
+    # Optional GPU path: guard with env to avoid surprising failures.
+    use_gpu = os.getenv("MGHD_CUDAQ_GPU", "0") == "1"
+    result = None
+    if use_gpu:
+        try:
+            result = _try_cudaq_gpu_surface(
+                d=d,
+                batch_size=batch_size,
+                T=T,
+                layout=layout,
+                phys_p=phys_p,
+                noise_scale=noise_scale,
+                profile_json=profile_json,
+            )
+        except Exception as exc:
+            warnings.warn(f"CUDA-Q GPU sampler unavailable, falling back to CPU path ({exc})")
+            result = None
+
+    if result is None:
+        result = sample_surface_cudaq(
+            mode=mode,
+            batch_size=batch_size,
+            T=T,
+            layout=layout,
+            rng=rng,
+            bitpack=bitpack,
+            surface_layout=surface_layout,
+            phys_p=phys_p,
+            noise_scale=noise_scale,
+            profile_json=profile_json,
+        )
     expected_x = len(layout.get("ancilla_x", []))
     expected_z = len(layout.get("ancilla_z", []))
     expected_n = len(layout.get("data", []))

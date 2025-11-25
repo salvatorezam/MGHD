@@ -1,0 +1,58 @@
+[
+  {
+    "distance": 3,
+    "p": 0.007,
+    "shots": 10000,
+    "ler_mghd": 0.04085,
+    "ler_mwpm": null,
+    "ler_lsd": 0.03795
+  },
+  {
+    "distance": 3,
+    "p": 0.006,
+    "shots": 10000,
+    "ler_mghd": 0.03605,
+    "ler_mwpm": null,
+    "ler_lsd": 0.03295
+  },
+  {
+    "distance": 3,
+    "p": 0.005,
+    "shots": 10000,
+    "ler_mghd": 0.0294,
+    "ler_mwpm": null,
+    "ler_lsd": 0.02705
+  },
+  {
+    "distance": 3,
+    "p": 0.004,
+    "shots": 10000,
+    "ler_mghd": 0.02465,
+    "ler_mwpm": null,
+    "ler_lsd": 0.02215
+  },
+  {
+    "distance": 3,
+    "p": 0.003,
+    "shots": 10000,
+    "ler_mghd": 0.01695,
+    "ler_mwpm": null,
+    "ler_lsd": 0.0156
+  },
+  {
+    "distance": 3,
+    "p": 0.002,
+    "shots": 10000,
+    "ler_mghd": 0.01695,
+    "ler_mwpm": null,
+    "ler_lsd": 0.0156
+  },
+  {
+    "distance": 3,
+    "p": 0.001,
+    "shots": 10000,
+    "ler_mghd": 0.01695,
+    "ler_mwpm": null,
+    "ler_lsd": 0.0156
+  }
+]
