@@ -398,41 +398,75 @@ def save_npz(
 
 @cache
 def build_surface_rotated_H(d: int) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Construct rotated planar surface Hx/Hz with metadata for odd distance d."""
+    """Construct rotated planar surface code Hx/Hz with metadata for odd distance d.
+
+    The rotated surface code places data qubits on a d x d grid.
+    Stabilizers are centered on plaquettes (half-integer coordinates):
+    - Interior plaquettes have weight 4 (touching 4 data qubits)
+    - Boundary plaquettes have weight 2 (touching 2 data qubits)
+
+    The stabilizer type (X or Z) alternates in a checkerboard pattern.
+    For X-memory configuration:
+    - Smooth boundaries (top/bottom) have Z stabilizers only
+    - Rough boundaries (left/right) have X stabilizers only
+
+    This ensures CSS commutativity: Hx @ Hz.T = 0 (mod 2).
+    """
     if d < 1 or d % 2 == 0:
         raise ValueError("Rotated surface code requires odd distance >= 1")
+
     n_data = d * d
-    hz_rows = []
-    hx_rows = []
+    hz_rows: list[np.ndarray] = []
+    hx_rows: list[np.ndarray] = []
 
     def q_index(r: int, c: int) -> int:
         return r * d + c
 
-    center = d // 2
-
-    for r in range(d):
-        for c in range(d):
-            parity = (r + c) % 2
-            qubits = {q_index(r, c)}
-            if r - 1 >= 0:
-                qubits.add(q_index(r - 1, c))
-            if r + 1 < d:
-                qubits.add(q_index(r + 1, c))
-            if c - 1 >= 0:
-                qubits.add(q_index(r, c - 1))
-            if c + 1 < d:
-                qubits.add(q_index(r, c + 1))
-            if parity == 1:
-                row = np.zeros(n_data, dtype=np.uint8)
-                row[list(qubits)] = 1
-                hz_rows.append(row)
-            elif parity == 0 and not (r == center and c == center):
-                row = np.zeros(n_data, dtype=np.uint8)
-                row[list(qubits)] = 1
+    # Interior plaquettes: weight-4 stabilizers at (r+0.5, c+0.5)
+    # touching qubits at (r,c), (r+1,c), (r,c+1), (r+1,c+1)
+    for r in range(d - 1):
+        for c in range(d - 1):
+            qubits = [q_index(r, c), q_index(r + 1, c),
+                      q_index(r, c + 1), q_index(r + 1, c + 1)]
+            row = np.zeros(n_data, dtype=np.uint8)
+            row[qubits] = 1
+            # Checkerboard: (r + c) even => X stabilizer, odd => Z stabilizer
+            if (r + c) % 2 == 0:
                 hx_rows.append(row)
+            else:
+                hz_rows.append(row)
 
-    hz = np.vstack(hz_rows)
-    hx = np.vstack(hx_rows)
+    # Boundary stabilizers: weight-2
+    # Top boundary (smooth): Z stabilizers where interior parity would be odd
+    for c in range(d - 1):
+        if ((-1) + c) % 2 != 0:  # parity at virtual row -1
+            row = np.zeros(n_data, dtype=np.uint8)
+            row[[q_index(0, c), q_index(0, c + 1)]] = 1
+            hz_rows.append(row)
+
+    # Bottom boundary (smooth): Z stabilizers
+    for c in range(d - 1):
+        if ((d - 1) + c) % 2 != 0:  # parity at row d-1
+            row = np.zeros(n_data, dtype=np.uint8)
+            row[[q_index(d - 1, c), q_index(d - 1, c + 1)]] = 1
+            hz_rows.append(row)
+
+    # Left boundary (rough): X stabilizers where interior parity would be even
+    for r in range(d - 1):
+        if (r + (-1)) % 2 == 0:  # parity at virtual col -1
+            row = np.zeros(n_data, dtype=np.uint8)
+            row[[q_index(r, 0), q_index(r + 1, 0)]] = 1
+            hx_rows.append(row)
+
+    # Right boundary (rough): X stabilizers
+    for r in range(d - 1):
+        if (r + (d - 1)) % 2 == 0:  # parity at col d-1
+            row = np.zeros(n_data, dtype=np.uint8)
+            row[[q_index(r, d - 1), q_index(r + 1, d - 1)]] = 1
+            hx_rows.append(row)
+
+    hz = np.vstack(hz_rows) if hz_rows else np.zeros((0, n_data), dtype=np.uint8)
+    hx = np.vstack(hx_rows) if hx_rows else np.zeros((0, n_data), dtype=np.uint8)
 
     meta = {
         "code": "surface_rotated",

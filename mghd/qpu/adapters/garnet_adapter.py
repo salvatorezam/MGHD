@@ -37,9 +37,13 @@ from mghd.samplers.cudaq_backend.garnet_noise import (
     FOUNDATION_DEFAULTS,  # single source of truth for noise
 )
 
-_USE_SYNTH = os.getenv("MGHD_SYNTHETIC", "0") == "1"
 _MODE = os.getenv("MGHD_MODE", "foundation")  # {"foundation","student"}
 _NEIGHBOR_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def _use_synth() -> bool:
+    """Check if synthetic sampling should be used (evaluated at call time)."""
+    return os.getenv("MGHD_SYNTHETIC", "0") == "1"
 
 
 def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -> dict[str, Any]:
@@ -52,7 +56,7 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
     - coords_c: float32 check coordinates (Z first then X), half‑offset preserved
     - dem_meta: metadata for downstream teachers (opaque)
     """
-    if _USE_SYNTH:
+    if _use_synth():
         return _synthetic_sample_round(d, p, seed)
 
     # Check if we should use Stim for circuit-level noise

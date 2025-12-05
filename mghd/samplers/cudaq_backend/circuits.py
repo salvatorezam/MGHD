@@ -70,11 +70,17 @@ def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
       For d=3: q00=0, q01=1, q02=2, q10=3, q11=4, q12=5, q20=6, q21=7, q22=8
       For d=5: q00=0, q01=1, ..., q04=4, q10=5, ..., q44=24
 
+    The rotated surface code has:
+    - Interior weight-4 plaquette stabilizers at (r+0.5, c+0.5) coordinates
+    - Boundary weight-2 stabilizers on edges
+    - X stabilizers on rough boundaries (left/right) + interior even parity
+    - Z stabilizers on smooth boundaries (top/bottom) + interior odd parity
+
     Returns:
-      (Hz, Hx) as numpy arrays
-      Hz: (d*(d-1), d*d) - Z stabilizers
-      Hx: ((d-1)*d, d*d) - X stabilizers
-      Columns correspond to data-qubit order 0..(d²-1) in row-major order.
+      (Hz, Hx) as numpy arrays with CSS commutation property: Hx @ Hz.T = 0 (mod 2)
+      Hz: Z stabilizers (detect X errors)
+      Hx: X stabilizers (detect Z errors)
+      Each matrix has (d²-1)/2 rows and d² columns.
     """
     try:
         from codes_q import create_rotated_surface_codes  # optional external helper
@@ -84,36 +90,58 @@ def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
         Hz = css.hz.astype(int)
         return Hz, Hx
     except ImportError:
-        # Fallback: create rotated surface code matrices manually
+        # Build proper rotated surface code with plaquette stabilizers
         n_data = d * d
-        n_z_checks = d * (d - 1)  # Z stabilizers
-        n_x_checks = (d - 1) * d  # X stabilizers
+        hz_rows: list[np.ndarray] = []
+        hx_rows: list[np.ndarray] = []
 
-        # Initialize matrices
-        Hz = np.zeros((n_z_checks, n_data), dtype=int)
-        Hx = np.zeros((n_x_checks, n_data), dtype=int)
+        def q_index(r: int, c: int) -> int:
+            return r * d + c
 
-        # Build Z stabilizers (horizontal edges in rotated lattice)
-        z_check_idx = 0
-        for row in range(d):
-            for col in range(d - 1):
-                # Z check connects qubits (row, col) and (row, col+1)
-                q1 = row * d + col
-                q2 = row * d + col + 1
-                Hz[z_check_idx, q1] = 1
-                Hz[z_check_idx, q2] = 1
-                z_check_idx += 1
+        # Interior plaquettes: weight-4 stabilizers at (r+0.5, c+0.5)
+        for r in range(d - 1):
+            for c in range(d - 1):
+                qubits = [q_index(r, c), q_index(r + 1, c),
+                          q_index(r, c + 1), q_index(r + 1, c + 1)]
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[qubits] = 1
+                # Checkerboard: (r + c) even => X stabilizer, odd => Z stabilizer
+                if (r + c) % 2 == 0:
+                    hx_rows.append(row)
+                else:
+                    hz_rows.append(row)
 
-        # Build X stabilizers (vertical edges in rotated lattice)
-        x_check_idx = 0
-        for row in range(d - 1):
-            for col in range(d):
-                # X check connects qubits (row, col) and (row+1, col)
-                q1 = row * d + col
-                q2 = (row + 1) * d + col
-                Hx[x_check_idx, q1] = 1
-                Hx[x_check_idx, q2] = 1
-                x_check_idx += 1
+        # Boundary stabilizers: weight-2
+        # Top boundary (smooth): Z stabilizers where parity at virtual row -1 is odd
+        for c in range(d - 1):
+            if ((-1) + c) % 2 != 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(0, c), q_index(0, c + 1)]] = 1
+                hz_rows.append(row)
+
+        # Bottom boundary (smooth): Z stabilizers
+        for c in range(d - 1):
+            if ((d - 1) + c) % 2 != 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(d - 1, c), q_index(d - 1, c + 1)]] = 1
+                hz_rows.append(row)
+
+        # Left boundary (rough): X stabilizers where parity at virtual col -1 is even
+        for r in range(d - 1):
+            if (r + (-1)) % 2 == 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(r, 0), q_index(r + 1, 0)]] = 1
+                hx_rows.append(row)
+
+        # Right boundary (rough): X stabilizers
+        for r in range(d - 1):
+            if (r + (d - 1)) % 2 == 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(r, d - 1), q_index(r + 1, d - 1)]] = 1
+                hx_rows.append(row)
+
+        Hz = np.vstack(hz_rows) if hz_rows else np.zeros((0, n_data), dtype=np.uint8)
+        Hx = np.vstack(hx_rows) if hx_rows else np.zeros((0, n_data), dtype=np.uint8)
 
         return Hz, Hx
 

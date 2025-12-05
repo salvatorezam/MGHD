@@ -9,7 +9,9 @@ import json
 import time
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,6 +28,89 @@ from mghd.samplers.cudaq_sampler import CudaQSampler
 from mghd.samplers.stim_sampler import StimSampler
 from mghd.utils.graphlike import is_graphlike
 from mghd.utils.metrics import logical_error_rate
+
+
+@dataclass
+class PhenomenologicalBatch:
+    """Sample batch from phenomenological noise model."""
+    dets: np.ndarray  # Combined syndromes [synX | synZ] for compatibility
+    obs: np.ndarray   # Logical observables
+    synX: np.ndarray  # X-stabilizer syndromes (detect Z errors)
+    synZ: np.ndarray  # Z-stabilizer syndromes (detect X errors)
+    err_x: np.ndarray # X errors (for debugging)
+    err_z: np.ndarray # Z errors (for debugging)
+    meta: dict
+
+
+class PhenomenologicalSampler:
+    """Sampler that generates IID phenomenological noise on surface codes.
+    
+    This produces both X and Z syndromes from independent data qubit errors,
+    matching the training setup used with CUDA-Q.
+    """
+    
+    def __init__(self, p: float = 0.01):
+        self.p = p
+    
+    def sample(self, code_obj, n_shots: int, seed: Optional[int] = None) -> PhenomenologicalBatch:
+        """Sample phenomenological errors and compute syndromes."""
+        rng = np.random.default_rng(seed)
+        
+        Hx = np.asarray(code_obj.Hx, dtype=np.uint8)
+        Hz = np.asarray(code_obj.Hz, dtype=np.uint8)
+        n_data = Hx.shape[1]
+        mx = Hx.shape[0]
+        mz = Hz.shape[0]
+        
+        # Generate IID errors
+        err_x = (rng.random((n_shots, n_data)) < self.p).astype(np.uint8)
+        err_z = (rng.random((n_shots, n_data)) < self.p).astype(np.uint8)
+        
+        # Compute syndromes
+        # X checks (Hx) detect Z errors: synX = (Hx @ err_z.T).T % 2
+        synX = (err_z @ Hx.T) % 2
+        # Z checks (Hz) detect X errors: synZ = (Hz @ err_x.T).T % 2
+        synZ = (err_x @ Hz.T) % 2
+        
+        # Combined detector array for compatibility with _resolve_syndromes
+        # Format: [synX | synZ] so that detectors_to_syndromes works correctly
+        dets = np.concatenate([synX, synZ], axis=1).astype(np.uint8)
+        
+        # Compute logical observables
+        # For surface code: Lx detects Z logical errors, Lz detects X logical errors
+        Lx = getattr(code_obj, 'Lx', None)
+        Lz = getattr(code_obj, 'Lz', None)
+        
+        obs_list = []
+        if Lz is not None:
+            Lz_arr = np.asarray(Lz, dtype=np.uint8)
+            if Lz_arr.ndim == 1:
+                Lz_arr = Lz_arr.reshape(1, -1)
+            # X errors flip Z logical: obs_z = (err_x @ Lz.T) % 2
+            obs_z = (err_x @ Lz_arr.T) % 2
+            obs_list.append(obs_z)
+        if Lx is not None:
+            Lx_arr = np.asarray(Lx, dtype=np.uint8)
+            if Lx_arr.ndim == 1:
+                Lx_arr = Lx_arr.reshape(1, -1)
+            # Z errors flip X logical: obs_x = (err_z @ Lx.T) % 2  
+            obs_x = (err_z @ Lx_arr.T) % 2
+            obs_list.append(obs_x)
+        
+        if obs_list:
+            obs = np.concatenate(obs_list, axis=1).astype(np.uint8)
+        else:
+            obs = np.zeros((n_shots, 1), dtype=np.uint8)
+        
+        return PhenomenologicalBatch(
+            dets=dets,
+            obs=obs,
+            synX=synX.astype(np.uint8),
+            synZ=synZ.astype(np.uint8),
+            err_x=err_x,
+            err_z=err_z,
+            meta={'sampler': 'phenomenological', 'p': self.p},
+        )
 
 def align_preds(preds, obs_true):
     """Align predictions with ground truth observables."""
@@ -115,12 +200,13 @@ def evaluate(args):
         # LSD
         lsd = LSDTeacher(Hx_dense, Hz_dense)
 
-        # MWPF (hypergraph) — optional; may fall back internally if mwpf not available
+        # MWPF (hypergraph) — DISABLED: crashes with Rust panic on larger/complex syndromes
+        # that cannot be caught by Python exception handling
         mwpf_teacher = None
-        try:
-            mwpf_teacher = MWPFTeacher(code)
-        except Exception as exc:
-            print(f"  MWPFTeacher unavailable for d={d}: {exc}")
+        # try:
+        #     mwpf_teacher = MWPFTeacher(code)
+        # except Exception as exc:
+        #     print(f"  MWPFTeacher unavailable for d={d}: {exc}")
         
         for p in p_values:
             # Check if already computed
@@ -130,13 +216,17 @@ def evaluate(args):
 
             print(f"  Testing p={p}...")
             if args.sampler == "stim":
-                sampler = StimSampler(rounds=d, dep=p)  # rounds=d for phenomenological/circuit
+                sampler = StimSampler(rounds=1, dep=p)  # rounds=1 to match training (single-round phenomenological)
             elif args.sampler == "cudaq":
                 # CudaQSampler expects phys_p/noise_scale in profile_kwargs
                 pk = {"phys_p": p, "rounds": d}
                 if getattr(args, "noise_scale", None) is not None:
                     pk["noise_scale"] = float(args.noise_scale)
                 sampler = CudaQSampler(device_profile="garnet", profile_kwargs=pk)
+            elif args.sampler == "phenomenological":
+                # Phenomenological sampler generates IID X/Z errors with both syndrome types
+                # This matches the training setup better than Stim's circuit-level simulation
+                sampler = PhenomenologicalSampler(p=p)
             else:
                 raise ValueError(f"Unknown sampler: {args.sampler}")
             
@@ -147,9 +237,8 @@ def evaluate(args):
                     import stim
                     import pymatching
                     # Re-generate circuit to match StimSampler's configuration
-                    # For Stim sampler, we use rounds=d (full circuit).
-                    # For CudaQ sampler, we use rounds=1 because CudaQSampler currently returns single-round syndromes.
-                    mwpm_rounds = d if args.sampler == "stim" else 1
+                    # Use rounds=1 to match the single-round sampling (phenomenological-like)
+                    mwpm_rounds = 1
                     circuit = stim.Circuit.generated(
                         "surface_code:rotated_memory_x",
                         distance=d,
@@ -183,16 +272,23 @@ def evaluate(args):
                 # Ground truth observables
                 obs_true = batch.obs
                 
-                # --- MGHD Decoding ---
-                sx, sz = _resolve_syndromes(code, batch.dets)
+                # --- Get syndromes ---
+                # For phenomenological sampler, use direct synX/synZ
+                # For Stim/CUDA-Q, use _resolve_syndromes
+                if hasattr(batch, 'synX') and hasattr(batch, 'synZ'):
+                    sx = batch.synX
+                    sz = batch.synZ
+                else:
+                    sx, sz = _resolve_syndromes(code, batch.dets)
                 
+                # --- MGHD Decoding ---
                 preds_mghd = []
                 for i in range(this_batch):
-                    # Z errors (from sx)
+                    # Z errors (from sx - X checks detect Z errors)
                     res_z = mghd_Z.decode(sx[i])
                     ez = res_z["e"]
                     
-                    # X errors (from sz)
+                    # X errors (from sz - Z checks detect X errors)
                     res_x = mghd_X.decode(sz[i])
                     ex = res_x["e"]
                     
@@ -224,7 +320,7 @@ def evaluate(args):
                     failures_mwpm += float(ler_res_mwpm.ler_mean) * this_batch
                 elif mwpm_enabled and mwpm_ctx is not None:
                     preds_mwpm = []
-                    for i in range(args.batch_size):
+                    for i in range(this_batch):
                         ez_pm, _ = mwpm_ctx.decode(Hx_dense, sx[i], "Z")
                         ex_pm, _ = mwpm_ctx.decode(Hz_dense, sz[i], "X")
                         obs_pred = code.data_to_observables(ex_pm, ez_pm)
@@ -236,10 +332,17 @@ def evaluate(args):
                         print(f"MWPM LER Error: {ler_res_mwpm.notes}")
                         print(f"obs_true shape: {obs_true.shape}, preds_mwpm shape: {preds_mwpm.shape}")
                         sys.exit(1)
-                    failures_mwpm += ler_res_mwpm.ler_mean * args.batch_size
+                    failures_mwpm += float(ler_res_mwpm.ler_mean) * this_batch
                 
                 # --- LSD Decoding ---
-                ex_lsd, ez_lsd = lsd.decode_batch_xz(sx, sz)
+                # NOTE: LSDTeacher.decode_batch_xz returns (ex, ez) where:
+                #   ex = Hx^{-1}(syndromes_x) - solves Hx @ ex = sx
+                #   ez = Hz^{-1}(syndromes_z) - solves Hz @ ez = sz
+                # But in CSS semantics: Hx detects Z errors, Hz detects X errors!
+                # So the naming is misleading - we need to swap:
+                #   The "ex" output is actually ez (Z errors from sx via Hx)
+                #   The "ez" output is actually ex (X errors from sz via Hz)
+                ez_lsd, ex_lsd = lsd.decode_batch_xz(sx, sz)  # Swapped!
                 preds_lsd = []
                 for i in range(this_batch):
                     obs_pred = code.data_to_observables(ex_lsd[i], ez_lsd[i])
@@ -255,7 +358,9 @@ def evaluate(args):
                 failures_lsd += float(ler_res_lsd.ler_mean) * this_batch
 
                 # --- MWPF Decoding (approximate ex/ez from fault_ids) ---
-                if mwpf_teacher is not None:
+                # NOTE: MWPF often crashes on large distances or complex syndromes.
+                # We catch exceptions and disable it for the rest of this (d, p) combo.
+                if mwpf_teacher is not None and failures_mwpf is not None:
                     try:
                         out_mwpf = mwpf_teacher.decode_batch(batch.dets)
                         fault_ids = np.asarray(out_mwpf.get("fault_ids"), dtype=np.int32)
@@ -280,13 +385,12 @@ def evaluate(args):
                             preds_mwpf = align_preds(preds_mwpf, obs_true)
 
                             ler_res_mwpf = logical_error_rate(obs_true, preds_mwpf)
-                            if ler_res_mwpf.ler_mean is None:
-                                print(f"MWPF LER Error: {ler_res_mwpf.notes}")
-                                sys.exit(1)
-                            failures_mwpf += float(ler_res_mwpf.ler_mean) * this_batch
+                            if ler_res_mwpf.ler_mean is not None:
+                                failures_mwpf += float(ler_res_mwpf.ler_mean) * this_batch
                     except Exception as exc:
-                        print(f"  MWPF decode failed at p={p}, d={d}: {exc}")
-                        mwpf_teacher = None
+                        print(f"\n  MWPF decode failed at d={d}, p={p}: {type(exc).__name__}")
+                        # Disable MWPF for the rest of this evaluation
+                        failures_mwpf = None
                 
                 total_shots += this_batch
                 
@@ -329,8 +433,119 @@ def evaluate(args):
         json.dump(results, f, indent=2)
     print(f"Results saved to {args.output}")
     
+    # Run sanity checks
+    sanity_check_results(results)
+    
     # Plot results
     plot_results(results, args.output)
+
+
+def sanity_check_results(results):
+    """Validate LER trends follow expected QEC behavior.
+    
+    Expected:
+    1. LER should increase with p at fixed d (more noise → more errors)
+    2. LER should decrease with d at fixed p (below threshold) — larger codes correct more
+    3. MGHD should be comparable to or better than teacher (LSD) on training distribution
+    """
+    print("\n" + "="*60)
+    print("SANITY CHECK: Validating LER trends")
+    print("="*60)
+    
+    warnings_found = []
+    
+    # Group by distance
+    by_d = defaultdict(list)
+    for r in results:
+        by_d[r["distance"]].append(r)
+    
+    # Check 1: LER increases with p at fixed d
+    print("\n[Check 1] LER should increase with p at fixed d:")
+    for d in sorted(by_d.keys()):
+        pts = sorted(by_d[d], key=lambda x: x["p"])
+        mghd_lers = [x["ler_mghd"] for x in pts]
+        lsd_lers = [x["ler_lsd"] for x in pts if x.get("ler_lsd") is not None]
+        
+        # Check MGHD trend
+        mghd_monotonic = all(mghd_lers[i] <= mghd_lers[i+1] + 0.001 for i in range(len(mghd_lers)-1))
+        status = "✓" if mghd_monotonic else "✗ WARNING"
+        print(f"  d={d}: MGHD {status}")
+        if not mghd_monotonic:
+            warnings_found.append(f"d={d}: MGHD LER not monotonic with p")
+        
+        # Check LSD trend (teacher baseline)
+        if lsd_lers:
+            lsd_monotonic = all(lsd_lers[i] <= lsd_lers[i+1] + 0.001 for i in range(len(lsd_lers)-1))
+            status = "✓" if lsd_monotonic else "✗ WARNING"
+            print(f"  d={d}: LSD  {status}")
+            if not lsd_monotonic:
+                warnings_found.append(f"d={d}: LSD LER not monotonic with p (baseline issue!)")
+    
+    # Check 2: LER decreases with d at fixed p (below threshold ~1%)
+    print("\n[Check 2] LER should decrease with d at fixed p (below threshold):")
+    by_p = defaultdict(list)
+    for r in results:
+        by_p[r["p"]].append(r)
+    
+    for p in sorted(by_p.keys()):
+        if p > 0.008:  # Skip above-threshold points
+            continue
+        pts = sorted(by_p[p], key=lambda x: x["distance"])
+        if len(pts) < 2:
+            continue
+        
+        mghd_lers = [x["ler_mghd"] for x in pts]
+        distances = [x["distance"] for x in pts]
+        
+        # Check if generally decreasing (allow some noise)
+        decreasing_count = sum(1 for i in range(len(mghd_lers)-1) if mghd_lers[i] >= mghd_lers[i+1] - 0.002)
+        is_decreasing = decreasing_count >= len(mghd_lers) - 2  # Allow 1 violation
+        
+        status = "✓" if is_decreasing else "✗ WARNING"
+        trend = " → ".join(f"d{d}:{ler:.4f}" for d, ler in zip(distances, mghd_lers))
+        print(f"  p={p:.4f}: {status} ({trend})")
+        if not is_decreasing:
+            warnings_found.append(f"p={p}: MGHD LER not decreasing with d")
+    
+    # Check 3: MGHD vs Teacher comparison
+    print("\n[Check 3] MGHD should match or beat LSD teacher:")
+    mghd_better = 0
+    mghd_worse = 0
+    mghd_worse_cases = []
+    
+    for r in results:
+        if r.get("ler_lsd") is None:
+            continue
+        diff = r["ler_mghd"] - r["ler_lsd"]
+        if diff <= 0.001:  # MGHD is better or equal (within noise)
+            mghd_better += 1
+        else:
+            mghd_worse += 1
+            mghd_worse_cases.append((r["distance"], r["p"], r["ler_mghd"], r["ler_lsd"]))
+    
+    total = mghd_better + mghd_worse
+    if total > 0:
+        pct_better = 100 * mghd_better / total
+        status = "✓" if pct_better >= 80 else "✗ WARNING"
+        print(f"  {status} MGHD ≤ LSD in {mghd_better}/{total} cases ({pct_better:.1f}%)")
+        
+        if mghd_worse_cases:
+            print("\n  Cases where MGHD > LSD:")
+            for d, p, ler_mghd, ler_lsd in mghd_worse_cases[:5]:
+                ratio = ler_mghd / max(ler_lsd, 1e-10)
+                print(f"    d={d}, p={p:.4f}: MGHD={ler_mghd:.5f}, LSD={ler_lsd:.5f} (ratio={ratio:.2f}x)")
+            if len(mghd_worse_cases) > 5:
+                print(f"    ... and {len(mghd_worse_cases) - 5} more")
+    
+    # Summary
+    print("\n" + "="*60)
+    if warnings_found:
+        print(f"⚠️  {len(warnings_found)} warnings found:")
+        for w in warnings_found:
+            print(f"   - {w}")
+    else:
+        print("✓ All sanity checks passed!")
+    print("="*60 + "\n")
 
 def plot_results(results, output_path):
     """Generate and save a clean LER plot from results."""
@@ -442,7 +657,10 @@ if __name__ == "__main__":
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--profile", default="S")
     parser.add_argument("--node-feat-dim", type=int, default=8)
-    parser.add_argument("--sampler", default="stim", choices=["stim", "cudaq"], help="Sampler to use (stim or cudaq)")
+    parser.add_argument("--sampler", default="phenomenological", choices=["stim", "cudaq", "phenomenological"],
+                       help="Sampler to use. 'phenomenological' (default) matches training setup with IID X/Z errors. "
+                            "'stim' uses Stim circuit-level simulation (caution: different noise model). "
+                            "'cudaq' uses CUDA-Q backend.")
     parser.add_argument(
         "--noise-scale",
         type=float,

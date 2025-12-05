@@ -56,9 +56,15 @@ def to_dict(cfg: MGHDConfig) -> Dict[str, Any]:
 def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
     """Return rotated surface code parity-check matrix for odd distance d.
 
-    This constructs a simple rotated surface code adjacency where each check
-    touches up to 5 data qubits (center + 4-neighbors) depending on lattice
-    bounds. It matches the previous helper in mghd.codes.pcm_real.
+    Constructs the proper rotated planar surface code where stabilizers are
+    centered on plaquettes (at half-integer lattice coordinates), not on data qubits.
+
+    Interior stabilizers have weight 4, boundary stabilizers have weight 2.
+    The stabilizer type alternates in a checkerboard pattern on the dual lattice.
+
+    For X-memory configuration:
+    - X stabilizers (detect Z errors): on rough boundaries (left/right) + interior
+    - Z stabilizers (detect X errors): on smooth boundaries (top/bottom) + interior
     """
     if d % 2 == 0 or d < 1:
         raise ValueError("rotated_surface_pcm requires odd d >= 1")
@@ -68,6 +74,8 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
         raise ValueError("side must be 'X' or 'Z'")
 
     n_qubits = d * d
+    # For rotated surface code: (d-1)^2/2 interior + boundary stabilizers
+    # Total stabilizers = d^2 - 1 (split evenly between X and Z)
     n_checks = (d * d - 1) // 2
 
     rows: List[int] = []
@@ -77,33 +85,53 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
     def q_index(r: int, c: int) -> int:
         return r * d + c
 
-    center = d // 2
-
-    for r in range(d):
-        for c in range(d):
+    # Interior plaquettes: weight-4 stabilizers
+    for r in range(d - 1):
+        for c in range(d - 1):
             parity = (r + c) % 2
-            include = False
-            if side == "Z":
-                include = parity == 1
-            else:  # side == 'X'
-                include = (parity == 0) and not (r == center and c == center)
-            if not include:
-                continue
+            # X stabilizers at even parity, Z at odd
+            is_x_type = (parity == 0)
+            if (side == "X" and is_x_type) or (side == "Z" and not is_x_type):
+                qubits = [q_index(r, c), q_index(r + 1, c),
+                          q_index(r, c + 1), q_index(r + 1, c + 1)]
+                for q in qubits:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
 
-            qubits = {q_index(r, c)}
-            if r - 1 >= 0:
-                qubits.add(q_index(r - 1, c))
-            if r + 1 < d:
-                qubits.add(q_index(r + 1, c))
-            if c - 1 >= 0:
-                qubits.add(q_index(r, c - 1))
-            if c + 1 < d:
-                qubits.add(q_index(r, c + 1))
-
-            for q in sorted(qubits):
-                rows.append(row_idx)
-                cols.append(q)
-            row_idx += 1
+    # Boundary stabilizers: weight-2
+    if side == "Z":
+        # Z stabilizers on smooth boundaries (top and bottom)
+        # Top: where parity at virtual row -1 would be odd
+        for c in range(d - 1):
+            if ((-1) + c) % 2 != 0:
+                for q in [q_index(0, c), q_index(0, c + 1)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
+        # Bottom
+        for c in range(d - 1):
+            if ((d - 1) + c) % 2 != 0:
+                for q in [q_index(d - 1, c), q_index(d - 1, c + 1)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
+    else:  # side == "X"
+        # X stabilizers on rough boundaries (left and right)
+        # Left: where parity at virtual col -1 would be even
+        for r in range(d - 1):
+            if (r + (-1)) % 2 == 0:
+                for q in [q_index(r, 0), q_index(r + 1, 0)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
+        # Right
+        for r in range(d - 1):
+            if (r + (d - 1)) % 2 == 0:
+                for q in [q_index(r, d - 1), q_index(r + 1, d - 1)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
 
     if row_idx != n_checks:
         raise AssertionError(f"Constructed {row_idx} checks, expected {n_checks}")
