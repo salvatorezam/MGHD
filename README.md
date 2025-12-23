@@ -1,19 +1,27 @@
-# MGHD: Mamba-Graph Hybrid Decoder
+# MGHD: Mamba-Graph Hybrid Decoder for Quantum Error Correction
 
-**A Universal Hybrid Architecture for Real-Time Quantum Error Correction**
+MGHD combines Mamba sequence models with Graph Neural Networks to create a powerful, universal decoder for quantum error correction on surface code (to be extended across multiple code families).
 
-MGHD combines Mamba sequence models with Graph Neural Networks to create a powerful, universal decoder for quantum error correction across multiple code families.
+**⚠️ Pre-Release Status**
+This repository contains the **active development branch** for the MGHD architecture described in the upcoming manuscript *(Kulkarni et al., arXiv target: Jan 2026)*.
+
+**Current Status:**
+* **Codebase:** Pre-alpha (Code optimizations in progress).
+* **Benchmarks:** Full logical error rate plots and latency results will be released publicly upon arXiv submission.
+* **Reproducibility:** Pre-trained weights and inference scripts are currently internal-only.
+
+*Please check back in January 2026 for the stable release.*
 
 ---
 
 ## Overview
 
-MGHD (Mamba-GNN Hybrid Decoder) is a state-of-the-art quantum error correction decoder that leverages:
+MGHD (Mamba-GNN Hybrid Decoder) is a novel quantum error correction decoder that leverages:
 
 - **Mamba Sequence Models**: Efficient processing of detector sequences and syndrome patterns
 - **Graph Neural Networks (GNN)**: Spatial reasoning over qubit connectivity and error correlations
 - **Teacher-Assisted Decoding (TAD)**: Knowledge distillation from classical decoders (MWPF, LSD, MWPM)
-- **Multi-Code Support**: Surface codes, color codes, repetition codes, Steane, BB codes, and more
+- **Multi-Code Support** (Planned): Surface codes, color codes, repetition codes, Steane, BB codes, and more
 
 The decoder is designed for real-time performance while maintaining high accuracy across varying code distances and noise models.
 
@@ -31,7 +39,7 @@ The decoder is designed for real-time performance while maintaining high accurac
   - LSD (Belief Propagation + OSD)
   - MWPM (Classical minimum weight perfect matching)
 - **Flexible Training**: Supports curriculum learning across code distances, online RL, and adaptive weighting
-- **Production Ready**: Includes preflight validation, benchmarking tools, and comprehensive testing
+- **Robust Research Tooling**: Includes preflight validation, benchmarking tools.
 
 ---
 
@@ -380,10 +388,10 @@ Outputs are saved next to the run (loss.png, teacher_usage.png, plots_manifest.j
 If you use MGHD in your research, please cite:
 
 ```
-@article{mghd2024,
+@article{mghd2025,
   title={MGHD: A Universal Mamba-Graph Hybrid Decoder Architecture for Real-Time Quantum Error Correction},
-  author={MGHD Team},
-  year={2024}
+  author={Kulkarni, Pranav et al.},
+  year={2025}
 }
 ```
 
