@@ -5,6 +5,9 @@
 # Large datasets and experiment data
 /core/datasets/google_qec3v5/google_qec3v5_experiment_data/
 
+# Data folder
+/data/
+
 # =============================================================================
 # PYTHON & CONDA ENVIRONMENTS
 # =============================================================================
