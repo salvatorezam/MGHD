@@ -226,16 +226,17 @@ mghd/
 
 ---
 
-## Supported Code Families
+## Code Families
 
 - **Surface Codes**: Planar and toric surface codes with varying distances
-- **Color Codes**: 4.8.8 and 6.6.6 lattice geometries
-- **Repetition Codes**: X and Z basis repetition codes
-- **Steane Code**: [[7,1,3]] quantum error correction code
-- **Bicycle Codes (BB)**: Quantum LDPC codes
-- **Hypergraph Product (HGP)**: Generalized product codes
-- **Reed-Muller (RM)**: Classical code-based QEC
-- **Generalized Bicycle (GB)**: LDPC constructions
+
+To be supported in the future:
+- **Color Codes** (4.8.8 and 6.6.6 lattice geometries)
+- **Repetition Codes**
+- **Steane Code**
+- **Bicycle Codes (BB)**
+- **Hypergraph Product (HGP)**
+- **Reed-Muller (RM)**
 
 ---
 
