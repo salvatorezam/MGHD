@@ -585,6 +585,12 @@ def main() -> None:
                     ez = out.get("ez")
                     if hasattr(code, "data_to_observables"):
                         pred_obs = code.data_to_observables(ex, ez)
+                elif out["which"] == "nvqldpc":
+                    # nvqldpc teacher returns ex/ez like lsd
+                    ex = out.get("ex")
+                    ez = out.get("ez")
+                    if hasattr(code, "data_to_observables"):
+                        pred_obs = code.data_to_observables(ex, ez)
                 elif out["which"].startswith("mwpm"):
                     cx = out.get("cx")
                     cz = out.get("cz")
@@ -598,6 +604,11 @@ def main() -> None:
                     pred_arr = np.asarray(pred_obs, dtype=np.uint8)
                     if pred_arr.ndim == 1:
                         pred_arr = pred_arr[np.newaxis, :]
+                    # Align predicted observables to match sampler's observable count
+                    # (e.g., Z-memory circuit has 1 obs, but code may have 2 logical ops)
+                    true_obs = getattr(batch, "obs", None)
+                    if true_obs is not None and pred_arr.shape[1] > true_obs.shape[1]:
+                        pred_arr = pred_arr[:, :true_obs.shape[1]]
                     pred_chunks.append(pred_arr)
 
                 dem_pred = out.get("dem_pred_obs")
