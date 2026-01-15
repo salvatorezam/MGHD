@@ -33,7 +33,7 @@ from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_ctx import MWPFContext
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
-from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_side
+from mghd.qpu.adapters.surface_sampler import sample_round, split_components_for_side
 
 
 @dataclass
@@ -399,6 +399,7 @@ def run(args) -> None:
                                 "seq_mask": packed.seq_mask.numpy(),
                                 "g_token": packed.g_token.numpy(),
                                 "y_bits": packed.y_bits.numpy(),
+                                "s_sub": packed.s_sub.numpy(),
                                 "meta": {
                                     **packed.meta.__dict__,
                                     "side": side,

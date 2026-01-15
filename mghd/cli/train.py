@@ -39,7 +39,7 @@ from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
 from mghd.decoders.nvqldpc_teacher import NvQldpcTeacher
 from mghd.decoders.dem_matching import DEMMatchingTeacher, _HAVE_PM as _HAVE_PYMATCHING
-from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_side
+from mghd.qpu.adapters.surface_sampler import sample_round, split_components_for_side
 from mghd.tad import context as tad_context
 from mghd.tad import weighting as tad_weighting
 
@@ -85,6 +85,13 @@ class CropShardDataset(Dataset):
                 return torch.as_tensor(x, dtype=dtype)
             return torch.as_tensor(x, dtype=dtype)
 
+        seq_idx_t = to_tensor(item["seq_idx"], torch.long)
+        s_sub_raw = item.get("s_sub", None)
+        if s_sub_raw is None:
+            s_sub_t = torch.zeros_like(seq_idx_t, dtype=torch.int8)
+        else:
+            s_sub_t = to_tensor(s_sub_raw, torch.int8)
+
         packed = PackedCrop(
             x_nodes=to_tensor(item["x_nodes"], torch.float32),
             node_mask=to_tensor(item["node_mask"], torch.bool),
@@ -92,10 +99,11 @@ class CropShardDataset(Dataset):
             edge_index=to_tensor(item["edge_index"], torch.long),
             edge_attr=to_tensor(item["edge_attr"], torch.float32),
             edge_mask=to_tensor(item["edge_mask"], torch.bool),
-            seq_idx=to_tensor(item["seq_idx"], torch.long),
+            seq_idx=seq_idx_t,
             seq_mask=to_tensor(item["seq_mask"], torch.bool),
             g_token=to_tensor(item["g_token"], torch.float32),
             y_bits=to_tensor(item["y_bits"], torch.int8),
+            s_sub=s_sub_t,
             meta=item["meta"],
             H_sub=item.get("H_sub", None),
             idx_data_local=item.get("idx_data_local", None),
@@ -161,6 +169,7 @@ def collate_packed(batch):
     node_type = torch.stack([c.node_type for c in batch])
     g_token = torch.stack([c.g_token for c in batch])
     y_bits = torch.stack([c.y_bits for c in batch])
+    s_sub = torch.stack([c.s_sub for c in batch])
     
     # Concatenate and shift 2D/1D tensors
     edge_indices = []
@@ -204,6 +213,7 @@ def collate_packed(batch):
         seq_mask=seq_mask,
         g_token=g_token,
         y_bits=y_bits,
+        s_sub=s_sub,
         meta=meta,
         H_sub=H_sub, # List of H_subs
         idx_data_local=None,
@@ -258,11 +268,49 @@ def bce_binary_head_loss(
     return loss_all.mean()
 
 
+def focal_binary_head_loss(
+    logits: torch.Tensor,
+    node_mask: torch.Tensor,
+    node_type: torch.Tensor,
+    y_bits: torch.Tensor,
+    *,
+    alpha: float | None = 0.25,
+    gamma: float = 2.0,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Focal loss on data‑qubit nodes (binary head) with optional weights."""
+    is_data = (node_type == 0) & node_mask
+    if is_data.sum() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    targets = y_bits.clamp_min(0).clamp_max(1).long()
+    logits_sel = logits[is_data]
+    targets_sel = targets[is_data]
+
+    ce = F.cross_entropy(logits_sel, targets_sel, reduction="none")
+    probs = torch.softmax(logits_sel, dim=-1)
+    p_t = probs[torch.arange(probs.size(0), device=probs.device), targets_sel]
+    loss = (1.0 - p_t).pow(float(gamma)) * ce
+
+    if alpha is not None:
+        a = float(alpha)
+        alpha_t = torch.where(
+            targets_sel == 1,
+            torch.tensor(a, device=probs.device),
+            torch.tensor(1.0 - a, device=probs.device),
+        )
+        loss = alpha_t * loss
+    if sample_weight is not None:
+        weight = sample_weight.to(logits.device).clamp_min(0.5).clamp_max(3.0)
+        loss = loss * weight
+    return loss.mean()
+
+
 def parity_auxiliary_loss(
     logits: torch.Tensor,
     node_mask: torch.Tensor,
     node_type: torch.Tensor,
     H_sub: np.ndarray | list[np.ndarray],
+    s_sub: torch.Tensor,
 ) -> torch.Tensor:
     """Small regularizer encouraging parity consistency within the crop."""
     # logits: [B, N, 2] or [N, 2]
@@ -272,6 +320,8 @@ def parity_auxiliary_loss(
         node_type = node_type.unsqueeze(0)
         if not isinstance(H_sub, list):
             H_sub = [H_sub]
+        if s_sub.dim() == 1:
+            s_sub = s_sub.unsqueeze(0)
             
     batch_size = logits.shape[0]
     total_loss = torch.tensor(0.0, device=logits.device)
@@ -317,8 +367,9 @@ def parity_auxiliary_loss(
             
         prod = torch.stack(prod_terms)
         E_par = 0.5 * (1 - prod)
-        # Encourage small E_par (close to 0 or target) — here we push toward 0.5 neutrality lightly
-        total_loss = total_loss + (E_par - 0.5).pow(2).mean()
+        # Correct target: H·e ≡ s (mod 2)  => expected parity should match s_sub (0/1)
+        s = s_sub[i][: h.shape[0]].to(E_par.device).float()
+        total_loss = total_loss + (E_par - s).pow(2).mean()
         
     return total_loss / batch_size
 
@@ -341,12 +392,16 @@ def projection_aware_logits_to_bits(
     # Adapter to clustered projector (discover exact signature and adapt)
     if hasattr(cc, "ml_parity_project"):
         H_sub = projector_kwargs.get("H_sub")
-        s_sub_default = (
-            np.zeros(H_sub.shape[0], dtype=np.uint8)
-            if H_sub is not None
-            else np.array([], dtype=np.uint8)
-        )
-        s_sub = projector_kwargs.get("s_sub", s_sub_default)
+        if H_sub is None:
+            return (probs1 > 0.5).astype(np.uint8)
+        s_sub = projector_kwargs.get("s_sub", None)
+        if s_sub is None:
+            raise ValueError("projection_aware_logits_to_bits requires s_sub (true syndrome) but got None")
+        if torch.is_tensor(s_sub):
+            s_sub = s_sub.detach().cpu().numpy()
+        s_sub = np.asarray(s_sub, dtype=np.uint8).ravel()
+        if H_sub is not None and hasattr(H_sub, "shape"):
+            s_sub = s_sub[: int(H_sub.shape[0])]
         if H_sub is not None and isinstance(H_sub, np.ndarray):
             H_sub = sp.csr_matrix(H_sub)
         bits = cc.ml_parity_project(H_sub, s_sub, probs1)  # np.uint8
@@ -423,6 +478,9 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--parity-lambda", type=float, default=0.03)
     parser.add_argument("--projection-aware", type=int, default=1)
     parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
+    parser.add_argument("--use-focal", action="store_true", help="Use focal loss for per-qubit labels")
+    parser.add_argument("--focal-alpha", type=float, default=0.25)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--noise-injection", type=float, default=0.009883059279379016)
     parser.add_argument("--grad-clip", type=float, default=0.8545326095750816)
     parser.add_argument(
@@ -569,7 +627,7 @@ def train_inprocess(ns) -> str:
         "msg_net_dropout_p": 0.0,
         "gru_dropout_p": 0.0,
         "se_reduction": 4,
-        "node_feat_dim": 8,
+        "node_feat_dim": 9,
         "edge_feat_dim": 3,
     }
     for attr, value in defaults.items():
@@ -601,7 +659,7 @@ def train_inprocess(ns) -> str:
 
         node_feat_dim = int(hp_data.get("node_feat_dim", args.node_feat_dim))
         if bool(hp_data.get("erasure_enabled", False)):
-            node_feat_dim = 9
+            node_feat_dim = 10
         edge_feat_dim = int(hp_data.get("edge_feat_dim", args.edge_feat_dim))
         args.node_feat_dim = node_feat_dim
         args.edge_feat_dim = edge_feat_dim
@@ -616,7 +674,7 @@ def train_inprocess(ns) -> str:
 
     args.msg_net_size = int(getattr(args, "msg_net_size", max(96, int(args.d_model))))
     if bool(getattr(args, "online", False)) and float(getattr(args, "erasure_frac", 0.0)) > 0.0:
-        args.node_feat_dim = max(int(args.node_feat_dim), 9)
+        args.node_feat_dim = max(int(args.node_feat_dim), 10)
 
     expected_node_dim = int(args.node_feat_dim)
     expected_edge_dim = int(args.edge_feat_dim)
@@ -893,7 +951,14 @@ def train_inprocess(ns) -> str:
         Example: "mwpf=1.0,mwpm=0.5,lsd=0.25" → {"mwpf":1.0,"mwpm":0.5,"lsd":0.25}
         Missing teachers default to 0.0; if all are zero, defaults to MWPF=1.0.
         """
-        weights = {"mwpf": 0.0, "mwpm": 0.0, "lsd": 0.0, "dem_mwpm": 0.0, "nvqldpc": 0.0}
+        weights = {
+            "mwpf": 0.0,
+            "mwpm": 0.0,
+            "lsd": 0.0,
+            "dem_mwpm": 0.0,
+            "nvqldpc": 0.0,
+            "oracle": 0.0,
+        }
         if not spec:
             weights["mwpf"] = 1.0
             return weights
@@ -945,13 +1010,13 @@ def train_inprocess(ns) -> str:
                 getattr(args, "teacher_mix", "mwpf=1.0,mwpm=0.0,lsd=0.0")
             )
             label_teacher_weight = sum(
-                teacher_mix.get(k, 0.0) for k in ("mwpf", "mwpm", "lsd", "nvqldpc")
+                teacher_mix.get(k, 0.0) for k in ("mwpf", "mwpm", "lsd", "nvqldpc", "oracle")
             )
             if label_teacher_weight <= 0.0:
                 raise ValueError(
                     "Invalid `--teacher-mix`: no label-producing teachers selected. "
                     "This MGHDv2 training loop requires per-qubit labels from one of "
-                    "`mwpf`, `mwpm`, `lsd`, or `nvqldpc`. "
+                    "`mwpf`, `mwpm`, `lsd`, `nvqldpc`, or `oracle`. "
                     "`dem_mwpm` produces observable-only predictions and cannot supervise MGHDv2."
                 )
             if teacher_mix.get("dem_mwpm", 0.0) > 0.0 and not warned_dem_mwpm:
@@ -1029,20 +1094,32 @@ def train_inprocess(ns) -> str:
                         hard, dtype=torch.float32, device=device
                     )
                     
-                    loss_bce = bce_binary_head_loss(
-                        logits, # flattened
-                        node_mask, # flattened
-                        packed.node_type.view(-1),
-                        packed.y_bits.view(-1),
-                        sample_weight=sample_weight,
-                        label_smoothing=args.label_smoothing,
-                    )
+                    if bool(getattr(args, "use_focal", False)):
+                        loss_bce = focal_binary_head_loss(
+                            logits,
+                            node_mask,
+                            packed.node_type.view(-1),
+                            packed.y_bits.view(-1),
+                            alpha=float(getattr(args, "focal_alpha", 0.25)),
+                            gamma=float(getattr(args, "focal_gamma", 2.0)),
+                            sample_weight=sample_weight,
+                        )
+                    else:
+                        loss_bce = bce_binary_head_loss(
+                            logits,  # flattened
+                            node_mask,  # flattened
+                            packed.node_type.view(-1),
+                            packed.y_bits.view(-1),
+                            sample_weight=sample_weight,
+                            label_smoothing=args.label_smoothing,
+                        )
                     
                     loss_par = args.parity_lambda * parity_auxiliary_loss(
                         logits_reshaped,
                         node_mask_reshaped,
                         node_type_reshaped,
                         H_sub=packed.H_sub,
+                        s_sub=packed.s_sub,
                     )
                     
                     loss_proj = torch.tensor(0.0, device=device)
@@ -1068,6 +1145,7 @@ def train_inprocess(ns) -> str:
                                 projector_kwargs={
                                     "H_sub": h,
                                     "side": side,
+                                    "s_sub": packed.s_sub[i],
                                 },
                                 data_mask=data_mask,
                             )
@@ -1163,20 +1241,32 @@ def train_inprocess(ns) -> str:
                         )
                         sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
 
-                        loss_bce = bce_binary_head_loss(
-                            logits,
-                            node_mask,
-                            packed.node_type,
-                            packed.y_bits,
-                            sample_weight=sample_weight,
-                            label_smoothing=args.label_smoothing,
-                        )
+                        if bool(getattr(args, "use_focal", False)):
+                            loss_bce = focal_binary_head_loss(
+                                logits,
+                                node_mask,
+                                packed.node_type,
+                                packed.y_bits,
+                                alpha=float(getattr(args, "focal_alpha", 0.25)),
+                                gamma=float(getattr(args, "focal_gamma", 2.0)),
+                                sample_weight=sample_weight,
+                            )
+                        else:
+                            loss_bce = bce_binary_head_loss(
+                                logits,
+                                node_mask,
+                                packed.node_type,
+                                packed.y_bits,
+                                sample_weight=sample_weight,
+                                label_smoothing=args.label_smoothing,
+                            )
 
                         loss_par = args.parity_lambda * parity_auxiliary_loss(
                             logits,
                             node_mask,
                             packed.node_type,
                             H_sub=packed.H_sub,
+                            s_sub=packed.s_sub,
                         )
 
                         loss_proj = torch.tensor(0.0, device=device)
@@ -1187,6 +1277,7 @@ def train_inprocess(ns) -> str:
                                 projector_kwargs={
                                     "H_sub": packed.H_sub,
                                     "side": getattr(packed.meta, "side", "Z"),
+                                    "s_sub": packed.s_sub,
                                 },
                                 data_mask=data_mask,
                             )
@@ -1346,6 +1437,7 @@ def move_to(p: PackedCrop, device):
     p.seq_mask = p.seq_mask.to(device)
     p.g_token = p.g_token.to(device)
     p.y_bits = p.y_bits.to(device)
+    p.s_sub = p.s_sub.to(device)
     return p
 
 
@@ -1373,9 +1465,12 @@ def sanity_train(
     ns.projection_aware = 1
     ns.seed = 42
     ns.label_smoothing = 0.1
+    ns.use_focal = False
+    ns.focal_alpha = 0.25
+    ns.focal_gamma = 2.0
     ns.noise_injection = 0.0
     ns.grad_clip = 1.0
-    ns.node_feat_dim = 8
+    ns.node_feat_dim = 9
     ns.edge_feat_dim = 3
     ns.hparams = hparams
 
@@ -1642,7 +1737,7 @@ class OnlineSurfaceDataset(IterableDataset):
                 fault_ids_global = None
 
         # Compute LSD once per sample
-        ex_glob = ez_glob = None
+        ex_lsd = ez_lsd = None
         if lsd_teacher is not None:
             try:
                 ex_arr, ez_arr = lsd_teacher.decode_batch_xz(
@@ -1650,9 +1745,9 @@ class OnlineSurfaceDataset(IterableDataset):
                     syndromes_z=sample["synZ"][None, :],
                     llr_overrides=self.llr_overrides if hasattr(self, "llr_overrides") else None,
                 )
-                ex_glob, ez_glob = ex_arr[0], ez_arr[0]
+                ex_lsd, ez_lsd = ex_arr[0], ez_arr[0]
             except Exception:
-                ex_glob = ez_glob = None
+                ex_lsd = ez_lsd = None
 
         # Compute NvQldpc once per sample (GPU BP+OSD teacher, strict)
         ex_nq = ez_nq = None
@@ -1673,6 +1768,14 @@ class OnlineSurfaceDataset(IterableDataset):
                     dem_mwpm_pred = dem_mwpm_pred[0]  # Single sample
             except Exception:
                 dem_mwpm_pred = None
+
+        oracle_enabled = self.teacher_mix.get("oracle", 0.0) > 0.0
+        oracle_ex = sample.get("ex_glob", None)
+        oracle_ez = sample.get("ez_glob", None)
+        if oracle_enabled and (oracle_ex is None or oracle_ez is None):
+            raise RuntimeError(
+                "Oracle supervision requested but sampler did not return ex_glob/ez_glob."
+            )
 
         for side in ("Z", "X"):
             comps = split_components_for_side(
@@ -1705,11 +1808,22 @@ class OnlineSurfaceDataset(IterableDataset):
                     outputs["mwpm"] = (bits_pm.astype(np.uint8), int(w_pm))
 
                 # LSD
-                if lsd_teacher is not None and (ex_glob is not None and ez_glob is not None):
-                    bits_global = ex_glob if side == "Z" else ez_glob
+                if lsd_teacher is not None and (ex_lsd is not None and ez_lsd is not None):
+                    bits_global = ex_lsd if side == "Z" else ez_lsd
                     if qubit_indices.size and bits_global.size > qubit_indices.max():
                         bits_local = bits_global[qubit_indices].astype(np.uint8)
                         outputs["lsd"] = (bits_local, int(bits_local.sum()))
+
+                # Oracle labels (true sampled errors), if provided by sampler
+                if oracle_enabled:
+                    bits_global = oracle_ex if side == "Z" else oracle_ez
+                    if (
+                        bits_global is not None
+                        and qubit_indices.size
+                        and bits_global.size > qubit_indices.max()
+                    ):
+                        bits_local = bits_global[qubit_indices].astype(np.uint8)
+                        outputs["oracle"] = (bits_local, int(bits_local.sum()))
 
                 # NvQldpc (GPU BP+OSD)
                 if nvqldpc_teacher is not None and (ex_nq is not None and ez_nq is not None):
@@ -1763,7 +1877,7 @@ class OnlineSurfaceDataset(IterableDataset):
                     y_bits_local=chosen_bits,
                     side=side,
                     d=d,
-                    p=self.args.p,
+                    p=self.p_epoch,
                     seed=seed,
                     N_max=self.args.N_max if hasattr(self.args, "N_max") else 512,
                     E_max=self.args.E_max if hasattr(self.args, "E_max") else 4096,

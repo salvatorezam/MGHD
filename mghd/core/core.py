@@ -179,10 +179,14 @@ class PackedCrop:
     seq_mask: torch.Tensor
     g_token: torch.Tensor
     y_bits: torch.Tensor
+    s_sub: torch.Tensor  # (S_max,) padded syndrome bits for checks (row order of H_sub)
     meta: CropMeta
     H_sub: np.ndarray | None = None
     idx_data_local: np.ndarray | None = None
     idx_check_local: np.ndarray | None = None
+
+
+SYND_FEAT_IDX = 8  # after xy(2), type(1), degree(1), k/r/bw/bh(4) => 8 dims
 
 
 def _degree_from_Hsub(H_sub: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -332,6 +336,8 @@ def pack_cluster(
         er = None
 
     # Base per-node features (8 dims): xy(2), type(1), degree(1), k/r/bw/bh(4)
+    # Append syndrome as feature index 8 (on check nodes only). If erasure is
+    # enabled, it becomes the final feature dim.
     parts = [
         xy01,
         node_type[:, None].astype(np.float32),
@@ -341,6 +347,14 @@ def pack_cluster(
         np.full((nQ + nC, 1), float(bw), dtype=np.float32),
         np.full((nQ + nC, 1), float(bh), dtype=np.float32),
     ]
+    synd = (np.asarray(synd_Z_then_X_bits, dtype=np.uint8).ravel() & 1)
+    if synd.size < nC:
+        synd = np.pad(synd, (0, nC - synd.size), mode="constant")
+    elif synd.size > nC:
+        synd = synd[:nC]
+    synd_col = np.zeros((nQ + nC, 1), dtype=np.float32)
+    synd_col[nQ:, 0] = synd.astype(np.float32)
+    parts.append(synd_col)
     # Optional per-node erasure flag (only when provided): adds +1 feature dim
     if er is not None:
         er_col = np.concatenate([er.astype(np.float32), np.zeros(nC, dtype=np.float32)])[:, None]
@@ -415,6 +429,9 @@ def pack_cluster(
     y_bits_t = torch.full((N_max,), -1, dtype=torch.int8)
     y_bits_t[:nQ] = torch.from_numpy(y_bits_local.astype(np.int8))
 
+    s_sub_t = torch.zeros((S_max,), dtype=torch.int8)
+    s_sub_t[:S] = torch.from_numpy(synd.astype(np.int8))
+
     meta = CropMeta(
         k=k,
         r=r,
@@ -440,6 +457,7 @@ def pack_cluster(
         seq_mask=seq_mask,
         g_token=g_token,
         y_bits=y_bits_t,
+        s_sub=s_sub_t,
         meta=meta,
         H_sub=H_sub.astype(np.uint8),
         idx_data_local=np.arange(nQ, dtype=np.int32),
@@ -797,7 +815,7 @@ class MGHDv2(nn.Module):
         d_model: int = 192,
         d_state: int = 80,
         n_iters: int = 8,
-        node_feat_dim: int = 8,
+        node_feat_dim: int = 9,
         edge_feat_dim: int = 3,
         g_dim: Optional[int] = None,
         se_reduction: int = 4,
@@ -1022,6 +1040,7 @@ TensorFields: Tuple[str, ...] = (
     "seq_mask",
     "g_token",
     "y_bits",
+    "s_sub",
 )
 
 
@@ -1046,7 +1065,7 @@ def _ensure_array(array: np.ndarray | sp.csr_matrix) -> np.ndarray:
 class MGHDDecoderPublic:
     """Thin wrapper that keeps only the MGHD v2 inference surface."""
 
-    def __init__(self, ckpt_path: str, device: str = "cpu", *, profile: str = "S", node_feat_dim: int = 8) -> None:
+    def __init__(self, ckpt_path: str, device: str = "cpu", *, profile: str = "S", node_feat_dim: int = 9) -> None:
         self.device = torch.device(device)
         state_dict = _load_state_dict(ckpt_path)
         self.model = MGHDv2(profile=profile, node_feat_dim=node_feat_dim)

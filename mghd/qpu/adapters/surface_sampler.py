@@ -52,6 +52,7 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
     Returns
     - Hx, Hz: uint8 parity‑check matrices trimmed to measured checks
     - synZ, synX: uint8 detector bits (Z then X ordering)
+    - ex_glob, ez_glob: uint8 oracle data‑qubit error indicators (X/Z), if available
     - coords_q: int32 data‑qubit lattice coordinates
     - coords_c: float32 check coordinates (Z first then X), half‑offset preserved
     - dem_meta: metadata for downstream teachers (opaque)
@@ -83,14 +84,23 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
             rng=rng,
             bitpack=False,
             profile_json=profile_path,
+            phys_p=float(p),
+            noise_scale=1.0,
         )
 
         # Extract Z/X syndrome components from packed result
         # Backend format: [X_syndrome, 2*Z_syndrome, X_error + 2*Z_error]
         n_x_checks = len(layout["ancilla_x"])
         n_z_checks = len(layout["ancilla_z"])
-        synX = result[0, :n_x_checks].astype(np.uint8)
-        synZ = result[0, n_x_checks : n_x_checks + n_z_checks].astype(np.uint8)
+        sx_raw = result[0, :n_x_checks].astype(np.uint8)
+        sz_raw = result[0, n_x_checks : n_x_checks + n_z_checks].astype(np.uint8)
+        synX = (sx_raw & 1).astype(np.uint8)
+        synZ = ((sz_raw >> 1) & 1).astype(np.uint8)
+
+        err_block = result[0, n_x_checks + n_z_checks :].astype(np.uint8)
+        # Decode packed Pauli: X + 2Z => x_err = bit0, z_err = bit1
+        ex_glob = (err_block & 1).astype(np.uint8)
+        ez_glob = ((err_block >> 1) & 1).astype(np.uint8)
 
         # Trim matrices to match actual measured ancilla (remove boundary checks)
         Hx_measured = Hx[:n_x_checks, :]
@@ -107,7 +117,9 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
             "noise_defaults": FOUNDATION_DEFAULTS,
             "T": 3,
             "d": d,
-            "requested_p": p,
+            "requested_p": float(p),
+            "effective_p": float(p),
+            "noise_scale": 1.0,
         }
 
         return {
@@ -115,6 +127,8 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
             "Hz": Hz_measured.astype(np.uint8),
             "synZ": synZ,
             "synX": synX,
+            "ex_glob": ex_glob,
+            "ez_glob": ez_glob,
             "coords_q": coords_q,
             "coords_c": coords_c,
             "dem_meta": dem_meta,
@@ -164,6 +178,8 @@ def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
         "Hz": Hz.astype(np.uint8),
         "synZ": synZ.astype(np.uint8),
         "synX": synX.astype(np.uint8),
+        "ex_glob": err_x.astype(np.uint8),
+        "ez_glob": err_z.astype(np.uint8),
         "coords_q": coords_q,
         "coords_c": coords_c,
         "dem_meta": {"synthetic": True, "effective_p": p, "model": "phenomenological"},
