@@ -4,6 +4,7 @@
 
 # Large datasets and experiment data
 /core/datasets/google_qec3v5/google_qec3v5_experiment_data/
+/data/
 
 # =============================================================================
 # PYTHON & CONDA ENVIRONMENTS
@@ -312,6 +313,7 @@ scratchpad/initial-test/**/__pycache__/
 
 
 # Exclude symlinks to external data
+
 scratchpad/initial-test/data
 scratchpad/initial-test/results  
 scratchpad/initial-test/experiments

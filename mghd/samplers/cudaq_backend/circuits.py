@@ -65,6 +65,10 @@ class CudaQKernel:
 def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Build rotated planar surface code parity-check matrices for arbitrary distance d.
+    
+    IMPORTANT: This matches Stim's rotated_memory_z convention where:
+    - Hz (Z-type stabilizers) detect X errors and have boundaries on left/right
+    - Hx (X-type stabilizers) detect Z errors and have boundaries on top/bottom
 
     Data-qubit indexing: d×d grid, row-major order:
       For d=3: q00=0, q01=1, q02=2, q10=3, q11=4, q12=5, q20=6, q21=7, q22=8
@@ -73,12 +77,12 @@ def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
     The rotated surface code has:
     - Interior weight-4 plaquette stabilizers at (r+0.5, c+0.5) coordinates
     - Boundary weight-2 stabilizers on edges
-    - X stabilizers on rough boundaries (left/right) + interior even parity
-    - Z stabilizers on smooth boundaries (top/bottom) + interior odd parity
+    - For rotated_memory_z: Z stabilizers on rough boundaries (left/right)
+    - For rotated_memory_z: X stabilizers on smooth boundaries (top/bottom)
 
     Returns:
       (Hz, Hx) as numpy arrays with CSS commutation property: Hx @ Hz.T = 0 (mod 2)
-      Hz: Z stabilizers (detect X errors)
+      Hz: Z stabilizers (detect X errors) - matches Stim's first detectors
       Hx: X stabilizers (detect Z errors)
       Each matrix has (d²-1)/2 rows and d² columns.
     """
@@ -90,7 +94,7 @@ def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
         Hz = css.hz.astype(int)
         return Hz, Hx
     except ImportError:
-        # Build proper rotated surface code with plaquette stabilizers
+        # Build proper rotated surface code matching Stim's rotated_memory_z
         n_data = d * d
         hz_rows: list[np.ndarray] = []
         hx_rows: list[np.ndarray] = []
@@ -99,45 +103,46 @@ def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
             return r * d + c
 
         # Interior plaquettes: weight-4 stabilizers at (r+0.5, c+0.5)
+        # Stim convention: checkerboard with (r + c) even => Z stabilizer
         for r in range(d - 1):
             for c in range(d - 1):
                 qubits = [q_index(r, c), q_index(r + 1, c),
                           q_index(r, c + 1), q_index(r + 1, c + 1)]
                 row = np.zeros(n_data, dtype=np.uint8)
                 row[qubits] = 1
-                # Checkerboard: (r + c) even => X stabilizer, odd => Z stabilizer
+                # Stim's rotated_memory_z: (r + c) even => Z stabilizer (detect X)
                 if (r + c) % 2 == 0:
-                    hx_rows.append(row)
-                else:
                     hz_rows.append(row)
+                else:
+                    hx_rows.append(row)
 
         # Boundary stabilizers: weight-2
-        # Top boundary (smooth): Z stabilizers where parity at virtual row -1 is odd
-        for c in range(d - 1):
-            if ((-1) + c) % 2 != 0:
-                row = np.zeros(n_data, dtype=np.uint8)
-                row[[q_index(0, c), q_index(0, c + 1)]] = 1
-                hz_rows.append(row)
-
-        # Bottom boundary (smooth): Z stabilizers
-        for c in range(d - 1):
-            if ((d - 1) + c) % 2 != 0:
-                row = np.zeros(n_data, dtype=np.uint8)
-                row[[q_index(d - 1, c), q_index(d - 1, c + 1)]] = 1
-                hz_rows.append(row)
-
-        # Left boundary (rough): X stabilizers where parity at virtual col -1 is even
+        # Left boundary (rough): Z stabilizers for rotated_memory_z
         for r in range(d - 1):
-            if (r + (-1)) % 2 == 0:
+            if (r + (-1)) % 2 == 0:  # matches interior checkerboard parity
                 row = np.zeros(n_data, dtype=np.uint8)
                 row[[q_index(r, 0), q_index(r + 1, 0)]] = 1
-                hx_rows.append(row)
+                hz_rows.append(row)
 
-        # Right boundary (rough): X stabilizers
+        # Right boundary (rough): Z stabilizers
         for r in range(d - 1):
             if (r + (d - 1)) % 2 == 0:
                 row = np.zeros(n_data, dtype=np.uint8)
                 row[[q_index(r, d - 1), q_index(r + 1, d - 1)]] = 1
+                hz_rows.append(row)
+
+        # Top boundary (smooth): X stabilizers
+        for c in range(d - 1):
+            if ((-1) + c) % 2 != 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(0, c), q_index(0, c + 1)]] = 1
+                hx_rows.append(row)
+
+        # Bottom boundary (smooth): X stabilizers
+        for c in range(d - 1):
+            if ((d - 1) + c) % 2 != 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(d - 1, c), q_index(d - 1, c + 1)]] = 1
                 hx_rows.append(row)
 
         Hz = np.vstack(hz_rows) if hz_rows else np.zeros((0, n_data), dtype=np.uint8)

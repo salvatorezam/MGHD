@@ -69,7 +69,8 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
 
     # Use general layout and matrix functions for arbitrary distances
     layout = make_surface_layout_general(d)
-    Hx, Hz = build_H_rotated_general(d)
+    # build_H_rotated_general returns (Hz, Hx)
+    Hz, Hx = build_H_rotated_general(d)
 
     try:
         # Sample syndrome data
@@ -488,186 +489,176 @@ def _fallback_split_components(
     return [component]
 
 
-def _stim_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
+# Cache for Stim circuit objects to avoid rebuilding every sample
+_STIM_CIRCUIT_CACHE: dict[tuple[int, float], dict] = {}
+
+
+def _get_stim_circuit_objects(d: int, p: float) -> dict:
     """
-    Sample a single round using Stim with circuit-level noise.
-    Generates a rotated surface code circuit, samples it, and maps detectors to syndromes.
+    Get or create cached Stim circuit objects for given (d, p).
+    Caches: circuit, Hz, Hx, det_coords tuple, DEM, matcher, and other reusable objects.
+    Does NOT cache sampler - that needs seed at compile time.
+    
+    Uses rounds=d for proper circuit-level noise simulation.
     """
     import stim
-
-    # 1. Build valid surface code matrices for the graph
+    
+    key = (d, p)
+    if key in _STIM_CIRCUIT_CACHE:
+        return _STIM_CIRCUIT_CACHE[key]
+    
+    # Build matrices
     Hz, Hx = build_H_rotated_general(d)
     
-    # 2. Generate Stim circuit
-    # We use standard rotated memory Z circuit.
-    # rounds=1 gives us one cycle of stabilizer measurements.
-    # We add depolarization noise.
+    # Generate circuit with rounds=d for proper circuit-level noise
     circuit = stim.Circuit.generated(
         "surface_code:rotated_memory_z",
         distance=d,
-        rounds=1,
+        rounds=d,  # Use d rounds for proper circuit-level error correction
         after_clifford_depolarization=p,
         after_reset_flip_probability=p,
         before_measure_flip_probability=p,
         before_round_data_depolarization=p
     )
     
-    # 3. Sample from the circuit
-    sampler = circuit.compile_sampler(seed=seed)
-    sample = sampler.sample(shots=1)[0]
+    # Get Detector Error Model for proper MWPM decoding
+    dem = circuit.detector_error_model(decompose_errors=True)
     
-    # 4. Map Stim detectors to our Hx/Hz matrices
-    # Stim's generated circuit orders detectors by coordinate.
-    # We need to ensure our Hx/Hz matrices match this ordering.
-    # The build_H_rotated_general function builds matrices in a specific order.
-    # To be robust, we should ideally map by coordinate.
-    # However, for speed in this "fast" implementation, we will rely on the fact that
-    # both our builder and Stim's builder follow standard row-major or coordinate-sorted ordering.
-    #
-    # Stim's detector coordinates for rotated code:
-    # Z-checks are at (odd, odd) or (even, even) depending on layout?
-    # Actually, Stim provides detector coordinates.
-    # Let's extract them to verify or map.
+    # Create pymatching matcher from DEM
+    try:
+        import pymatching
+        matcher = pymatching.Matching.from_detector_error_model(dem)
+    except Exception:
+        matcher = None
     
-    # For now, we assume the standard ordering matches our build_H_rotated_general
-    # if we separate Z and X checks.
-    # Stim's generated circuit puts detectors in time order.
-    # In a single round, it usually measures X checks then Z checks or vice versa.
-    # We need to split the sample into synZ and synX.
-    
-    # Let's use the DEM to identify which detectors are Z and which are X.
-    dem = circuit.detector_error_model()
-    
-    # We can inspect the coordinates of detectors in the circuit.
-    # circuit.get_detector_coordinates(i) returns [t, x, y] or similar.
-    
+    # Get detector coordinates for mapping
     det_coords = circuit.get_detector_coordinates()
+    det_coords_tuple = tuple(sorted((k, tuple(v)) for k, v in det_coords.items()))
     
-    # Our Hx/Hz builder:
-    # Hz: Z-checks (horizontal edges in rotated lattice)
-    # Hx: X-checks (vertical edges in rotated lattice)
-    
-    # We will reconstruct synZ and synX arrays from the flat sample.
-    # We need to know which detector index corresponds to which row in Hz/Hx.
-    # This is the tricky part.
-    #
-    # Robust Strategy:
-    # 1. Calculate coordinates for our Hz/Hz rows.
-    # 2. Match them with Stim's detector coordinates.
-    # 3. Build a permutation map.
-    
-    # Our coordinates:
-    my_coords_c = _generate_check_coords(d) # Z first, then X
+    # Pre-compute check counts
     n_z = Hz.shape[0]
     n_x = Hx.shape[0]
     
-    # Stim coordinates:
-    # Stim coords are usually (x, y, t). We ignore t.
-    stim_map = {} # (x,y) -> detector_index
-    for k, v in det_coords.items():
-        # v is [x, y, t] or [x, y]
-        if len(v) >= 2:
-            # Stim uses integer coordinates for rotated code?
-            # Let's assume they are close to our half-integer coordinates.
-            # Our coords are like 0.5, 1.5 etc.
-            # Stim might use 1, 3, 5...
-            stim_map[(v[0], v[1])] = k
-            
-    # If mapping is too hard to get right blindly, we might fallback to a simpler assumption:
-    # Stim generated circuit usually groups checks.
-    # But wait! We can just use the Stim circuit to define the problem!
-    # But MGHD needs Hx/Hz to build the graph.
-    #
-    # Alternative: Use the "synthetic" logic but with Stim's noise?
-    # No, that doesn't capture measurement errors correctly.
-    #
-    # Let's assume standard ordering for now and check if it works.
-    # If d=3, we have 4 Z checks and 4 X checks.
-    # Stim will output 8 bits.
-    # We need to know which 4 are Z and which 4 are X.
-    # Usually Stim does all X then all Z or vice versa in a round.
-    
-    # Let's try to infer from the count.
-    # If we just split them, we might swap X and Z.
-    #
-    # Let's use a heuristic:
-    # Z-checks are usually at (even, odd) or (odd, even)?
-    # In rotated code, checks are at (i+j+0.5, i-j-0.5) in our coords.
-    #
-    # Let's try to match coordinates.
-    # Our coords:
-    # Z: (0.5, -0.5), (1.5, 0.5), ...
-    # Stim coords: likely scaled by 2.
-    
-    # For this implementation, to ensure "fast" and "working", we will use a
-    # simplified mapping:
-    # We will assume the first N_Z detectors are Z and next N_X are X?
-    # Or we can check the circuit structure.
-    #
-    # Actually, let's look at how `sinter` or `pymatching` does it. They use the DEM.
-    # MGHD *needs* the H matrices.
-    #
-    # Let's trust that `build_H_rotated_general` produces standard row-major order.
-    # And let's trust that `stim` produces standard coordinate order.
-    # We will map based on coordinates.
-    
-    # Get our expected coordinates
-    my_coords = _generate_check_coords(d) # Z first (0..nz-1), then X (nz..end)
-    
-    # Stim coordinates
-    # We need to find the best match for each of our coordinates in Stim's output.
-    # Stim coords are usually integers. Our coords are x = i+j+0.5, y = i-j-0.5.
-    # Let's scale ours or Stim's.
-    # Stim's rotated code usually places qubits at (2i, 2j) or similar.
-    #
-    # Let's try to find the permutation.
-    synZ = np.zeros(n_z, dtype=np.uint8)
-    synX = np.zeros(n_x, dtype=np.uint8)
-    
-    # If we can't map, we return zeros (which will fail training but run).
-    # But we want it to work.
-    
-    # Let's try a dynamic mapping based on Euclidean distance.
-    # We only do this once per distance? No, we can do it every time or cache it.
-    # Since d is small (up to 31), we can cache the permutation.
-    
-    perm = _get_stim_permutation(d, tuple(sorted(det_coords.items())))
-    
-    # Apply permutation
-    # perm maps "our index" -> "stim detector index"
-    # our indices: 0..nz-1 are Z, nz..end are X
-    
-    for i in range(n_z):
-        stim_idx = perm[i]
-        if stim_idx in sample: # sample is a boolean array? No, it's uint8 bits
-             # Wait, sample is a 1D array of bits.
-             if stim_idx < len(sample):
-                 synZ[i] = sample[stim_idx]
-                 
-    for i in range(n_x):
-        stim_idx = perm[n_z + i]
-        if stim_idx < len(sample):
-            synX[i] = sample[stim_idx]
-            
+    # Pre-compute qubit and check coordinates
     coords_q = _generate_qubit_coords(d)
-    coords_c = my_coords
+    coords_c = _generate_check_coords(d)
+    
+    # Pre-compute permutation
+    perm = _get_stim_permutation(d, det_coords_tuple)
+    
+    cached = {
+        "circuit": circuit,
+        "dem": dem,
+        "matcher": matcher,
+        "Hz": Hz.astype(np.uint8),
+        "Hx": Hx.astype(np.uint8),
+        "det_coords_tuple": det_coords_tuple,
+        "n_z": n_z,
+        "n_x": n_x,
+        "coords_q": coords_q,
+        "coords_c": coords_c,
+        "perm": perm,
+    }
+    
+    _STIM_CIRCUIT_CACHE[key] = cached
+    return cached
 
+
+def _stim_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
+    """
+    Sample using Stim with circuit-level noise (rounds=d).
+    Uses cached circuit objects for efficiency.
+    Returns detector samples in STIM's NATIVE ordering (no permutation).
+    The DEM-based teacher uses the same ordering, guaranteeing consistency.
+    """
+    # Get cached objects
+    cached = _get_stim_circuit_objects(d, p)
+    
+    circuit = cached["circuit"]
+    dem = cached["dem"]
+    matcher = cached["matcher"]
+    
+    # Compile sampler with seed and sample
+    sampler = circuit.compile_detector_sampler(seed=seed)
+    det_sample, obs_sample = sampler.sample(shots=1, separate_observables=True)
+    det_sample = det_sample[0]  # Shape: (num_detectors,)
+    obs_sample = obs_sample[0]  # Shape: (num_observables,)
+    
+    # Get detector coordinates directly from Stim
+    det_coords = circuit.get_detector_coordinates()
+    n_detectors = len(det_sample)
+    
+    # Build coordinate arrays from Stim's detector coordinates
+    # det_coords is {detector_idx: [x, y, t, ...]}
+    coords_det = np.zeros((n_detectors, 2), dtype=np.float32)
+    for idx, coord in det_coords.items():
+        if idx < n_detectors:
+            coords_det[idx, 0] = coord[0]  # x
+            coords_det[idx, 1] = coord[1]  # y
+    
+    # For data qubit coordinates, use the standard grid
+    n_data = d * d
+    coords_q = _generate_qubit_coords(d)
+    
+    # Build H matrix from DEM for graph construction
+    # Each error in DEM defines edges in the detector graph
+    H_det = _build_H_from_dem(dem, n_detectors, n_data)
+    
     dem_meta = {
-        "backend": "stim",
+        "backend": "stim_native",
         "mode": "circuit",
         "d": d,
         "p": p,
+        "n_detectors": n_detectors,
+        "dem": dem,
+        "matcher": matcher,
+        "observable": obs_sample.astype(np.uint8),
     }
 
     return {
-        "Hx": Hx.astype(np.uint8),
-        "Hz": Hz.astype(np.uint8),
-        "synZ": synZ,
-        "synX": synX,
+        "detectors": det_sample.astype(np.uint8),  # Native Stim ordering
+        "observable": obs_sample.astype(np.uint8),
+        "coords_det": coords_det,
         "coords_q": coords_q,
-        "coords_c": coords_c,
+        "H_det": H_det,
         "dem_meta": dem_meta,
+        # Legacy fields for compatibility (will be removed)
+        "Hx": cached["Hx"],
+        "Hz": cached["Hz"],
+        "synZ": det_sample[:cached["n_z"]].astype(np.uint8),  # Approximate split
+        "synX": det_sample[cached["n_z"]:cached["n_z"]+cached["n_x"]].astype(np.uint8),
+        "coords_c": cached["coords_c"],
     }
+
+
+def _build_H_from_dem(dem, n_detectors: int, n_data: int) -> np.ndarray:
+    """
+    Build a detector-to-fault matrix from the DEM.
+    This defines the graph structure for the GNN.
+    
+    Returns H_det: (n_detectors, n_faults) where H_det[d,f]=1 if fault f triggers detector d.
+    """
+    # Count faults in DEM
+    faults = []
+    for inst in dem.flattened():
+        if inst.type == "error":
+            targets = inst.targets_copy()
+            det_ids = [t.val for t in targets if t.is_relative_detector_id()]
+            obs_flip = any(t.is_logical_observable_id() for t in targets)
+            faults.append({
+                'detectors': det_ids,
+                'flips_observable': obs_flip,
+            })
+    
+    n_faults = len(faults)
+    H_det = np.zeros((n_detectors, n_faults), dtype=np.uint8)
+    
+    for f_idx, fault in enumerate(faults):
+        for d_idx in fault['detectors']:
+            if d_idx < n_detectors:
+                H_det[d_idx, f_idx] = 1
+    
+    return H_det
 
 _STIM_PERM_CACHE = {}
 

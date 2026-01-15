@@ -376,7 +376,9 @@ def pack_cluster(
             edge_attr = np.concatenate([edge_attr, j_attr], axis=0)
 
     check_order = hilbert_order_within_bbox(xy_check, bbox_xywh)
-    seq_idx = check_order.astype(np.int64)
+    # Sequence encoder runs over check nodes (Hilbert order), which are offset by nQ
+    # because nodes are stored as [data..., checks...].
+    seq_idx = (nQ + check_order).astype(np.int64)
 
     N = nQ + nC
     E_tot = edge_index.shape[1]
@@ -662,6 +664,49 @@ class SequenceEncoder(nn.Module):
         """
         if seq_idx.numel() == 0 or seq_mask.sum() == 0:
             return x
+
+        # Batched path: x=[B,N,C], seq_idx=[B,S], seq_mask=[B,S]
+        if x.dim() == 3 and seq_idx.dim() == 2 and seq_mask.dim() == 2:
+            B, N, C = x.shape
+            idx = seq_idx.long().clamp(min=0, max=max(0, N - 1))
+            mask = seq_mask.bool()
+
+            x_chk = x.gather(1, idx.unsqueeze(-1).expand(-1, -1, C))
+            try:
+                y_chk = self.core(x_chk)
+            except Exception:
+                y_chk = x_chk
+            y_chk = self.out_norm(y_chk)
+
+            # Ensure dtype alignment for index_copy in mixed precision
+            if y_chk.dtype != x.dtype:
+                y_chk = y_chk.to(x.dtype)
+                x_chk = x_chk.to(x.dtype)
+
+            x_scatter = x.clone()
+            x_flat = x_scatter.view(B * N, C)
+            idx_flat = idx + (torch.arange(B, device=x.device).unsqueeze(1) * N)
+            idx_flat_valid = idx_flat[mask]
+            vals = (x_chk + y_chk)[mask]
+            x_flat.index_copy_(0, idx_flat_valid, vals)
+            return x_flat.view(B, N, C)
+
+        if x.dim() == 3:
+            if seq_idx.dim() != 1 or seq_mask.dim() != 1:
+                raise ValueError(
+                    "For batched x_nodes, expected seq_idx/seq_mask to have shape [B,S] "
+                    f"(got seq_idx {tuple(seq_idx.shape)}, seq_mask {tuple(seq_mask.shape)})."
+                )
+            # Backwards-compatible path: treat batched nodes as a single disjoint
+            # union indexed by flattened node IDs.
+            B, N, C = x.shape
+            x = x.view(B * N, C)
+            node_type = node_type.view(B * N)
+        elif seq_idx.dim() != 1 or seq_mask.dim() != 1:
+            raise ValueError(
+                "Expected seq_idx/seq_mask to be 1D for unbatched x_nodes "
+                f"(got seq_idx {tuple(seq_idx.shape)}, seq_mask {tuple(seq_mask.shape)})."
+            )
         valid = seq_mask.nonzero(as_tuple=False).squeeze(-1)
         idx = seq_idx[valid].long()
         x_chk = x.index_select(0, idx)
@@ -677,6 +722,8 @@ class SequenceEncoder(nn.Module):
             x_chk = x_chk.to(x.dtype)
         x_scatter = x.clone()
         x_scatter.index_copy_(0, idx, x_chk + y_chk)
+        if "B" in locals():
+            return x_scatter.view(B, N, C)
         return x_scatter
 
 
@@ -688,16 +735,18 @@ class GraphDecoderAdapter(nn.Module):
         hidden_dim: int,
         edge_feat_dim: int,
         n_iters: int,
+        n_node_outputs: int = 2,
         *,
         msg_net_size: Optional[int] = None,
         msg_net_dropout_p: float = 0.0,
         gru_dropout_p: float = 0.0,
     ):
         super().__init__()
+        self.n_node_outputs = int(n_node_outputs)
         self.core = GraphDecoder(
             n_iters=n_iters,
             n_node_inputs=hidden_dim,
-            n_node_outputs=2,
+            n_node_outputs=self.n_node_outputs,
             n_edge_features=edge_feat_dim,
             msg_net_size=max(96, hidden_dim) if msg_net_size is None else int(msg_net_size),
             msg_net_dropout_p=float(msg_net_dropout_p),
@@ -780,43 +829,66 @@ class MGHDv2(nn.Module):
         emask = packed.edge_mask.bool()
         gtok = packed.g_token.float()
 
-        if x.dim() == 3:
-            batch_size, nodes_pad, feat_dim = x.shape
-            x = x.view(batch_size * nodes_pad, feat_dim)
-            nmask = packed.node_mask.view(batch_size * nodes_pad).bool()
-            node_type = packed.node_type.view(batch_size * nodes_pad).long()
-        else:
-            batch_size = 1
-            nodes_pad = x.shape[0]
-            nmask = packed.node_mask.bool()
-            node_type = packed.node_type.long()
-
-        if gtok.dim() == 2:
-            g_dim = gtok.size(-1)
-            if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.ensure_g_proj(g_dim, gtok.device)
-            g_bias = self.g_proj(gtok)
-            g_bias = (
-                g_bias.unsqueeze(1)
-                .expand(batch_size, nodes_pad, -1)
-                .reshape(batch_size * nodes_pad, -1)
-            )
-        else:
-            g_dim = gtok.numel()
-            if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.ensure_g_proj(g_dim, gtok.device)
-            g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0)
-            g_bias = g_bias.expand(x.shape[0], -1)
-
         # Guard against feature-dim mismatches (e.g., erasure channel optional)
         if self.node_in.in_features != x.shape[-1]:
             self.ensure_node_in(int(x.shape[-1]), x.device)
         if self.edge_in.in_features != eatt.shape[-1]:
             self.ensure_edge_in(int(eatt.shape[-1]), eatt.device)
 
+        if x.dim() == 3:
+            batch_size, nodes_pad, _ = x.shape
+            nmask = packed.node_mask.bool()
+            node_type = packed.node_type.long()
+
+            if gtok.dim() == 2:
+                g_dim = gtok.size(-1)
+                if self.g_proj is None or self.g_proj.in_features != g_dim:
+                    self.ensure_g_proj(g_dim, gtok.device)
+                g_bias = self.g_proj(gtok).unsqueeze(1).expand(batch_size, nodes_pad, -1)
+            else:
+                g_dim = gtok.numel()
+                if self.g_proj is None or self.g_proj.in_features != g_dim:
+                    self.ensure_g_proj(g_dim, gtok.device)
+                g_bias = self.g_proj(gtok.view(-1)).view(1, 1, -1).expand(batch_size, nodes_pad, -1)
+
+            x = self.node_in(x) + g_bias
+            x = self.seq_encoder(
+                x,
+                packed.seq_idx.long(),
+                packed.seq_mask.bool(),
+                node_type=node_type,
+            )
+            x = self.se(x)
+
+            x_flat = x.view(batch_size * nodes_pad, -1)
+            nmask_flat = nmask.view(batch_size * nodes_pad)
+            e = self.edge_in(eatt)
+            logits = self.gnn(x_flat, eidx, e, nmask_flat, emask)
+            return logits, nmask_flat
+
+        nodes_pad = x.shape[0]
+        nmask = packed.node_mask.bool()
+        node_type = packed.node_type.long()
+
+        if gtok.dim() == 2:
+            g_dim = gtok.size(-1)
+            if self.g_proj is None or self.g_proj.in_features != g_dim:
+                self.ensure_g_proj(g_dim, gtok.device)
+            g_bias = self.g_proj(gtok).unsqueeze(1).expand(1, nodes_pad, -1).reshape(nodes_pad, -1)
+        else:
+            g_dim = gtok.numel()
+            if self.g_proj is None or self.g_proj.in_features != g_dim:
+                self.ensure_g_proj(g_dim, gtok.device)
+            g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0).expand(nodes_pad, -1)
+
         x = self.node_in(x) + g_bias
         e = self.edge_in(eatt)
-        x = self.seq_encoder(x, packed.seq_idx.long(), packed.seq_mask.bool(), node_type=node_type)
+        x = self.seq_encoder(
+            x,
+            packed.seq_idx.long(),
+            packed.seq_mask.bool(),
+            node_type=node_type,
+        )
         x = self.se(x.unsqueeze(0)).squeeze(0)
         logits = self.gnn(x, eidx, e, nmask, emask)
         return logits, nmask
@@ -843,8 +915,8 @@ class MGHDv2(nn.Module):
             edge_index=zeros((2, batch_size * edges_pad), torch.long),
             edge_attr=zeros((batch_size * edges_pad, edge_feat_dim), torch.float32),
             edge_mask=zeros((batch_size * edges_pad,), torch.bool),
-            seq_idx=zeros((batch_size * seq_pad,), torch.long),
-            seq_mask=zeros((batch_size * seq_pad,), torch.bool),
+            seq_idx=zeros((batch_size, seq_pad), torch.long),
+            seq_mask=zeros((batch_size, seq_pad), torch.bool),
             g_token=zeros((batch_size, g_dim), torch.float32),
             batch_size=batch_size,
             nodes_pad=nodes_pad,

@@ -38,6 +38,7 @@ from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
 from mghd.decoders.nvqldpc_teacher import NvQldpcTeacher
+from mghd.decoders.dem_matching import DEMMatchingTeacher, _HAVE_PM as _HAVE_PYMATCHING
 from mghd.qpu.adapters.garnet_adapter import sample_round, split_components_for_side
 from mghd.tad import context as tad_context
 from mghd.tad import weighting as tad_weighting
@@ -175,14 +176,14 @@ def collate_packed(batch):
         edge_indices.append(c.edge_index + shift)
         edge_attrs.append(c.edge_attr)
         edge_masks.append(c.edge_mask)
-        seq_idxs.append(c.seq_idx + shift)
+        seq_idxs.append(c.seq_idx)
         seq_masks.append(c.seq_mask)
         
     edge_index = torch.cat(edge_indices, dim=1)
     edge_attr = torch.cat(edge_attrs, dim=0)
     edge_mask = torch.cat(edge_masks, dim=0)
-    seq_idx = torch.cat(seq_idxs, dim=0)
-    seq_mask = torch.cat(seq_masks, dim=0)
+    seq_idx = torch.stack(seq_idxs, dim=0)
+    seq_mask = torch.stack(seq_masks, dim=0)
     
     # Keep H_sub as list for per-sample processing
     H_sub = [c.H_sub for c in batch]
@@ -388,12 +389,18 @@ def train_inprocess(ns) -> str:
         type=str,
         default="cudaq",
         choices=["cudaq", "stim", "synthetic"],
-        help="Sampler backend for online mode (stim/synthetic uses the fast phenomenological path)",
+        help=(
+            "Sampler backend for online mode: "
+            "'cudaq' uses the CUDA-Q adapter (or falls back), "
+            "'synthetic' uses a fast phenomenological sampler (parity-check syndromes), "
+            "'stim' is circuit-level detector sampling and is NOT compatible with MGHDv2's per-qubit "
+            "supervision pipeline (use a DEM/fault-space or observable-training path instead)."
+        ),
     )
     parser.add_argument(
         "--phenomenological",
         action="store_true",
-        help="Shortcut for requesting the fast phenomenological sampler (sets sampler=stim)",
+        help="Shortcut for requesting the fast phenomenological sampler (sets sampler=synthetic)",
     )
     parser.add_argument(
         "--erasure-frac",
@@ -516,14 +523,32 @@ def train_inprocess(ns) -> str:
     # Handle sampler selection and environment variable
     sampler_choice = str(getattr(args, "sampler", "cudaq"))
     if getattr(args, "phenomenological", False):
-        sampler_choice = "stim"
-        args.sampler = "stim"
+        sampler_choice = "synthetic"
+        args.sampler = "synthetic"
     
-    # Set environment variable for synthetic/stim sampling
-    if sampler_choice in {"stim", "synthetic"}:
+    # Set environment variables for sampling backend
+    # - "stim": Use Stim circuit-level noise (MGHD_SAMPLER=stim)
+    # - "synthetic": Use fast phenomenological noise (MGHD_SYNTHETIC=1)
+    # - "cudaq": Use CUDA-Q backend (default)
+    if sampler_choice == "stim":
+        os.environ["MGHD_SAMPLER"] = "stim"
+        os.environ.pop("MGHD_SYNTHETIC", None)
+    elif sampler_choice == "synthetic":
         os.environ["MGHD_SYNTHETIC"] = "1"
+        os.environ.pop("MGHD_SAMPLER", None)
     elif sampler_choice == "cudaq":
         os.environ.pop("MGHD_SYNTHETIC", None)
+        os.environ.pop("MGHD_SAMPLER", None)
+
+    if bool(getattr(args, "online", False)) and sampler_choice == "stim":
+        raise ValueError(
+            "Online training with `--sampler stim` is not supported for MGHDv2 per-qubit training. "
+            "Stim's circuit-level sampler produces space-time detector events; "
+            "the current MGHDv2 training loop expects parity-check syndromes (synZ/synX) "
+            "and per-qubit correction labels from MWPF/LSD/MWPM. "
+            "Use `--sampler synthetic` for phenomenological training, or switch to a circuit-level "
+            "DEM/fault-space or observable-based training pipeline."
+        )
 
     # Auto-scale pad limits for large distances if not provided
     if not hasattr(args, "N_max"):
@@ -868,8 +893,9 @@ def train_inprocess(ns) -> str:
         Example: "mwpf=1.0,mwpm=0.5,lsd=0.25" → {"mwpf":1.0,"mwpm":0.5,"lsd":0.25}
         Missing teachers default to 0.0; if all are zero, defaults to MWPF=1.0.
         """
-        weights = {"mwpf": 1.0, "mwpm": 0.0, "lsd": 0.0}
+        weights = {"mwpf": 0.0, "mwpm": 0.0, "lsd": 0.0, "dem_mwpm": 0.0, "nvqldpc": 0.0}
         if not spec:
+            weights["mwpf"] = 1.0
             return weights
         for chunk in spec.split(","):
             if "=" not in chunk:
@@ -887,6 +913,7 @@ def train_inprocess(ns) -> str:
 
     bandit = None
     prev_epoch_loss = None
+    warned_dem_mwpm = False
     # Optional curriculum over p for online mode
     p_list = None
     if use_online and getattr(args, "p_curriculum", None):
@@ -917,6 +944,22 @@ def train_inprocess(ns) -> str:
             teacher_mix = _parse_teacher_mix(
                 getattr(args, "teacher_mix", "mwpf=1.0,mwpm=0.0,lsd=0.0")
             )
+            label_teacher_weight = sum(
+                teacher_mix.get(k, 0.0) for k in ("mwpf", "mwpm", "lsd", "nvqldpc")
+            )
+            if label_teacher_weight <= 0.0:
+                raise ValueError(
+                    "Invalid `--teacher-mix`: no label-producing teachers selected. "
+                    "This MGHDv2 training loop requires per-qubit labels from one of "
+                    "`mwpf`, `mwpm`, `lsd`, or `nvqldpc`. "
+                    "`dem_mwpm` produces observable-only predictions and cannot supervise MGHDv2."
+                )
+            if teacher_mix.get("dem_mwpm", 0.0) > 0.0 and not warned_dem_mwpm:
+                print(
+                    "[warn] `dem_mwpm` is ignored for MGHDv2 per-qubit training "
+                    "(it produces observable-only outputs)."
+                )
+                warned_dem_mwpm = True
             
             # TAD context/overrides
             qpu_prof, ctx_vec, llr_overrides = _build_tad_for_code(code)
@@ -1432,7 +1475,7 @@ class OnlineSurfaceDataset(IterableDataset):
             if d not in _WORKER_TEACHERS_CACHE:
                 _WORKER_TEACHERS_CACHE[d] = self._init_teachers_for_d(d)
 
-            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher = _WORKER_TEACHERS_CACHE[d]
+            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher, dem_mwpm_teacher, dem = _WORKER_TEACHERS_CACHE[d]
             
             # Handle erasure
             erase_local = None
@@ -1479,12 +1522,13 @@ class OnlineSurfaceDataset(IterableDataset):
                 d,
                 erase_local,
                 nvqldpc_teacher=nvqldpc_teacher,
+                dem_mwpm_teacher=dem_mwpm_teacher,
             )
             
             shots_done += 1
 
     def _init_teachers_for_d(self, d):
-        # Build Hx/Hz directly from a CUDA-Q sample so that
+        # Build Hx/Hz directly from a sample so that
         # - parity-check dimensions match the online sampler's syndromes, and
         # - nvqldpc (and other teachers) see a consistent PCM.
         base_p = float(getattr(self.args, "p", 0.005))
@@ -1494,6 +1538,12 @@ class OnlineSurfaceDataset(IterableDataset):
             seed=0,
             profile_path=self.args.qpu_profile if getattr(self.args, "qpu_profile", None) else None,
         )
+        
+        # Check if we're using Stim native sampling (with DEM)
+        use_stim_native = sample.get("dem_meta", {}).get("backend") == "stim_native"
+        dem = sample.get("dem_meta", {}).get("dem")
+        dem_matcher = sample.get("dem_meta", {}).get("matcher")
+        
         Hx = np.asarray(sample["Hx"], dtype=np.uint8)
         Hz = np.asarray(sample["Hz"], dtype=np.uint8)
 
@@ -1520,6 +1570,7 @@ class OnlineSurfaceDataset(IterableDataset):
         use_mwpm = self.teacher_mix.get("mwpm", 0.0) > 0.0
         use_lsd = self.teacher_mix.get("lsd", 0.0) > 0.0
         use_nvqldpc = self.teacher_mix.get("nvqldpc", 0.0) > 0.0
+        use_dem_mwpm = self.teacher_mix.get("dem_mwpm", 0.0) > 0.0
 
         mwpf_teacher = None
         if use_mwpf:
@@ -1543,18 +1594,35 @@ class OnlineSurfaceDataset(IterableDataset):
             # should propagate rather than silently disabling the teacher.
             nvqldpc_teacher = NvQldpcTeacher(code.Hx, code.Hz)
 
-        return mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher
+        # DEM-based MWPM teacher (uses Stim's DEM directly - most accurate)
+        dem_mwpm_teacher = None
+        if (use_dem_mwpm or use_stim_native) and dem is not None and _HAVE_PYMATCHING:
+            try:
+                dem_mwpm_teacher = DEMMatchingTeacher(dem)
+            except Exception as e:
+                print(f"Warning: Failed to create DEMMatchingTeacher: {e}")
+                dem_mwpm_teacher = None
 
-    def _process_sample(self, sample, seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local=None, nvqldpc_teacher=None):
+        return mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher, dem_mwpm_teacher, dem
+
+    def _process_sample(self, sample, seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local=None, nvqldpc_teacher=None, dem_mwpm_teacher=None):
         # Logic extracted from the main loop
-        # Pack detectors in canonical Z→X order for MWPFTeacher
-        dets_global = np.concatenate(
-            [
-                sample["synZ"][np.newaxis, :].astype(np.uint8),
-                sample["synX"][np.newaxis, :].astype(np.uint8),
-            ],
-            axis=1,
-        )
+        
+        # Check if we have native Stim detectors (preferred path)
+        use_native_dets = "detectors" in sample and sample.get("dem_meta", {}).get("backend") == "stim_native"
+        
+        if use_native_dets:
+            # Use native Stim detector ordering - this is the correct path
+            dets_global = sample["detectors"][np.newaxis, :].astype(np.uint8)
+        else:
+            # Legacy path: Pack detectors in canonical Z→X order for MWPFTeacher
+            dets_global = np.concatenate(
+                [
+                    sample["synZ"][np.newaxis, :].astype(np.uint8),
+                    sample["synX"][np.newaxis, :].astype(np.uint8),
+                ],
+                axis=1,
+            )
         
         # Global per-fault scaling dict
         mwpf_scale = None
@@ -1594,6 +1662,17 @@ class OnlineSurfaceDataset(IterableDataset):
                 syndromes_z=sample["synZ"][None, :],
             )
             ex_nq, ez_nq = ex_arr[0], ez_arr[0]
+
+        # Compute DEM-MWPM once per sample (uses Stim's DEM directly)
+        dem_mwpm_pred = None
+        if dem_mwpm_teacher is not None and use_native_dets:
+            try:
+                out = dem_mwpm_teacher.decode_batch(dets_global)
+                dem_mwpm_pred = out.get("pred_obs", None)
+                if dem_mwpm_pred is not None:
+                    dem_mwpm_pred = dem_mwpm_pred[0]  # Single sample
+            except Exception:
+                dem_mwpm_pred = None
 
         for side in ("Z", "X"):
             comps = split_components_for_side(

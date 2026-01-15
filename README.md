@@ -131,6 +131,7 @@ Online (on-the-fly CUDA‑Q trajectories) with TAD + optional RL scaling and era
 mghd-train \
   --online \
   --family surface --distance 3 \
+  --sampler cudaq \
   --p-curriculum 0.01,0.006,0.003 --epochs-per-p 10 \
   --qpu-profile mghd/qpu/profiles/iqm_garnet_example.json \
   --context-source qiskit \
@@ -140,6 +141,10 @@ mghd-train \
   --shots-per-epoch 256 \
   --save checkpoints/online
 ```
+
+Note: `mghd-train --online` trains MGHDv2 on parity-check crops with per-qubit supervision; it supports
+`--sampler cudaq` and `--sampler synthetic`. Circuit-level Stim detector streams require a separate
+DEM/fault-space or observable-level training workflow.
 
 Teacher evaluation (LER, DEM A/B, TAD weighting):
 
