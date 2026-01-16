@@ -49,6 +49,75 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 _TEACHER_POOL: ThreadPoolExecutor | None = None
 
+# ---------------------------------------------------------------------------
+# Circuit-level sampler for observable-prediction training
+# ---------------------------------------------------------------------------
+
+try:
+    import stim
+
+    _HAVE_STIM = True
+except ImportError:
+    stim = None  # type: ignore
+    _HAVE_STIM = False
+
+
+def _build_stim_memory_circuit(distance: int, rounds: int, p: float):
+    """Build a rotated surface code memory circuit with circuit-level noise."""
+    if not _HAVE_STIM:
+        raise RuntimeError("stim package required for stim_dem_obs sampler")
+    return stim.Circuit.generated(
+        "surface_code:rotated_memory_x",
+        distance=distance,
+        rounds=rounds,
+        after_clifford_depolarization=p,
+        before_measure_flip_probability=p,
+        after_reset_flip_probability=p,
+    )
+
+
+class _StimDemObsSampler:
+    """Stim sampler for circuit-level observable-prediction training.
+
+    Uses compile_m2d_converter() to convert measurements to detectors+observables.
+    """
+
+    def __init__(self, distance: int, rounds: int, p: float, seed: int = 0):
+        c = _build_stim_memory_circuit(distance, rounds, p)
+        self.det_sampler = c.compile_detector_sampler(seed=seed)
+        self.num_det = c.num_detectors
+        self.num_obs = c.num_observables
+        # Use compile_sampler + m2d_converter for measurement→detector conversion
+        self.meas_sampler = c.compile_sampler(seed=seed)
+        self.m2d = c.compile_m2d_converter()
+        self.circuit = c
+        self.distance = distance
+        self.rounds = rounds
+        self.p = p
+
+    def sample(self, shots: int):
+        """Sample detector events and observable flips.
+
+        Returns:
+            dets: uint8 array [shots, num_det]
+            obs: uint8 array [shots, num_obs]
+        """
+        m = self.meas_sampler.sample(shots=shots)  # bool array
+        dets, obs = self.m2d.convert(m, separate_observables=True)
+        return dets.astype(np.uint8), obs.astype(np.uint8)
+
+    def update_p(self, p: float, seed: int = 0):
+        """Rebuild circuit with new error rate (for curriculum)."""
+        if abs(p - self.p) > 1e-9:
+            self.p = p
+            c = _build_stim_memory_circuit(self.distance, self.rounds, p)
+            self.meas_sampler = c.compile_sampler(seed=seed)
+            self.m2d = c.compile_m2d_converter()
+            self.det_sampler = c.compile_detector_sampler(seed=seed)
+            self.num_det = c.num_detectors
+            self.num_obs = c.num_observables
+            self.circuit = c
+
 
 class CropShardDataset(Dataset):
     """Index all ``.npz`` shards under ``root`` and expose packed crops."""
@@ -162,7 +231,7 @@ def collate_packed(batch):
     """Stack crops into a single batched PackedCrop."""
     if not batch:
         return None
-    
+
     # Stack 3D tensors
     x_nodes = torch.stack([c.x_nodes for c in batch])
     node_mask = torch.stack([c.node_mask for c in batch])
@@ -170,16 +239,16 @@ def collate_packed(batch):
     g_token = torch.stack([c.g_token for c in batch])
     y_bits = torch.stack([c.y_bits for c in batch])
     s_sub = torch.stack([c.s_sub for c in batch])
-    
+
     # Concatenate and shift 2D/1D tensors
     edge_indices = []
     edge_attrs = []
     edge_masks = []
     seq_idxs = []
     seq_masks = []
-    
+
     N_max = batch[0].x_nodes.shape[0]
-    
+
     for i, c in enumerate(batch):
         shift = i * N_max
         edge_indices.append(c.edge_index + shift)
@@ -187,21 +256,21 @@ def collate_packed(batch):
         edge_masks.append(c.edge_mask)
         seq_idxs.append(c.seq_idx)
         seq_masks.append(c.seq_mask)
-        
+
     edge_index = torch.cat(edge_indices, dim=1)
     edge_attr = torch.cat(edge_attrs, dim=0)
     edge_mask = torch.cat(edge_masks, dim=0)
     seq_idx = torch.stack(seq_idxs, dim=0)
     seq_mask = torch.stack(seq_masks, dim=0)
-    
+
     # Keep H_sub as list for per-sample processing
     H_sub = [c.H_sub for c in batch]
-    
+
     # Meta: use first one, but we might need per-sample meta for projection
     meta = batch[0].meta
     # We attach the list of metas to the batch meta for reference
     meta.batch_metas = [c.meta for c in batch]
-    
+
     return PackedCrop(
         x_nodes=x_nodes,
         node_mask=node_mask,
@@ -215,9 +284,9 @@ def collate_packed(batch):
         y_bits=y_bits,
         s_sub=s_sub,
         meta=meta,
-        H_sub=H_sub, # List of H_subs
+        H_sub=H_sub,  # List of H_subs
         idx_data_local=None,
-        idx_check_local=None
+        idx_check_local=None,
     )
 
 
@@ -322,35 +391,35 @@ def parity_auxiliary_loss(
             H_sub = [H_sub]
         if s_sub.dim() == 1:
             s_sub = s_sub.unsqueeze(0)
-            
+
     batch_size = logits.shape[0]
     total_loss = torch.tensor(0.0, device=logits.device)
-    
+
     for i in range(batch_size):
         h = H_sub[i]
         if h is None or h.shape[0] == 0:
             continue
-            
+
         l = logits[i]
         nm = node_mask[i]
         nt = node_type[i]
-        
+
         # Differentiable XOR expectation ~= parity of Bernoulli probs
         with torch.no_grad():
             is_data = ((nt == 0) & nm).cpu().numpy()
             # map logits indices -> data-qubits used by H_sub
             data_idx = np.nonzero(is_data)[0]
-            
+
         if len(data_idx) == 0:
             continue
-            
+
         p = torch.sigmoid(l[:, 1] - l[:, 0])  # P(bit=1)
         p_data = p[data_idx]
-        
+
         # Expected parity for each check row: E[⊕] ≈ 0.5*(1 - ∏(1-2p_i)) over participating data
         # H_sub columns are already local data-qubit order [0..nQ-1]
         H = torch.as_tensor(h, dtype=torch.float32, device=logits.device)
-        
+
         # Map logits to local data-qubit region: we assume data-qubits occupy [0:nQ)
         eps = 1e-6
         prod_terms = []
@@ -361,16 +430,16 @@ def parity_auxiliary_loss(
             else:
                 sel = p_data[idx]
                 prod_terms.append(torch.clamp(1 - 2 * sel, -1 + eps, 1 - eps).prod())
-        
+
         if not prod_terms:
             continue
-            
+
         prod = torch.stack(prod_terms)
         E_par = 0.5 * (1 - prod)
         # Correct target: H·e ≡ s (mod 2)  => expected parity should match s_sub (0/1)
         s = s_sub[i][: h.shape[0]].to(E_par.device).float()
         total_loss = total_loss + (E_par - s).pow(2).mean()
-        
+
     return total_loss / batch_size
 
 
@@ -396,7 +465,9 @@ def projection_aware_logits_to_bits(
             return (probs1 > 0.5).astype(np.uint8)
         s_sub = projector_kwargs.get("s_sub", None)
         if s_sub is None:
-            raise ValueError("projection_aware_logits_to_bits requires s_sub (true syndrome) but got None")
+            raise ValueError(
+                "projection_aware_logits_to_bits requires s_sub (true syndrome) but got None"
+            )
         if torch.is_tensor(s_sub):
             s_sub = s_sub.detach().cpu().numpy()
         s_sub = np.asarray(s_sub, dtype=np.uint8).ravel()
@@ -409,6 +480,66 @@ def projection_aware_logits_to_bits(
         # Fallback: threshold
         bits = (probs1 > 0.5).astype(np.uint8)
     return bits  # length == #data_qubits
+
+
+def obs_training_step(
+    model: nn.Module,
+    dets: np.ndarray,
+    obs: np.ndarray,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    autocast_ctx,
+    scaler,
+    grad_clip: float = 1.0,
+) -> float:
+    """Observable-prediction training step for circuit-level mode.
+
+    Args:
+        model: MGHDv2 model with obs_head initialized
+        dets: uint8 array [B, num_det] detector events
+        obs: uint8 array [B, num_obs] observable flip targets
+        optimizer: optimizer instance
+        device: torch device
+        autocast_ctx: autocast context manager
+        scaler: GradScaler for AMP
+        grad_clip: gradient clipping max norm
+
+    Returns:
+        loss value (float)
+    """
+    dets_t = torch.from_numpy(dets).float().to(device)
+    obs_t = torch.from_numpy(obs).float().to(device)
+
+    # Ensure model has obs_head of correct size
+    if hasattr(model, "module"):
+        # DDP wrapped
+        model.module.ensure_obs_head(dets_t.shape[1], device)
+    else:
+        model.ensure_obs_head(dets_t.shape[1], device)
+
+    optimizer.zero_grad(set_to_none=True)
+
+    with autocast_ctx():
+        # Forward pass through observable head
+        if hasattr(model, "module"):
+            obs_logits = model.module.forward_obs(dets_t)
+        else:
+            obs_logits = model.forward_obs(dets_t)
+        loss = F.binary_cross_entropy_with_logits(obs_logits, obs_t)
+
+    # Backward with AMP support
+    if scaler.is_enabled():
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        optimizer.step()
+
+    return loss.item()
 
 
 def train_inprocess(ns) -> str:
@@ -443,14 +574,21 @@ def train_inprocess(ns) -> str:
         "--sampler",
         type=str,
         default="cudaq",
-        choices=["cudaq", "stim", "synthetic"],
+        choices=["cudaq", "stim", "synthetic", "stim_dem_obs"],
         help=(
             "Sampler backend for online mode: "
             "'cudaq' uses the CUDA-Q adapter (or falls back), "
             "'synthetic' uses a fast phenomenological sampler (parity-check syndromes), "
             "'stim' is circuit-level detector sampling and is NOT compatible with MGHDv2's per-qubit "
-            "supervision pipeline (use a DEM/fault-space or observable-training path instead)."
+            "supervision pipeline (use a DEM/fault-space or observable-training path instead). "
+            "'stim_dem_obs' trains on circuit-level detector events with oracle observable-flip targets."
         ),
+    )
+    parser.add_argument(
+        "--dem-rounds",
+        type=int,
+        default=None,
+        help="Number of syndrome-extraction rounds for stim_dem_obs (default: distance)",
     )
     parser.add_argument(
         "--phenomenological",
@@ -478,7 +616,9 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--parity-lambda", type=float, default=0.03)
     parser.add_argument("--projection-aware", type=int, default=1)
     parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
-    parser.add_argument("--use-focal", action="store_true", help="Use focal loss for per-qubit labels")
+    parser.add_argument(
+        "--use-focal", action="store_true", help="Use focal loss for per-qubit labels"
+    )
     parser.add_argument("--focal-alpha", type=float, default=0.25)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--noise-injection", type=float, default=0.009883059279379016)
@@ -565,16 +705,16 @@ def train_inprocess(ns) -> str:
     world_size = 1
     local_rank = 0
     is_distributed = False
-    
+
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         is_distributed = True
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        
+
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
-            
+
         dist.init_process_group(backend="nccl", init_method="env://")
         print(f"Initialized DDP: rank {rank}/{world_size}, local_rank {local_rank}")
 
@@ -583,7 +723,7 @@ def train_inprocess(ns) -> str:
     if getattr(args, "phenomenological", False):
         sampler_choice = "synthetic"
         args.sampler = "synthetic"
-    
+
     # Set environment variables for sampling backend
     # - "stim": Use Stim circuit-level noise (MGHD_SAMPLER=stim)
     # - "synthetic": Use fast phenomenological noise (MGHD_SYNTHETIC=1)
@@ -736,7 +876,9 @@ def train_inprocess(ns) -> str:
             if amp_mode == "fp16":
                 amp_dtype = torch.float16
             elif amp_mode == "auto":
-                bf16_ok = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+                bf16_ok = (
+                    hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+                )
                 amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
             else:
                 amp_dtype = torch.bfloat16
@@ -747,6 +889,7 @@ def train_inprocess(ns) -> str:
         if device.type == "cuda":
             return torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
         return nullcontext()
+
     # Build model with optional hyperparameters from JSON/data contract
     m_kwargs = {
         "d_model": int(getattr(args, "d_model", 192)),
@@ -762,10 +905,10 @@ def train_inprocess(ns) -> str:
         "edge_feat_dim": expected_edge_dim,
     }
     model = MGHDv2(profile=args.profile, **m_kwargs).to(device)
-    
+
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        
+
     opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
@@ -790,8 +933,8 @@ def train_inprocess(ns) -> str:
             if rank == 0:
                 print(f"Resuming from checkpoint: {ckpt_path}")
             # Map location to CPU first to avoid GPU OOM or device mismatch, then load_state_dict handles move
-            checkpoint = torch.load(ckpt_path, map_location='cpu')
-            
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+
             # The saved state_dict is unwrapped (see save logic below).
             # If current model is DDP, we load into model.module.
             state_dict = checkpoint["model"]
@@ -810,7 +953,7 @@ def train_inprocess(ns) -> str:
                 model.module.load_state_dict(state_dict)
             else:
                 model.load_state_dict(state_dict)
-            
+
             if "optimizer" in checkpoint:
                 try:
                     opt.load_state_dict(checkpoint["optimizer"])
@@ -821,11 +964,11 @@ def train_inprocess(ns) -> str:
                         print(f"Failed to load optimizer state: {e}")
 
             start_epoch = checkpoint.get("epoch", 0) + 1
-            
+
             # Align scheduler without stepping before first optimizer step
             if start_epoch > 1:
                 sched.last_epoch = start_epoch - 1
-                    
+
             if rank == 0:
                 print(f"Resumed model at epoch {start_epoch - 1}. Next epoch: {start_epoch}")
         else:
@@ -999,6 +1142,110 @@ def train_inprocess(ns) -> str:
                 p_epoch = float(p_list[idx])
             else:
                 p_epoch = float(getattr(args, "p", 0.005))
+
+            # =====================================================================
+            # Circuit-level training path (stim_dem_obs sampler)
+            # =====================================================================
+            if sampler_choice == "stim_dem_obs":
+                # Initialize or update the circuit-level sampler
+                dem_rounds = getattr(args, "dem_rounds", None) or args.distance
+                if epoch == start_epoch:
+                    circuit_sampler = _StimDemObsSampler(
+                        distance=args.distance,
+                        rounds=dem_rounds,
+                        p=p_epoch,
+                        seed=args.seed + epoch,
+                    )
+                else:
+                    circuit_sampler.update_p(p_epoch, seed=args.seed + epoch)
+
+                # Run circuit-level training loop for this epoch
+                shots_per_epoch = int(getattr(args, "shots_per_epoch", 256))
+                batch_size = int(getattr(args, "batch", 64))
+                steps_per_epoch = max(1, shots_per_epoch // batch_size)
+
+                for step_idx in range(steps_per_epoch):
+                    dets, obs = circuit_sampler.sample(shots=batch_size)
+                    loss_val = obs_training_step(
+                        model=model,
+                        dets=dets,
+                        obs=obs,
+                        optimizer=opt,
+                        device=device,
+                        autocast_ctx=_autocast,
+                        scaler=scaler,
+                        grad_clip=float(getattr(args, "grad_clip", 1.0)),
+                    )
+                    total_loss += loss_val * batch_size
+                    n_items += batch_size
+
+                # End of epoch for circuit-level training
+                epoch_loss = total_loss / max(n_items, 1)
+                elapsed = time.time() - t0
+                history.append(
+                    {
+                        "epoch": epoch,
+                        "loss": float(epoch_loss),
+                        "mode": "circuit_level",
+                        "p": float(p_epoch),
+                        "samples": int(n_items),
+                        "time": float(elapsed),
+                    }
+                )
+
+                if rank == 0:
+                    log_entry = {
+                        "epoch": epoch,
+                        "loss": float(epoch_loss),
+                        "mode": "circuit_level",
+                        "p": float(p_epoch),
+                        "samples": int(n_items),
+                        "time": float(elapsed),
+                    }
+                    print(json.dumps(log_entry, separators=(",", ":")), flush=True)
+
+                    # Save checkpoint
+                    if epoch_loss < best_loss:
+                        best_loss = epoch_loss
+                        torch.save(
+                            {
+                                "model": model.module.state_dict()
+                                if is_distributed
+                                else model.state_dict(),
+                                "optimizer": opt.state_dict(),
+                                "epoch": epoch,
+                                "loss": epoch_loss,
+                            },
+                            save_dir / "best.pt",
+                        )
+                    torch.save(
+                        {
+                            "model": model.module.state_dict()
+                            if is_distributed
+                            else model.state_dict(),
+                            "optimizer": opt.state_dict(),
+                            "epoch": epoch,
+                            "loss": epoch_loss,
+                        },
+                        save_dir / "last.pt",
+                    )
+
+                    # Persist logs incrementally
+                    try:
+                        with (save_dir / "train_log.jsonl").open("a", encoding="utf-8") as f:
+                            f.write(json.dumps(log_entry, separators=(",", ":")) + "\n")
+                        (save_dir / "train_log.json").write_text(
+                            json.dumps(history, indent=2), encoding="utf-8"
+                        )
+                    except Exception:
+                        pass
+
+                # Skip per-qubit supervision loop
+                continue
+
+            # =====================================================================
+            # Per-qubit supervision path (cudaq/synthetic samplers)
+            # =====================================================================
             # Teacher setup per epoch
             family = args.family
             # Build code object
@@ -1025,7 +1272,7 @@ def train_inprocess(ns) -> str:
                     "(it produces observable-only outputs)."
                 )
                 warned_dem_mwpm = True
-            
+
             # TAD context/overrides
             qpu_prof, ctx_vec, llr_overrides = _build_tad_for_code(code)
             # Initialize bandit once if requested and context available
@@ -1036,21 +1283,23 @@ def train_inprocess(ns) -> str:
                     bandit = LinTSBandit(d=ctx_vec.size, prior_var=5.0, noise_var=0.5)
                 except Exception:
                     bandit = None
-            
+
             # Setup DataLoader for parallel generation
             workers = max(1, int(getattr(args, "workers", 4)))
             shots_target = int(getattr(args, "shots_per_epoch", args.batch))
-            
+
             # Divide shots among ranks
             if is_distributed:
                 shots_target = shots_target // world_size
-            
+
             # Pass per-rank shot budget; dataset will split this across workers to avoid duplication
-            dataset = OnlineSurfaceDataset(args, p_epoch, epoch, shots_target, teacher_mix, ctx_vec, llr_overrides, rank=rank)
-            
+            dataset = OnlineSurfaceDataset(
+                args, p_epoch, epoch, shots_target, teacher_mix, ctx_vec, llr_overrides, rank=rank
+            )
+
             # In DDP mode, divide batch size across GPUs
             effective_batch = args.batch // world_size if is_distributed else args.batch
-            
+
             loader = DataLoader(
                 dataset,
                 batch_size=effective_batch,
@@ -1060,40 +1309,38 @@ def train_inprocess(ns) -> str:
                 persistent_workers=True if workers > 0 else False,
                 prefetch_factor=int(getattr(args, "prefetch_factor", 2)) if workers > 0 else None,
             )
-            
+
             steps_done = 0
-            
+
             prog_stride = (
                 max(1, shots_target // int(getattr(args, "progress_prints", 1)))
                 if int(getattr(args, "progress_prints", 1)) > 1
                 else 0
             )
-            
+
             for batch in loader:
                 if not batch:
                     continue
-                
+
                 # batch is a single PackedCrop (batched)
                 packed = batch
                 _validate_packed_contract(packed, expected_node_dim, expected_edge_dim)
                 packed = move_to(packed, device)
-                
+
                 with _autocast():
                     logits, node_mask = model(packed=packed)
                     # logits: (B*N, 2), node_mask: (B*N,)
-                    
+
                     # Reshape for structured losses
                     B = packed.x_nodes.shape[0]
                     N = packed.x_nodes.shape[1]
                     logits_reshaped = logits.view(B, N, 2)
                     node_mask_reshaped = node_mask.view(B, N)
-                    node_type_reshaped = packed.node_type # (B, N)
-                    
+                    node_type_reshaped = packed.node_type  # (B, N)
+
                     hard = 1.0
-                    sample_weight = torch.tensor(
-                        hard, dtype=torch.float32, device=device
-                    )
-                    
+                    sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
+
                     if bool(getattr(args, "use_focal", False)):
                         loss_bce = focal_binary_head_loss(
                             logits,
@@ -1113,7 +1360,7 @@ def train_inprocess(ns) -> str:
                             sample_weight=sample_weight,
                             label_smoothing=args.label_smoothing,
                         )
-                    
+
                     loss_par = args.parity_lambda * parity_auxiliary_loss(
                         logits_reshaped,
                         node_mask_reshaped,
@@ -1121,7 +1368,7 @@ def train_inprocess(ns) -> str:
                         H_sub=packed.H_sub,
                         s_sub=packed.s_sub,
                     )
-                    
+
                     loss_proj = torch.tensor(0.0, device=device)
                     if args.projection_aware:
                         proj_loss_sum = 0.0
@@ -1131,14 +1378,14 @@ def train_inprocess(ns) -> str:
                             nt = node_type_reshaped[i]
                             yb = packed.y_bits[i]
                             h = packed.H_sub[i] if isinstance(packed.H_sub, list) else packed.H_sub
-                            
+
                             data_mask = (nt == 0) & nm
-                            
+
                             side = "Z"
                             if hasattr(packed.meta, "batch_metas"):
-                                 side = getattr(packed.meta.batch_metas[i], "side", "Z")
+                                side = getattr(packed.meta.batch_metas[i], "side", "Z")
                             elif hasattr(packed.meta, "side"):
-                                 side = packed.meta.side
+                                side = packed.meta.side
 
                             proj_bits = projection_aware_logits_to_bits(
                                 l,
@@ -1151,38 +1398,28 @@ def train_inprocess(ns) -> str:
                             )
                             with torch.no_grad():
                                 mask_data = data_mask.detach().cpu().numpy()
-                                target_full = (
-                                    yb.detach()
-                                    .cpu()
-                                    .numpy()
-                                    .clip(0, 1)
-                                    .astype(np.uint8)
-                                )
+                                target_full = yb.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
                                 target_data = target_full[mask_data]
                             proj_target = torch.from_numpy(target_data).to(device)
-                            proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(
-                                device
-                            )
-                            raw_bits = (
-                                torch.sigmoid(l[:, 1] - l[:, 0])[data_mask] > 0.5
-                            ).long()
+                            proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
+                            raw_bits = (torch.sigmoid(l[:, 1] - l[:, 0])[data_mask] > 0.5).long()
                             p_loss = 0.5 * F.l1_loss(
                                 proj_pred.float(), proj_target.float()
                             ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
                             proj_loss_sum += p_loss
                         loss_proj = proj_loss_sum / B
-                        
+
                     sample_loss = loss_bce + loss_par + 0.5 * loss_proj
-                    
+
                     batch_loss = sample_loss
-                
+
                 _backward_and_step(batch_loss)
-                
+
                 batch_size = B
                 total_loss += batch_loss.detach().item() * batch_size
                 n_items += batch_size
                 steps_done += 1
-                
+
                 if prog_stride and (steps_done % prog_stride == 0) and rank == 0:
                     prog = {
                         "epoch": epoch,
@@ -1228,7 +1465,7 @@ def train_inprocess(ns) -> str:
                     std = float(args.noise_injection)
                     for packed in moved:
                         packed.x_nodes = packed.x_nodes + torch.randn_like(packed.x_nodes) * std
-                
+
                 batch_loss = torch.zeros((), device=device)
                 for packed, teach in zip(moved, teacher_outs):
                     with _autocast():
@@ -1291,7 +1528,9 @@ def train_inprocess(ns) -> str:
                             proj_target = torch.from_numpy(target_data).to(device)
                             proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
 
-                            raw_bits = (torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5).long()
+                            raw_bits = (
+                                torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5
+                            ).long()
                             loss_proj = 0.5 * F.l1_loss(
                                 proj_pred.float(), proj_target.float()
                             ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
@@ -1327,20 +1566,28 @@ def train_inprocess(ns) -> str:
         prev_epoch_loss = avg
 
         if rank == 0:
-            torch.save({
-                "model": model.module.state_dict() if is_distributed else model.state_dict(),
-                "optimizer": opt.state_dict(),
-                "epoch": epoch,
-                "loss": avg
-            }, save_dir / "last.pt")
-            if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
-                best_loss = avg
-                torch.save({
+            torch.save(
+                {
                     "model": model.module.state_dict() if is_distributed else model.state_dict(),
                     "optimizer": opt.state_dict(),
                     "epoch": epoch,
-                    "loss": avg
-                }, save_dir / "best.pt")
+                    "loss": avg,
+                },
+                save_dir / "last.pt",
+            )
+            if avg < best_loss - float(getattr(args, "early_stop_min_delta", 0.0)):
+                best_loss = avg
+                torch.save(
+                    {
+                        "model": model.module.state_dict()
+                        if is_distributed
+                        else model.state_dict(),
+                        "optimizer": opt.state_dict(),
+                        "epoch": epoch,
+                        "loss": avg,
+                    },
+                    save_dir / "best.pt",
+                )
 
             log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
             if use_online:
@@ -1367,7 +1614,7 @@ def train_inprocess(ns) -> str:
                 best_loss_tensor = torch.tensor(best_loss, device=device)
                 dist.all_reduce(best_loss_tensor, op=dist.ReduceOp.MIN)
                 best_loss = best_loss_tensor.item()
-                
+
             if avg <= best_loss + 1e-12:
                 last_improve_epoch = epoch
             if (epoch - last_improve_epoch) >= patience:
@@ -1383,7 +1630,9 @@ def train_inprocess(ns) -> str:
     # Final snapshot (in case of early termination without last write)
     if rank == 0:
         try:
-            (save_dir / "train_log.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+            (save_dir / "train_log.json").write_text(
+                json.dumps(history, indent=2), encoding="utf-8"
+            )
         except Exception:
             pass
 
@@ -1418,7 +1667,7 @@ def train_inprocess(ns) -> str:
             )
         except Exception:
             pass
-            
+
     if is_distributed:
         dist.destroy_process_group()
 
@@ -1503,12 +1752,24 @@ def sanity_train(
 # Global cache for workers to avoid rebuilding teachers every epoch/iteration
 _WORKER_TEACHERS_CACHE = {}
 
+
 class OnlineSurfaceDataset(IterableDataset):
     """
     Iterable dataset for online surface code simulation.
     Generates crops on-the-fly using multiple workers.
     """
-    def __init__(self, args, p_epoch, epoch, shots_total, teacher_mix, ctx_vec=None, llr_overrides=None, rank=0):
+
+    def __init__(
+        self,
+        args,
+        p_epoch,
+        epoch,
+        shots_total,
+        teacher_mix,
+        ctx_vec=None,
+        llr_overrides=None,
+        rank=0,
+    ):
         self.args = args
         self.p_epoch = p_epoch
         self.epoch = epoch
@@ -1518,14 +1779,18 @@ class OnlineSurfaceDataset(IterableDataset):
         self.ctx_vec = ctx_vec
         self.llr_overrides = llr_overrides
         self.rank = rank
-        
+
         # Parse distance curriculum
         self.distances = [self.args.distance]
         if self.args.distance_curriculum:
             try:
-                self.distances = [int(x) for x in self.args.distance_curriculum.split(",") if x.strip()]
+                self.distances = [
+                    int(x) for x in self.args.distance_curriculum.split(",") if x.strip()
+                ]
             except ValueError:
-                print(f"Warning: Invalid distance curriculum '{self.args.distance_curriculum}', using default {self.args.distance}")
+                print(
+                    f"Warning: Invalid distance curriculum '{self.args.distance_curriculum}', using default {self.args.distance}"
+                )
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -1535,74 +1800,76 @@ class OnlineSurfaceDataset(IterableDataset):
         else:
             worker_id = worker_info.id
             num_workers = max(1, worker_info.num_workers)
-        
+
         # Split the per-rank shot budget across workers to avoid duplicating work
         base = self.shots_to_do // num_workers
         remainder = self.shots_to_do % num_workers
         shots_for_this_worker = base + (1 if worker_id < remainder else 0)
         if shots_for_this_worker <= 0:
             return
-        
+
         # Seed RNG for this worker
         # Ensure distinct seeds across ranks and workers
         seed = self.args.seed + self.epoch * 10000 + self.rank * 100 + worker_id
         rng = np.random.default_rng(seed)
-        
+
         # Use global cache for teachers to persist across epochs in persistent workers
         global _WORKER_TEACHERS_CACHE
-        
+
         shots_done = 0
         while shots_done < shots_for_this_worker:
             # Pick a distance for this shot
             d = int(rng.choice(self.distances))
-            
+
             # Per-shot seed
             shot_seed = int(rng.integers(0, 2**31 - 1))
-            
+
             sample = sample_round(
                 d=d,
                 p=self.p_epoch,
                 seed=shot_seed,
                 profile_path=self.args.qpu_profile if self.args.qpu_profile else None,
             )
-            
+
             # Get or create teachers for this distance
             if d not in _WORKER_TEACHERS_CACHE:
                 _WORKER_TEACHERS_CACHE[d] = self._init_teachers_for_d(d)
 
-            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher, dem_mwpm_teacher, dem = _WORKER_TEACHERS_CACHE[d]
-            
+            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher, dem_mwpm_teacher, dem = (
+                _WORKER_TEACHERS_CACHE[d]
+            )
+
             # Handle erasure
             erase_local = None
             if self.args.erasure_frac > 0:
                 n_q = len(sample["coords_q"])
                 # Generate erasure mask (1 if erased, 0 otherwise)
                 erase_mask = (rng.random(n_q) < self.args.erasure_frac).astype(np.uint8)
-                
+
                 # Always set erase_local if erasure is enabled, to ensure consistent feature dim
                 erase_local = erase_mask
-                
+
                 if np.any(erase_mask):
                     # Inject erasure noise into syndromes
                     # Erasure = random Pauli X/Y/Z/I.
                     # We simulate this as random X flip (50%) and random Z flip (50%)
                     # applied to the erased qubits.
-                    
+
                     # Random errors on erased qubits
                     erasure_err_x = (rng.random(n_q) < 0.5).astype(np.uint8) * erase_mask
                     erasure_err_z = (rng.random(n_q) < 0.5).astype(np.uint8) * erase_mask
-                    
+
                     # Update syndromes
                     # synZ checks X errors
                     # synX checks Z errors
-                    
+
                     Hz = sample["Hz"]
                     Hx = sample["Hx"]
-                    
+
                     # synZ += Hz @ erasure_err_x
                     additional_synZ = (Hz @ erasure_err_x) % 2
                     sample["synZ"] = (sample["synZ"] ^ additional_synZ).astype(np.uint8)
-                    
+
                     # synX += Hx @ erasure_err_z
                     additional_synX = (Hx @ erasure_err_z) % 2
                     sample["synX"] = (sample["synX"] ^ additional_synX).astype(np.uint8)
@@ -1619,7 +1886,7 @@ class OnlineSurfaceDataset(IterableDataset):
                 nvqldpc_teacher=nvqldpc_teacher,
                 dem_mwpm_teacher=dem_mwpm_teacher,
             )
-            
+
             shots_done += 1
 
     def _init_teachers_for_d(self, d):
@@ -1633,12 +1900,12 @@ class OnlineSurfaceDataset(IterableDataset):
             seed=0,
             profile_path=self.args.qpu_profile if getattr(self.args, "qpu_profile", None) else None,
         )
-        
+
         # Check if we're using Stim native sampling (with DEM)
         use_stim_native = sample.get("dem_meta", {}).get("backend") == "stim_native"
         dem = sample.get("dem_meta", {}).get("dem")
         dem_matcher = sample.get("dem_meta", {}).get("matcher")
-        
+
         Hx = np.asarray(sample["Hx"], dtype=np.uint8)
         Hz = np.asarray(sample["Hz"], dtype=np.uint8)
 
@@ -1700,12 +1967,26 @@ class OnlineSurfaceDataset(IterableDataset):
 
         return mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher, dem_mwpm_teacher, dem
 
-    def _process_sample(self, sample, seed, mwpf_teacher, mwpm_ctx, lsd_teacher, rng, d, erase_local=None, nvqldpc_teacher=None, dem_mwpm_teacher=None):
+    def _process_sample(
+        self,
+        sample,
+        seed,
+        mwpf_teacher,
+        mwpm_ctx,
+        lsd_teacher,
+        rng,
+        d,
+        erase_local=None,
+        nvqldpc_teacher=None,
+        dem_mwpm_teacher=None,
+    ):
         # Logic extracted from the main loop
-        
+
         # Check if we have native Stim detectors (preferred path)
-        use_native_dets = "detectors" in sample and sample.get("dem_meta", {}).get("backend") == "stim_native"
-        
+        use_native_dets = (
+            "detectors" in sample and sample.get("dem_meta", {}).get("backend") == "stim_native"
+        )
+
         if use_native_dets:
             # Use native Stim detector ordering - this is the correct path
             dets_global = sample["detectors"][np.newaxis, :].astype(np.uint8)
@@ -1718,7 +1999,7 @@ class OnlineSurfaceDataset(IterableDataset):
                 ],
                 axis=1,
             )
-        
+
         # Global per-fault scaling dict
         mwpf_scale = None
         if hasattr(self, "llr_overrides") and self.llr_overrides is not None:
@@ -1791,7 +2072,7 @@ class OnlineSurfaceDataset(IterableDataset):
                 H_sub = comp["H_sub"]
                 synd_bits = comp["synd_bits"]
                 qubit_indices = comp["qubit_indices"]
-                
+
                 outputs = {}
                 # MWPF
                 if fault_ids_global is not None:
@@ -1801,7 +2082,7 @@ class OnlineSurfaceDataset(IterableDataset):
                         mask = np.isin(qubit_indices, valid_ids)
                         local_bits[mask] = 1
                     outputs["mwpf"] = (local_bits, int(local_bits.sum()))
-                
+
                 # MWPM
                 if mwpm_ctx is not None:
                     bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
@@ -1831,13 +2112,13 @@ class OnlineSurfaceDataset(IterableDataset):
                     if qubit_indices.size and bits_global.size > qubit_indices.max():
                         bits_local = bits_global[qubit_indices].astype(np.uint8)
                         outputs["nvqldpc"] = (bits_local, int(bits_local.sum()))
-                
+
                 # Choose teacher
                 weighted = []
                 for name, (bits, w) in outputs.items():
                     if self.teacher_mix.get(name, 0.0) > 0:
                         weighted.append((name, bits, w, self.teacher_mix[name]))
-                
+
                 chosen_bits = None
                 if weighted:
                     total_w = sum(w for *_, w in weighted)
@@ -1848,7 +2129,7 @@ class OnlineSurfaceDataset(IterableDataset):
                         if r <= acc:
                             chosen_bits = bits
                             break
-                
+
                 if chosen_bits is None:
                     continue
 

@@ -90,10 +90,14 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
         for c in range(d - 1):
             parity = (r + c) % 2
             # X stabilizers at even parity, Z at odd
-            is_x_type = (parity == 0)
+            is_x_type = parity == 0
             if (side == "X" and is_x_type) or (side == "Z" and not is_x_type):
-                qubits = [q_index(r, c), q_index(r + 1, c),
-                          q_index(r, c + 1), q_index(r + 1, c + 1)]
+                qubits = [
+                    q_index(r, c),
+                    q_index(r + 1, c),
+                    q_index(r, c + 1),
+                    q_index(r + 1, c + 1),
+                ]
                 for q in qubits:
                     rows.append(row_idx)
                     cols.append(q)
@@ -347,7 +351,7 @@ def pack_cluster(
         np.full((nQ + nC, 1), float(bw), dtype=np.float32),
         np.full((nQ + nC, 1), float(bh), dtype=np.float32),
     ]
-    synd = (np.asarray(synd_Z_then_X_bits, dtype=np.uint8).ravel() & 1)
+    synd = np.asarray(synd_Z_then_X_bits, dtype=np.uint8).ravel() & 1
     if synd.size < nC:
         synd = np.pad(synd, (0, nC - synd.size), mode="constant")
     elif synd.size > nC:
@@ -822,10 +826,12 @@ class MGHDv2(nn.Module):
         gnn_msg_net_size: Optional[int] = None,
         gnn_msg_dropout: float = 0.0,
         gnn_gru_dropout: float = 0.0,
+        obs_head_dim: Optional[int] = None,  # For circuit-level observable prediction
     ) -> None:
         super().__init__()
         if g_dim is None:
             g_dim = max(8, node_feat_dim)
+        self.d_model = d_model  # Store for forward_obs
         self.seq_encoder = SequenceEncoder(d_model=d_model, d_state=d_state)
         self.se = ChannelSE(channels=d_model, reduction=int(se_reduction))
         self.gnn = GraphDecoderAdapter(
@@ -839,6 +845,15 @@ class MGHDv2(nn.Module):
         self.node_in = nn.Linear(node_feat_dim, d_model)
         self.edge_in = nn.Linear(edge_feat_dim, d_model)
         self.g_proj: Optional[nn.Linear] = None
+
+        # Observable prediction head for circuit-level training (ChatGPT patch)
+        self.obs_head: Optional[nn.Sequential] = None
+        if obs_head_dim is not None:
+            self.obs_head = nn.Sequential(
+                nn.Linear(obs_head_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, 1),  # Single observable for surface code
+            )
 
     def forward(self, packed: PackedCrop) -> Tuple[torch.Tensor, torch.Tensor]:
         x = packed.x_nodes.float()
@@ -910,6 +925,33 @@ class MGHDv2(nn.Module):
         x = self.se(x.unsqueeze(0)).squeeze(0)
         logits = self.gnn(x, eidx, e, nmask, emask)
         return logits, nmask
+
+    def forward_obs(self, dets: torch.Tensor) -> torch.Tensor:
+        """Predict observable flips from detector events (circuit-level mode).
+
+        This is a simple MLP baseline for circuit-level training.
+        More sophisticated approaches could use GNN on DEM graph structure.
+
+        Args:
+            dets: [B, num_detectors] float tensor of detector events (0/1)
+        Returns:
+            [B, 1] logits for observable flip prediction
+        """
+        if self.obs_head is None:
+            raise RuntimeError(
+                "Model not initialized with obs_head_dim. "
+                "Use MGHDv2(..., obs_head_dim=num_detectors) for circuit-level training."
+            )
+        return self.obs_head(dets)
+
+    def ensure_obs_head(self, num_detectors: int, device: torch.device) -> None:
+        """Lazily create obs_head if not present or wrong size."""
+        if self.obs_head is None or self.obs_head[0].in_features != num_detectors:
+            self.obs_head = nn.Sequential(
+                nn.Linear(num_detectors, self.d_model),
+                nn.GELU(),
+                nn.Linear(self.d_model, 1),
+            ).to(device)
 
     def allocate_static_batch(
         self,
@@ -1065,7 +1107,9 @@ def _ensure_array(array: np.ndarray | sp.csr_matrix) -> np.ndarray:
 class MGHDDecoderPublic:
     """Thin wrapper that keeps only the MGHD v2 inference surface."""
 
-    def __init__(self, ckpt_path: str, device: str = "cpu", *, profile: str = "S", node_feat_dim: int = 9) -> None:
+    def __init__(
+        self, ckpt_path: str, device: str = "cpu", *, profile: str = "S", node_feat_dim: int = 9
+    ) -> None:
         self.device = torch.device(device)
         state_dict = _load_state_dict(ckpt_path)
         self.model = MGHDv2(profile=profile, node_feat_dim=node_feat_dim)
