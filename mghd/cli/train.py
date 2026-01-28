@@ -49,75 +49,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 _TEACHER_POOL: ThreadPoolExecutor | None = None
 
-# ---------------------------------------------------------------------------
-# Circuit-level sampler for observable-prediction training
-# ---------------------------------------------------------------------------
-
-try:
-    import stim
-
-    _HAVE_STIM = True
-except ImportError:
-    stim = None  # type: ignore
-    _HAVE_STIM = False
-
-
-def _build_stim_memory_circuit(distance: int, rounds: int, p: float):
-    """Build a rotated surface code memory circuit with circuit-level noise."""
-    if not _HAVE_STIM:
-        raise RuntimeError("stim package required for stim_dem_obs sampler")
-    return stim.Circuit.generated(
-        "surface_code:rotated_memory_x",
-        distance=distance,
-        rounds=rounds,
-        after_clifford_depolarization=p,
-        before_measure_flip_probability=p,
-        after_reset_flip_probability=p,
-    )
-
-
-class _StimDemObsSampler:
-    """Stim sampler for circuit-level observable-prediction training.
-
-    Uses compile_m2d_converter() to convert measurements to detectors+observables.
-    """
-
-    def __init__(self, distance: int, rounds: int, p: float, seed: int = 0):
-        c = _build_stim_memory_circuit(distance, rounds, p)
-        self.det_sampler = c.compile_detector_sampler(seed=seed)
-        self.num_det = c.num_detectors
-        self.num_obs = c.num_observables
-        # Use compile_sampler + m2d_converter for measurement→detector conversion
-        self.meas_sampler = c.compile_sampler(seed=seed)
-        self.m2d = c.compile_m2d_converter()
-        self.circuit = c
-        self.distance = distance
-        self.rounds = rounds
-        self.p = p
-
-    def sample(self, shots: int):
-        """Sample detector events and observable flips.
-
-        Returns:
-            dets: uint8 array [shots, num_det]
-            obs: uint8 array [shots, num_obs]
-        """
-        m = self.meas_sampler.sample(shots=shots)  # bool array
-        dets, obs = self.m2d.convert(m, separate_observables=True)
-        return dets.astype(np.uint8), obs.astype(np.uint8)
-
-    def update_p(self, p: float, seed: int = 0):
-        """Rebuild circuit with new error rate (for curriculum)."""
-        if abs(p - self.p) > 1e-9:
-            self.p = p
-            c = _build_stim_memory_circuit(self.distance, self.rounds, p)
-            self.meas_sampler = c.compile_sampler(seed=seed)
-            self.m2d = c.compile_m2d_converter()
-            self.det_sampler = c.compile_detector_sampler(seed=seed)
-            self.num_det = c.num_detectors
-            self.num_obs = c.num_observables
-            self.circuit = c
-
 
 class CropShardDataset(Dataset):
     """Index all ``.npz`` shards under ``root`` and expose packed crops."""
@@ -482,66 +413,6 @@ def projection_aware_logits_to_bits(
     return bits  # length == #data_qubits
 
 
-def obs_training_step(
-    model: nn.Module,
-    dets: np.ndarray,
-    obs: np.ndarray,
-    optimizer: optim.Optimizer,
-    device: torch.device,
-    autocast_ctx,
-    scaler,
-    grad_clip: float = 1.0,
-) -> float:
-    """Observable-prediction training step for circuit-level mode.
-
-    Args:
-        model: MGHDv2 model with obs_head initialized
-        dets: uint8 array [B, num_det] detector events
-        obs: uint8 array [B, num_obs] observable flip targets
-        optimizer: optimizer instance
-        device: torch device
-        autocast_ctx: autocast context manager
-        scaler: GradScaler for AMP
-        grad_clip: gradient clipping max norm
-
-    Returns:
-        loss value (float)
-    """
-    dets_t = torch.from_numpy(dets).float().to(device)
-    obs_t = torch.from_numpy(obs).float().to(device)
-
-    # Ensure model has obs_head of correct size
-    if hasattr(model, "module"):
-        # DDP wrapped
-        model.module.ensure_obs_head(dets_t.shape[1], device)
-    else:
-        model.ensure_obs_head(dets_t.shape[1], device)
-
-    optimizer.zero_grad(set_to_none=True)
-
-    with autocast_ctx():
-        # Forward pass through observable head
-        if hasattr(model, "module"):
-            obs_logits = model.module.forward_obs(dets_t)
-        else:
-            obs_logits = model.forward_obs(dets_t)
-        loss = F.binary_cross_entropy_with_logits(obs_logits, obs_t)
-
-    # Backward with AMP support
-    if scaler.is_enabled():
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
-
-    return loss.item()
-
-
 def train_inprocess(ns) -> str:
     """Run the trainer in‑process (mirrors CLI ``main``) and return best.pt path."""
     args = ns
@@ -574,21 +445,14 @@ def train_inprocess(ns) -> str:
         "--sampler",
         type=str,
         default="cudaq",
-        choices=["cudaq", "stim", "synthetic", "stim_dem_obs"],
+        choices=["cudaq", "stim", "synthetic"],
         help=(
             "Sampler backend for online mode: "
             "'cudaq' uses the CUDA-Q adapter (or falls back), "
             "'synthetic' uses a fast phenomenological sampler (parity-check syndromes), "
             "'stim' is circuit-level detector sampling and is NOT compatible with MGHDv2's per-qubit "
-            "supervision pipeline (use a DEM/fault-space or observable-training path instead). "
-            "'stim_dem_obs' trains on circuit-level detector events with oracle observable-flip targets."
+            "supervision pipeline (use a DEM/fault-space or observable-training path instead)."
         ),
-    )
-    parser.add_argument(
-        "--dem-rounds",
-        type=int,
-        default=None,
-        help="Number of syndrome-extraction rounds for stim_dem_obs (default: distance)",
     )
     parser.add_argument(
         "--phenomenological",
@@ -1142,106 +1006,6 @@ def train_inprocess(ns) -> str:
                 p_epoch = float(p_list[idx])
             else:
                 p_epoch = float(getattr(args, "p", 0.005))
-
-            # =====================================================================
-            # Circuit-level training path (stim_dem_obs sampler)
-            # =====================================================================
-            if sampler_choice == "stim_dem_obs":
-                # Initialize or update the circuit-level sampler
-                dem_rounds = getattr(args, "dem_rounds", None) or args.distance
-                if epoch == start_epoch:
-                    circuit_sampler = _StimDemObsSampler(
-                        distance=args.distance,
-                        rounds=dem_rounds,
-                        p=p_epoch,
-                        seed=args.seed + epoch,
-                    )
-                else:
-                    circuit_sampler.update_p(p_epoch, seed=args.seed + epoch)
-
-                # Run circuit-level training loop for this epoch
-                shots_per_epoch = int(getattr(args, "shots_per_epoch", 256))
-                batch_size = int(getattr(args, "batch", 64))
-                steps_per_epoch = max(1, shots_per_epoch // batch_size)
-
-                for step_idx in range(steps_per_epoch):
-                    dets, obs = circuit_sampler.sample(shots=batch_size)
-                    loss_val = obs_training_step(
-                        model=model,
-                        dets=dets,
-                        obs=obs,
-                        optimizer=opt,
-                        device=device,
-                        autocast_ctx=_autocast,
-                        scaler=scaler,
-                        grad_clip=float(getattr(args, "grad_clip", 1.0)),
-                    )
-                    total_loss += loss_val * batch_size
-                    n_items += batch_size
-
-                # End of epoch for circuit-level training
-                epoch_loss = total_loss / max(n_items, 1)
-                elapsed = time.time() - t0
-                history.append(
-                    {
-                        "epoch": epoch,
-                        "loss": float(epoch_loss),
-                        "mode": "circuit_level",
-                        "p": float(p_epoch),
-                        "samples": int(n_items),
-                        "time": float(elapsed),
-                    }
-                )
-
-                if rank == 0:
-                    log_entry = {
-                        "epoch": epoch,
-                        "loss": float(epoch_loss),
-                        "mode": "circuit_level",
-                        "p": float(p_epoch),
-                        "samples": int(n_items),
-                        "time": float(elapsed),
-                    }
-                    print(json.dumps(log_entry, separators=(",", ":")), flush=True)
-
-                    # Save checkpoint
-                    if epoch_loss < best_loss:
-                        best_loss = epoch_loss
-                        torch.save(
-                            {
-                                "model": model.module.state_dict()
-                                if is_distributed
-                                else model.state_dict(),
-                                "optimizer": opt.state_dict(),
-                                "epoch": epoch,
-                                "loss": epoch_loss,
-                            },
-                            save_dir / "best.pt",
-                        )
-                    torch.save(
-                        {
-                            "model": model.module.state_dict()
-                            if is_distributed
-                            else model.state_dict(),
-                            "optimizer": opt.state_dict(),
-                            "epoch": epoch,
-                            "loss": epoch_loss,
-                        },
-                        save_dir / "last.pt",
-                    )
-
-                    # Persist logs incrementally
-                    try:
-                        with (save_dir / "train_log.jsonl").open("a", encoding="utf-8") as f:
-                            f.write(json.dumps(log_entry, separators=(",", ":")) + "\n")
-                        (save_dir / "train_log.json").write_text(
-                            json.dumps(history, indent=2), encoding="utf-8"
-                        )
-                    except Exception:
-                        pass
-
-                # Skip per-qubit supervision loop
-                continue
 
             # =====================================================================
             # Per-qubit supervision path (cudaq/synthetic samplers)

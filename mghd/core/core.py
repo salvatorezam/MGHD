@@ -826,12 +826,11 @@ class MGHDv2(nn.Module):
         gnn_msg_net_size: Optional[int] = None,
         gnn_msg_dropout: float = 0.0,
         gnn_gru_dropout: float = 0.0,
-        obs_head_dim: Optional[int] = None,  # For circuit-level observable prediction
     ) -> None:
         super().__init__()
         if g_dim is None:
             g_dim = max(8, node_feat_dim)
-        self.d_model = d_model  # Store for forward_obs
+        self.d_model = d_model
         self.seq_encoder = SequenceEncoder(d_model=d_model, d_state=d_state)
         self.se = ChannelSE(channels=d_model, reduction=int(se_reduction))
         self.gnn = GraphDecoderAdapter(
@@ -845,15 +844,6 @@ class MGHDv2(nn.Module):
         self.node_in = nn.Linear(node_feat_dim, d_model)
         self.edge_in = nn.Linear(edge_feat_dim, d_model)
         self.g_proj: Optional[nn.Linear] = None
-
-        # Observable prediction head for circuit-level training (ChatGPT patch)
-        self.obs_head: Optional[nn.Sequential] = None
-        if obs_head_dim is not None:
-            self.obs_head = nn.Sequential(
-                nn.Linear(obs_head_dim, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, 1),  # Single observable for surface code
-            )
 
     def forward(self, packed: PackedCrop) -> Tuple[torch.Tensor, torch.Tensor]:
         x = packed.x_nodes.float()
@@ -925,33 +915,6 @@ class MGHDv2(nn.Module):
         x = self.se(x.unsqueeze(0)).squeeze(0)
         logits = self.gnn(x, eidx, e, nmask, emask)
         return logits, nmask
-
-    def forward_obs(self, dets: torch.Tensor) -> torch.Tensor:
-        """Predict observable flips from detector events (circuit-level mode).
-
-        This is a simple MLP baseline for circuit-level training.
-        More sophisticated approaches could use GNN on DEM graph structure.
-
-        Args:
-            dets: [B, num_detectors] float tensor of detector events (0/1)
-        Returns:
-            [B, 1] logits for observable flip prediction
-        """
-        if self.obs_head is None:
-            raise RuntimeError(
-                "Model not initialized with obs_head_dim. "
-                "Use MGHDv2(..., obs_head_dim=num_detectors) for circuit-level training."
-            )
-        return self.obs_head(dets)
-
-    def ensure_obs_head(self, num_detectors: int, device: torch.device) -> None:
-        """Lazily create obs_head if not present or wrong size."""
-        if self.obs_head is None or self.obs_head[0].in_features != num_detectors:
-            self.obs_head = nn.Sequential(
-                nn.Linear(num_detectors, self.d_model),
-                nn.GELU(),
-                nn.Linear(self.d_model, 1),
-            ).to(device)
 
     def allocate_static_batch(
         self,

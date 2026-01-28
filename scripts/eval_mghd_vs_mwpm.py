@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
 Evaluate trained MGHD model LER vs MWPM baseline across physical error rates.
-Uses the proper PackedCrop pipeline for MGHD inference.
+
+Supports two modes:
+1. Per-qubit mode (default): Uses PackedCrop pipeline for phenomenological models
+2. Circuit-level mode (--circuit-level): Uses obs_head for circuit-level models
+
+For fair comparison, both MGHD and MWPM should use the same noise model/sampler.
 """
 import argparse
 import numpy as np
@@ -13,22 +18,56 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+try:
+    import stim
+    _HAVE_STIM = True
+except ImportError:
+    stim = None
+    _HAVE_STIM = False
 
-def load_mghd_model(checkpoint_path, device="cuda"):
-    """Load trained MGHD model from checkpoint."""
+
+def load_mghd_model(checkpoint_path, device="cuda", circuit_level=False):
+    """Load trained MGHD model from checkpoint.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        device: Device to load model on
+        circuit_level: If True, initialize obs_head from checkpoint metadata
+    
+    Returns:
+        model: Loaded MGHDv2 model in eval mode
+        metadata: Dict with checkpoint metadata (mode, num_detectors, etc.)
+    """
     from mghd.core.core import MGHDv2
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model = MGHDv2(profile="S").to(device)
     
     state_dict = checkpoint["model"]
+    metadata = {
+        "mode": checkpoint.get("mode", "per_qubit"),
+        "num_detectors": checkpoint.get("num_detectors"),
+        "sampler": checkpoint.get("sampler"),
+    }
+    
+    # Handle g_proj for per-qubit models
     if "g_proj.weight" in state_dict:
         g_dim = state_dict["g_proj.weight"].shape[1]
         model.ensure_g_proj(g_dim, device)
     
+    # Handle obs_head for circuit-level models
+    if circuit_level or metadata["mode"] == "circuit_level":
+        # Try to get num_detectors from checkpoint or state_dict
+        num_det = metadata["num_detectors"]
+        if num_det is None and "obs_head.0.weight" in state_dict:
+            num_det = state_dict["obs_head.0.weight"].shape[1]
+        if num_det is not None:
+            model.ensure_obs_head(num_det, device)
+            metadata["num_detectors"] = num_det
+    
     model.load_state_dict(state_dict)
     model.eval()
-    return model
+    return model, metadata
 
 
 def evaluate_mghd(model, code, p, distance, shots, device):
@@ -178,6 +217,114 @@ def evaluate_mghd(model, code, p, distance, shots, device):
     return {"ler": ler, "samples": total}
 
 
+# ---------------------------------------------------------------------------
+# Circuit-level evaluation functions (fair comparison using same Stim samples)
+# ---------------------------------------------------------------------------
+
+def _build_stim_memory_circuit(distance: int, rounds: int, p: float):
+    """Build a rotated surface code memory circuit with circuit-level noise."""
+    if not _HAVE_STIM:
+        raise RuntimeError("stim package required for circuit-level evaluation")
+    return stim.Circuit.generated(
+        "surface_code:rotated_memory_x",
+        distance=distance,
+        rounds=rounds,
+        after_clifford_depolarization=p,
+        before_measure_flip_probability=p,
+        after_reset_flip_probability=p,
+    )
+
+
+def evaluate_mghd_circuit_level(model, p, distance, rounds, shots, device):
+    """Evaluate circuit-level trained MGHD model using obs_head.
+    
+    Args:
+        model: MGHDv2 model with obs_head initialized
+        p: Physical error rate
+        distance: Code distance
+        rounds: Number of syndrome extraction rounds
+        shots: Number of shots to evaluate
+        device: Torch device
+        
+    Returns:
+        dict with ler, err, samples
+    """
+    circuit = _build_stim_memory_circuit(distance, rounds, p)
+    sampler = circuit.compile_sampler()
+    m2d = circuit.compile_m2d_converter()
+    
+    correct = 0
+    total = 0
+    batch_size = min(1024, shots)
+    n_batches = max(1, shots // batch_size)
+    
+    for batch_idx in range(n_batches):
+        # Sample measurements and convert to detectors + observables
+        meas = sampler.sample(shots=batch_size)
+        dets, obs = m2d.convert(meas, separate_observables=True)
+        
+        dets_t = torch.from_numpy(dets.astype(np.float32)).to(device)
+        
+        with torch.no_grad():
+            obs_logits = model.forward_obs(dets_t)
+            pred_obs = (torch.sigmoid(obs_logits) > 0.5).cpu().numpy().astype(np.uint8)
+        
+        # Compare predictions to ground truth
+        true_obs = obs.astype(np.uint8)
+        if pred_obs.shape[1] < true_obs.shape[1]:
+            true_obs = true_obs[:, :pred_obs.shape[1]]
+        elif pred_obs.shape[1] > true_obs.shape[1]:
+            pred_obs = pred_obs[:, :true_obs.shape[1]]
+        
+        correct += np.sum(pred_obs[:, 0] == true_obs[:, 0])
+        total += len(true_obs)
+    
+    ler = 1.0 - (correct / total) if total > 0 else 1.0
+    err = np.sqrt(ler * (1 - ler) / total) if total > 0 else 0
+    return {"ler": ler, "err": err, "samples": total}
+
+
+def evaluate_mwpm_circuit_level(p, distance, rounds, shots):
+    """Evaluate MWPM (PyMatching) on circuit-level Stim samples.
+    
+    Uses PyMatching directly on the detector error model for optimal MWPM.
+    This is the fairest comparison for circuit-level MGHD.
+    """
+    try:
+        import pymatching
+    except ImportError:
+        raise RuntimeError("pymatching required for circuit-level MWPM evaluation")
+    
+    circuit = _build_stim_memory_circuit(distance, rounds, p)
+    dem = circuit.detector_error_model(decompose_errors=True)
+    matcher = pymatching.Matching.from_detector_error_model(dem)
+    
+    sampler = circuit.compile_detector_sampler()
+    
+    correct = 0
+    total = 0
+    batch_size = min(4096, shots)
+    n_batches = max(1, shots // batch_size)
+    
+    for batch_idx in range(n_batches):
+        dets, obs = sampler.sample(shots=batch_size, separate_observables=True)
+        
+        # PyMatching decoding
+        pred_obs = matcher.decode_batch(dets)
+        
+        # Compare
+        true_obs = obs.astype(np.uint8)
+        if pred_obs.ndim == 1:
+            pred_obs = pred_obs.reshape(-1, 1)
+        
+        correct += np.sum(pred_obs[:, 0] == true_obs[:, 0])
+        total += len(true_obs)
+    
+    ler = 1.0 - (correct / total) if total > 0 else 1.0
+    err = np.sqrt(ler * (1 - ler) / total) if total > 0 else 0
+    return {"ler": ler, "err": err, "samples": total}
+
+
 def evaluate_mwpm(code, p, distance, shots):
     """Evaluate MWPM decoder using Stim circuit-level noise."""
     from mghd.samplers import get_sampler
@@ -227,59 +374,106 @@ def main():
     parser = argparse.ArgumentParser(description="Compare MGHD vs MWPM LER")
     parser.add_argument("--model", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--distance", type=int, default=3)
+    parser.add_argument("--rounds", type=int, default=None, 
+                        help="Syndrome rounds for circuit-level (default: distance)")
     parser.add_argument("--shots", type=int, default=2000, help="Shots per p value")
     parser.add_argument("--output", type=str, default="mghd_vs_mwpm.png")
+    parser.add_argument("--circuit-level", action="store_true",
+                        help="Use circuit-level evaluation (obs_head prediction)")
+    parser.add_argument("--p-values", type=str, default="0.001,0.003,0.007,0.01",
+                        help="Comma-separated physical error rates to evaluate")
     args = parser.parse_args()
     
-    p_values = [0.001, 0.003, 0.007, 0.01]
+    p_values = [float(p.strip()) for p in args.p_values.split(",")]
+    rounds = args.rounds if args.rounds is not None else args.distance
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     # Load model
     print(f"Loading model from {args.model}...")
-    model = load_mghd_model(args.model, device)
+    model, metadata = load_mghd_model(args.model, device, circuit_level=args.circuit_level)
     
-    # Load code
-    from mghd.codes.registry import get_code
-    code = get_code("surface", distance=args.distance)
+    # Auto-detect circuit-level mode from checkpoint
+    is_circuit_level = args.circuit_level or metadata.get("mode") == "circuit_level"
     
-    # Evaluate MWPM baseline
-    print("\n=== Evaluating MWPM baseline ===")
-    mwpm_results = {}
-    for p in p_values:
-        result = evaluate_mwpm(code, p, args.distance, args.shots)
-        mwpm_results[p] = result
-        print(f"  p={p:.3f}: MWPM LER={result['ler']:.4f} ± {result['err']:.4f}")
-    
-    # Evaluate MGHD model
-    print("\n=== Evaluating MGHD model ===")
-    mghd_results = {}
-    for p in p_values:
-        print(f"  Evaluating p={p:.3f}...", end=" ", flush=True)
-        result = evaluate_mghd(model, code, p, args.distance, args.shots, device)
-        mghd_results[p] = result
-        print(f"MGHD LER={result['ler']:.4f} ({result['samples']} samples)")
+    if is_circuit_level:
+        print(f"Mode: CIRCUIT-LEVEL (observable prediction)")
+        print(f"  num_detectors: {metadata.get('num_detectors')}")
+        print(f"  rounds: {rounds}")
+        
+        if not _HAVE_STIM:
+            raise RuntimeError("stim package required for circuit-level evaluation")
+        
+        # Evaluate MWPM baseline (PyMatching on DEM)
+        print("\n=== Evaluating MWPM baseline (PyMatching on DEM) ===")
+        mwpm_results = {}
+        for p in p_values:
+            result = evaluate_mwpm_circuit_level(p, args.distance, rounds, args.shots)
+            mwpm_results[p] = result
+            print(f"  p={p:.4f}: MWPM LER={result['ler']:.4f} ± {result['err']:.4f}")
+        
+        # Evaluate MGHD model
+        print("\n=== Evaluating MGHD model (obs_head) ===")
+        mghd_results = {}
+        for p in p_values:
+            print(f"  Evaluating p={p:.4f}...", end=" ", flush=True)
+            result = evaluate_mghd_circuit_level(model, p, args.distance, rounds, 
+                                                  args.shots, device)
+            mghd_results[p] = result
+            print(f"MGHD LER={result['ler']:.4f} ± {result['err']:.4f}")
+        
+        title_suffix = "(Circuit-Level)"
+    else:
+        print(f"Mode: PER-QUBIT (phenomenological)")
+        
+        # Load code for per-qubit evaluation
+        from mghd.codes.registry import get_code
+        code = get_code("surface", distance=args.distance)
+        
+        # Evaluate MWPM baseline
+        print("\n=== Evaluating MWPM baseline ===")
+        mwpm_results = {}
+        for p in p_values:
+            result = evaluate_mwpm(code, p, args.distance, args.shots)
+            mwpm_results[p] = result
+            print(f"  p={p:.4f}: MWPM LER={result['ler']:.4f} ± {result['err']:.4f}")
+        
+        # Evaluate MGHD model
+        print("\n=== Evaluating MGHD model ===")
+        mghd_results = {}
+        for p in p_values:
+            print(f"  Evaluating p={p:.4f}...", end=" ", flush=True)
+            result = evaluate_mghd(model, code, p, args.distance, args.shots, device)
+            mghd_results[p] = result
+            ler_str = f"MGHD LER={result['ler']:.4f}"
+            if "err" in result:
+                ler_str += f" ± {result['err']:.4f}"
+            print(f"{ler_str} ({result['samples']} samples)")
+        
+        title_suffix = "(Phenomenological)"
     
     # Plot
     print("\nPlotting...")
     fig, ax = plt.subplots(figsize=(8, 6))
     
     mwpm_lers = [mwpm_results[p]["ler"] for p in p_values]
-    mwpm_errs = [mwpm_results[p]["err"] for p in p_values]
+    mwpm_errs = [mwpm_results[p].get("err", 0) for p in p_values]
     mghd_lers = [mghd_results[p]["ler"] for p in p_values]
+    mghd_errs = [mghd_results[p].get("err", 0) for p in p_values]
     
     ax.errorbar(p_values, mwpm_lers, yerr=mwpm_errs, 
                 fmt='o-', label='MWPM', linewidth=2, markersize=8, capsize=4, color='blue')
-    ax.plot(p_values, mghd_lers, 's-', label='MGHD (trained)', 
-            linewidth=2, markersize=8, color='red')
+    ax.errorbar(p_values, mghd_lers, yerr=mghd_errs,
+                fmt='s-', label='MGHD (trained)', linewidth=2, markersize=8, 
+                capsize=4, color='red')
     
     ax.set_xlabel('Physical Error Rate (p)', fontsize=12)
     ax.set_ylabel('Logical Error Rate (LER)', fontsize=12)
-    ax.set_title(f'MGHD vs MWPM - Surface Code d={args.distance}', fontsize=14)
+    ax.set_title(f'MGHD vs MWPM - Surface Code d={args.distance} {title_suffix}', fontsize=14)
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(0, 0.012)
+    ax.set_xlim(0, max(p_values) * 1.2)
     
     plt.tight_layout()
     plt.savefig(args.output, dpi=150)
