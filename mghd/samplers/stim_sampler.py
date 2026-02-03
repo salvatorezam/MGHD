@@ -4,16 +4,30 @@ Adds CUDA‑Q parity in interface:
 - Optional omission of observables (``emit_obs=False``)
 - Optional erasure injection on data qubits (``inject_erasure_frac>0``)
   returning ``erase_data_mask`` and ``p_erase_data`` fields in ``SampleBatch``.
+- Circuit-level sampling with DEM graph extraction for MGHDCircuit.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional, Tuple
+from functools import lru_cache
 
 import numpy as np
 
 from . import SampleBatch
 from . import register_sampler
+
+
+@lru_cache(maxsize=32)
+def _get_surface_circuit(d: int, rounds: int, dep: float):
+    """Cache Stim circuit construction (expensive for large distances)."""
+    import stim
+    return stim.Circuit.generated(
+        "surface_code:rotated_memory_x",
+        distance=int(d),
+        rounds=int(rounds),
+        after_clifford_depolarization=float(dep),
+    )
 
 
 def sample_surface_memory(
@@ -26,14 +40,7 @@ def sample_surface_memory(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Sample a rotated surface memory circuit via Stim's generator."""
 
-    import stim  # type: ignore
-
-    circuit = stim.Circuit.generated(
-        "surface_code:rotated_memory_x",
-        distance=int(d),
-        rounds=int(rounds),
-        after_clifford_depolarization=float(dep),
-    )
+    circuit = _get_surface_circuit(d, rounds, dep)
     sampler = circuit.compile_detector_sampler()
     dets, obs = sampler.sample(shots=shots, separate_observables=True)
     return np.asarray(dets, dtype=np.uint8), np.asarray(obs, dtype=np.uint8)
@@ -137,7 +144,94 @@ class StimSampler:
         )
 
 
+class StimCircuitSampler:
+    """Circuit-level sampler that returns detection events + circuit for DEM extraction.
+
+    This sampler is designed for use with MGHDCircuit, providing:
+    - Detection events (temporal XOR of measurements)
+    - Ground truth observable flips
+    - Access to the underlying Stim circuit for DEM graph construction
+
+    Unlike StimSampler which returns raw detectors, this provides the full
+    context needed for circuit-level decoding.
+    """
+
+    def __init__(
+        self,
+        *,
+        distance: int,
+        rounds: int = 5,
+        dep: float = 0.001,
+    ) -> None:
+        # Store as both public and private for curriculum detection
+        self._distance = int(distance)
+        self._rounds = int(rounds)
+        self._dep = float(dep)
+        self.distance = self._distance
+        self.rounds = self._rounds
+        self.dep = self._dep
+        self._circuit = None
+        self._sampler = None
+
+    @property
+    def circuit(self):
+        """Lazily construct and cache the Stim circuit."""
+        if self._circuit is None:
+            self._circuit = _get_surface_circuit(self.distance, self.rounds, self.dep)
+        return self._circuit
+
+    @property
+    def dem(self):
+        """Get the Detector Error Model for graph construction."""
+        return self.circuit.detector_error_model(decompose_errors=True)
+
+    def sample(self, n_shots: int, seed: Optional[int] = None) -> dict:
+        """Sample detection events and observable flips.
+
+        Returns:
+            dict with:
+                - 'dets': [n_shots, num_detectors] binary detection events
+                - 'obs': [n_shots, num_observables] ground truth observable flips
+                - 'circuit': the Stim circuit (for DEM graph construction)
+                - 'meta': sampling metadata
+        """
+        if self._sampler is None:
+            self._sampler = self.circuit.compile_detector_sampler()
+
+        dets, obs = self._sampler.sample(shots=n_shots, separate_observables=True)
+
+        return {
+            "dets": np.asarray(dets, dtype=np.uint8),
+            "obs": np.asarray(obs, dtype=np.uint8),
+            "circuit": self.circuit,
+            "meta": {
+                "distance": self.distance,
+                "rounds": self.rounds,
+                "dep": self.dep,
+                "shots": n_shots,
+                "num_detectors": self.dem.num_detectors,
+                "num_observables": self.dem.num_observables,
+            },
+        }
+
+    def sample_with_dem_graph(self, n_shots: int, seed: Optional[int] = None):
+        """Sample and build DEMGraph for MGHDCircuit.
+
+        Returns:
+            DEMGraph ready for model forward pass
+        """
+        from mghd.core.core import build_dem_graph
+
+        samples = self.sample(n_shots, seed)
+        return build_dem_graph(
+            samples["circuit"],
+            samples["dets"],
+            samples["obs"],
+        )
+
+
 register_sampler("stim", lambda **kw: StimSampler(**kw))
+register_sampler("stim_circuit", lambda **kw: StimCircuitSampler(**kw))
 
 
-__all__ = ["StimSampler", "sample_surface_memory"]
+__all__ = ["StimSampler", "StimCircuitSampler", "sample_surface_memory"]

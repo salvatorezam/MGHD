@@ -1,9 +1,14 @@
-"""Consolidated MGHD v2 runtime stack (features, model, decoder)."""
+"""Consolidated MGHD v2 runtime stack (features, model, decoder).
+
+Includes:
+- MGHDv2: Code-level decoder (phenomenological noise, per-qubit supervision)
+- MGHDCircuit: Circuit-level decoder (DEM-based, observable prediction)
+"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -11,6 +16,7 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Lightweight config dataclass
@@ -188,6 +194,126 @@ class PackedCrop:
     H_sub: np.ndarray | None = None
     idx_data_local: np.ndarray | None = None
     idx_check_local: np.ndarray | None = None
+
+
+# ---------------------------------------------------------------------------
+# Circuit-level (DEM-based) data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DEMGraph:
+    """Graph representation built from a Stim Detector Error Model.
+
+    Nodes: detectors (temporal XOR of measurements)
+    Edges: error mechanisms from the DEM
+    
+    This is the correct representation for circuit-level decoding.
+    """
+    # Node features: [num_detectors, node_feat_dim]
+    x_det: torch.Tensor
+    # Detection events: [batch_size, num_detectors] binary
+    det_events: torch.Tensor
+    # Edge index: [2, num_edges] source/target detector indices
+    edge_index: torch.Tensor
+    # Edge weights: [num_edges] -log(p) from DEM
+    edge_weight: torch.Tensor
+    # Observable mask: [num_edges] 1 if edge contributes to observable
+    obs_mask: torch.Tensor
+    # Ground truth observable: [batch_size, num_observables]
+    y_obs: torch.Tensor
+    # Metadata
+    num_detectors: int
+    num_edges: int
+    num_observables: int
+
+
+def build_dem_graph(
+    circuit,
+    det_events: np.ndarray,
+    obs_labels: np.ndarray,
+    *,
+    node_feat_dim: int = 8,
+) -> DEMGraph:
+    """Build a DEMGraph from a Stim circuit and detection events.
+
+    Args:
+        circuit: stim.Circuit with detector and observable definitions
+        det_events: [batch_size, num_detectors] binary detection events
+        obs_labels: [batch_size, num_observables] ground truth observable flips
+        node_feat_dim: dimension of learned node features (initialized)
+
+    Returns:
+        DEMGraph ready for MGHDCircuit forward pass
+    """
+    import stim
+
+    dem = circuit.detector_error_model(decompose_errors=True)
+    num_det = dem.num_detectors
+    num_obs = dem.num_observables
+
+    # Parse DEM to extract edges (error mechanisms)
+    edges_src = []
+    edges_dst = []
+    edge_weights = []
+    obs_contributions = []  # which edges flip the observable
+
+    for instruction in dem.flattened():
+        if instruction.type == "error":
+            prob = instruction.args_copy()[0]
+            weight = -np.log(max(prob, 1e-15))
+            
+            targets = instruction.targets_copy()
+            det_targets = [t.val for t in targets if t.is_relative_detector_id()]
+            obs_targets = [t.val for t in targets if t.is_logical_observable_id()]
+            
+            # Create edges between pairs of detectors
+            if len(det_targets) == 2:
+                d0, d1 = det_targets
+                edges_src.append(d0)
+                edges_dst.append(d1)
+                edge_weights.append(weight)
+                obs_contributions.append(1.0 if obs_targets else 0.0)
+            elif len(det_targets) == 1:
+                # Single detector = boundary edge (connect to virtual node or self-loop)
+                d0 = det_targets[0]
+                edges_src.append(d0)
+                edges_dst.append(d0)  # self-loop for boundary
+                edge_weights.append(weight)
+                obs_contributions.append(1.0 if obs_targets else 0.0)
+
+    # Convert to tensors
+    batch_size = det_events.shape[0]
+    
+    # Node features: detector index embedding + detection event
+    x_det = torch.zeros(num_det, node_feat_dim, dtype=torch.float32)
+    # Initialize with sinusoidal position encoding
+    for i in range(num_det):
+        for j in range(node_feat_dim // 2):
+            freq = 1.0 / (10000 ** (2 * j / node_feat_dim))
+            x_det[i, 2*j] = np.sin(i * freq)
+            x_det[i, 2*j + 1] = np.cos(i * freq)
+
+    if edges_src:
+        edge_index = torch.tensor([edges_src, edges_dst], dtype=torch.long)
+        edge_weight = torch.tensor(edge_weights, dtype=torch.float32)
+        obs_mask = torch.tensor(obs_contributions, dtype=torch.float32)
+    else:
+        edge_index = torch.zeros(2, 0, dtype=torch.long)
+        edge_weight = torch.zeros(0, dtype=torch.float32)
+        obs_mask = torch.zeros(0, dtype=torch.float32)
+
+    return DEMGraph(
+        x_det=x_det,
+        det_events=torch.tensor(det_events, dtype=torch.float32),
+        edge_index=edge_index,
+        edge_weight=edge_weight,
+        obs_mask=obs_mask,
+        y_obs=torch.tensor(obs_labels, dtype=torch.float32),
+        num_detectors=num_det,
+        num_edges=len(edges_src),
+        num_observables=num_obs,
+    )
 
 
 SYND_FEAT_IDX = 8  # after xy(2), type(1), degree(1), k/r/bw/bh(4) => 8 dims
@@ -1030,6 +1156,230 @@ class MGHDv2(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Circuit-level decoder (DEM-based)
+# ---------------------------------------------------------------------------
+
+
+class SoftMatchingLayer(nn.Module):
+    """Differentiable approximation to minimum-weight matching.
+
+    Uses iterative soft assignment inspired by Sinkhorn iterations,
+    applied to edge probabilities to find likely error chains.
+    """
+
+    def __init__(self, n_iters: int = 5, temperature: float = 0.1) -> None:
+        super().__init__()
+        self.n_iters = n_iters
+        self.temperature = temperature
+
+    def forward(
+        self,
+        edge_logits: torch.Tensor,
+        edge_index: torch.Tensor,
+        det_events: torch.Tensor,
+        num_detectors: int,
+    ) -> torch.Tensor:
+        """Compute soft edge assignments that respect detection parity.
+
+        Args:
+            edge_logits: [num_edges] learned edge scores (lower = more likely)
+            edge_index: [2, num_edges] source/target detector indices
+            det_events: [batch_size, num_detectors] binary detection events
+            num_detectors: number of detector nodes
+
+        Returns:
+            soft_matching: [batch_size, num_edges] soft edge activations
+        """
+        batch_size = det_events.shape[0]
+        num_edges = edge_logits.shape[0]
+        device = edge_logits.device
+
+        # Convert logits to probabilities
+        edge_probs = torch.sigmoid(-edge_logits / self.temperature)
+
+        # Initial assignment based on edge probabilities
+        soft_match = edge_probs.unsqueeze(0).expand(batch_size, -1)
+
+        # Iterative refinement to satisfy detection constraints
+        src, dst = edge_index[0], edge_index[1]
+        
+        for _ in range(self.n_iters):
+            # Compute current parity at each detector
+            parity = torch.zeros(batch_size, num_detectors, device=device)
+            parity.scatter_add_(1, src.unsqueeze(0).expand(batch_size, -1), soft_match)
+            if not torch.equal(src, dst):  # avoid double counting self-loops
+                non_self = src != dst
+                parity.scatter_add_(
+                    1,
+                    dst.unsqueeze(0).expand(batch_size, -1)[:, non_self],
+                    soft_match[:, non_self],
+                )
+
+            # Residual: how much parity differs from detection events
+            residual = det_events - parity
+
+            # Adjust edges to reduce residual (soft gradient step)
+            src_residual = residual.gather(1, src.unsqueeze(0).expand(batch_size, -1))
+            adjustment = 0.5 * src_residual * edge_probs.unsqueeze(0)
+            soft_match = torch.clamp(soft_match + adjustment, 0.0, 1.0)
+
+        return soft_match
+
+
+class MGHDCircuit(nn.Module):
+    """Circuit-level decoder operating on Detector Error Model graphs.
+
+    Unlike MGHDv2 which operates on Hz/Hx matrices and predicts per-qubit errors,
+    this model operates on the DEM graph and predicts logical observables directly.
+
+    Architecture:
+    1. GNN message passing on detector graph (detectors as nodes, error mechanisms as edges)
+    2. Edge scoring to learn soft error weights
+    3. Soft matching layer to find likely error chains
+    4. Observable prediction via parity of matched edges
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int = 128,
+        n_gnn_iters: int = 6,
+        n_match_iters: int = 5,
+        match_temperature: float = 0.1,
+        node_feat_dim: int = 8,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+        # Node embedding: combine static features with detection events
+        self.node_embed = nn.Sequential(
+            nn.Linear(node_feat_dim + 1, d_model),  # +1 for detection event
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        # Edge embedding: combine DEM weight with learned features
+        self.edge_embed = nn.Sequential(
+            nn.Linear(1, d_model),  # DEM weight
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+        )
+
+        # GNN message passing
+        self.gnn = GraphDecoderCore(
+            n_iters=n_gnn_iters,
+            n_node_features=d_model,
+            n_node_inputs=d_model,
+            n_edge_features=d_model,
+            n_node_outputs=d_model,  # output node embeddings, not logits
+            msg_net_size=d_model * 2,
+            msg_net_dropout_p=dropout,
+            gru_dropout_p=dropout,
+        )
+
+        # Edge scorer: predict per-edge error probability
+        self.edge_scorer = nn.Sequential(
+            nn.Linear(d_model * 2 + d_model, d_model),  # src_node + dst_node + edge_feat
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+        # Soft matching
+        self.soft_matching = SoftMatchingLayer(
+            n_iters=n_match_iters,
+            temperature=match_temperature,
+        )
+
+        # Final observable prediction (learnable aggregation)
+        self.obs_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(self, graph: DEMGraph) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass for circuit-level decoding.
+
+        Args:
+            graph: DEMGraph with detection events and DEM structure
+
+        Returns:
+            obs_logits: [batch_size, num_observables] observable predictions
+            edge_probs: [batch_size, num_edges] soft edge activations (for analysis)
+        """
+        batch_size = graph.det_events.shape[0]
+        num_det = graph.num_detectors
+        num_edges = graph.num_edges
+        device = graph.x_det.device
+
+        # Handle empty graphs
+        if num_edges == 0:
+            return (
+                torch.zeros(batch_size, max(1, graph.num_observables), device=device),
+                torch.zeros(batch_size, 0, device=device),
+            )
+
+        # Per-sample node features: static + detection event
+        x_det_batch = graph.x_det.unsqueeze(0).expand(batch_size, -1, -1)
+        det_feat = graph.det_events.unsqueeze(-1)  # [B, num_det, 1]
+        node_input = torch.cat([x_det_batch, det_feat], dim=-1)
+        node_emb = self.node_embed(node_input)  # [B, num_det, d_model]
+
+        # Edge features from DEM weights
+        edge_feat = self.edge_embed(graph.edge_weight.unsqueeze(-1))  # [num_edges, d_model]
+
+        # Flatten for GNN (process each sample)
+        obs_logits_list = []
+        edge_probs_list = []
+
+        for b in range(batch_size):
+            x = node_emb[b]  # [num_det, d_model]
+            src, dst = graph.edge_index[0], graph.edge_index[1]
+
+            # GNN message passing
+            gnn_out = self.gnn(x, src, dst, edge_attr=edge_feat)
+            x_final = gnn_out[-1]  # last iteration: [num_det, d_model]
+
+            # Score edges
+            src_emb = x_final[src]  # [num_edges, d_model]
+            dst_emb = x_final[dst]  # [num_edges, d_model]
+            edge_input = torch.cat([src_emb, dst_emb, edge_feat], dim=-1)
+            edge_logits = self.edge_scorer(edge_input).squeeze(-1)  # [num_edges]
+
+            # Soft matching
+            det_events_b = graph.det_events[b:b+1]  # [1, num_det]
+            soft_match = self.soft_matching(
+                edge_logits, graph.edge_index, det_events_b, num_det
+            )  # [1, num_edges]
+
+            # Observable prediction: weighted sum of edge activations through obs_mask
+            # Plus learned correction from node embeddings
+            obs_from_edges = (soft_match * graph.obs_mask.unsqueeze(0)).sum(dim=-1)  # [1]
+            
+            # Pool node embeddings for additional signal
+            active_det_mask = det_events_b.squeeze(0) > 0.5
+            if active_det_mask.any():
+                pooled = x_final[active_det_mask].mean(dim=0, keepdim=True)
+            else:
+                pooled = x_final.mean(dim=0, keepdim=True)
+            obs_correction = self.obs_head(pooled).squeeze(-1)  # [1]
+            
+            # Combine: edge parity + learned correction
+            obs_logit = obs_from_edges + obs_correction
+
+            obs_logits_list.append(obs_logit)
+            edge_probs_list.append(soft_match.squeeze(0))
+
+        obs_logits = torch.stack(obs_logits_list, dim=0)  # [B, 1]
+        edge_probs = torch.stack(edge_probs_list, dim=0)  # [B, num_edges]
+
+        return obs_logits, edge_probs
+
+
+# ---------------------------------------------------------------------------
 # Inference wrapper
 # ---------------------------------------------------------------------------
 
@@ -1277,4 +1627,9 @@ __all__ = [
     "MGHDv2",
     "MGHDDecoderPublic",
     "warmup_and_capture",
+    # Circuit-level (DEM-based) exports
+    "DEMGraph",
+    "build_dem_graph",
+    "SoftMatchingLayer",
+    "MGHDCircuit",
 ]
