@@ -251,6 +251,8 @@ scratchpad/initial-test/PROJECT_SUMMARY.md
 !AUTHORS
 !MANIFEST.in
 
+!CIRCUIT_LEVEL_ARCHITECTURE-SUMMARY.md
+
 # Keep small example datasets (if any)
 !**/examples/*.csv
 !**/test_data/*.npy
