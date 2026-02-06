@@ -522,7 +522,21 @@ def train_inprocess(ns) -> str:
         default=0.0,
         help="Optional erasure injection fraction for online sampling",
     )
-    parser.add_argument("--teacher-mix", type=str, default="mwpf=1.0,mwpm=0.0,lsd=0.0")
+    parser.add_argument("--teacher-mix", type=str, default="lsd=0.7,mwpm=0.3,mwpf=0.0")
+    parser.add_argument(
+        "--teacher-contract-report",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to teacher contract JSON from scripts/audit_teacher_contracts.py. "
+            "When provided, non-eligible teachers are auto-disabled."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-contract-strict",
+        action="store_true",
+        help="If set with --teacher-contract-report, fail when a requested teacher is not eligible.",
+    )
     parser.add_argument(
         "--online-rl",
         action="store_true",
@@ -984,18 +998,102 @@ def train_inprocess(ns) -> str:
     save_dir.mkdir(parents=True, exist_ok=True)
     # Persist run metadata for reproducibility
     try:
+        def _resolve_noise_axis_for_point(p_value: float) -> tuple[str, float, dict]:
+            sampler_mode = str(getattr(args, "sampler", "cudaq")).lower()
+            if sampler_mode == "synthetic" or bool(getattr(args, "phenomenological", False)):
+                return (
+                    "p_data",
+                    float(p_value),
+                    {
+                        "noise_model_family": "phenomenological_iid",
+                        "p_data": float(p_value),
+                        "p_meas": float(p_value),
+                    },
+                )
+            if sampler_mode == "stim":
+                return (
+                    "p_data",
+                    float(p_value),
+                    {
+                        "noise_model_family": "stim_generated_surface_memory_zx",
+                        "p_data": float(p_value),
+                        "rounds": int(getattr(args, "distance", 0)),
+                    },
+                )
+            noise_family = str(os.environ.get("MGHD_NOISE_MODEL", "generic_cl")).strip().lower()
+            if noise_family in {"generic", "generic_cl", "generic-circuit"}:
+                p_ref = 0.03
+                lam = max(1e-3, min(5.0, float(p_value) / p_ref))
+                p1q = float(os.environ.get("MGHD_GENERIC_P1Q", 0.0015))
+                p2q = float(os.environ.get("MGHD_GENERIC_P2Q", 0.01))
+                pidle = float(os.environ.get("MGHD_GENERIC_PIDLE", 0.0008))
+                pmeas0 = float(os.environ.get("MGHD_GENERIC_PMEAS0", 0.02))
+                pmeas1 = float(os.environ.get("MGHD_GENERIC_PMEAS1", 0.02))
+                phook = float(os.environ.get("MGHD_GENERIC_PHOOK", 0.0))
+                pcrosstalk = float(os.environ.get("MGHD_GENERIC_PCROSSTALK", 0.0))
+                return (
+                    "lambda_scale",
+                    float(lam),
+                    {
+                        "noise_model_family": "generic_cl",
+                        "requested_phys_p": float(p_value),
+                        "lambda_scale": float(lam),
+                        "p_ref": float(p_ref),
+                        "p_1q": p1q * lam,
+                        "p_2q": p2q * lam,
+                        "p_idle": pidle * lam,
+                        "p_meas0": pmeas0 * lam,
+                        "p_meas1": pmeas1 * lam,
+                        "p_hook": phook * lam,
+                        "p_crosstalk": pcrosstalk * lam,
+                    },
+                )
+            return (
+                "p_phys_requested",
+                float(p_value),
+                {
+                    "noise_model_family": noise_family if noise_family else "cudaq_profile",
+                    "requested_phys_p": float(p_value),
+                },
+            )
+
+        base_p = float(getattr(args, "p", 0.0))
+        p_curriculum_vals = (
+            [float(x) for x in str(getattr(args, "p_curriculum", "")).split(",") if x.strip()]
+            if getattr(args, "p_curriculum", None)
+            else []
+        )
+        axis_name, axis_value, resolved_point = _resolve_noise_axis_for_point(base_p)
+        curriculum_axis = []
+        for p_entry in p_curriculum_vals:
+            curr_axis_name, curr_axis_val, curr_resolved = _resolve_noise_axis_for_point(p_entry)
+            curriculum_axis.append(
+                {
+                    "p_requested": p_entry,
+                    "x_axis_name": curr_axis_name,
+                    "x_axis_value": curr_axis_val,
+                    "resolved_noise": curr_resolved,
+                }
+            )
         run_meta = {
             "family": args.family,
             "distance": int(args.distance),
             "online": use_online,
-            "p": float(getattr(args, "p", 0.0)),
-            "p_curriculum": [
-                float(x) for x in str(getattr(args, "p_curriculum", "")).split(",") if x.strip()
-            ]
-            if getattr(args, "p_curriculum", None)
-            else None,
+            "p": base_p,
+            "p_curriculum": p_curriculum_vals if p_curriculum_vals else None,
+            "x_axis_name": axis_name,
+            "x_axis_value": axis_value,
+            "resolved_noise": resolved_point,
+            "curriculum_axis": curriculum_axis if curriculum_axis else None,
             "epochs_per_p": int(getattr(args, "epochs_per_p", 1)),
             "teacher_mix": getattr(args, "teacher_mix", None),
+            "teacher_output_classes": {
+                "lsd": "per_qubit",
+                "mwpm": "per_qubit",
+                "nvqldpc": "per_qubit",
+                "oracle": "per_qubit",
+                "mwpf": "fault_ids_proxy",
+            },
             "noise_model": os.environ.get("MGHD_NOISE_MODEL", None),
             "generic_noise": {
                 "p1q": os.environ.get("MGHD_GENERIC_P1Q", None),
@@ -1108,7 +1206,7 @@ def train_inprocess(ns) -> str:
             "oracle": 0.0,
         }
         if not spec:
-            weights["mwpf"] = 1.0
+            weights["lsd"] = 1.0
             return weights
         for chunk in spec.split(","):
             if "=" not in chunk:
@@ -1121,8 +1219,71 @@ def train_inprocess(ns) -> str:
         for k in weights:
             weights[k] = max(0.0, weights[k])
         if sum(weights.values()) == 0.0:
-            weights["mwpf"] = 1.0
+            weights["lsd"] = 1.0
         return weights
+
+    def _apply_teacher_contract_policy(weights: dict[str, float]) -> dict[str, float]:
+        path = getattr(args, "teacher_contract_report", None)
+        if not path:
+            return weights
+        try:
+            policy_payload = json.loads(Path(path).read_text())
+        except Exception as exc:
+            if rank == 0:
+                print(f"Warning: could not read teacher contract report '{path}': {exc}")
+            return weights
+
+        details = (
+            (policy_payload.get("policy") or {}).get("details")
+            if isinstance(policy_payload, dict)
+            else None
+        )
+        if not isinstance(details, dict):
+            if rank == 0:
+                print(f"Warning: teacher contract report missing policy.details: {path}")
+            return weights
+
+        strict = bool(getattr(args, "teacher_contract_strict", False))
+        adjusted = dict(weights)
+        removed = []
+        for teacher_name, current_weight in list(adjusted.items()):
+            if current_weight <= 0.0:
+                continue
+            if teacher_name not in details:
+                if strict:
+                    raise ValueError(
+                        f"Teacher '{teacher_name}' has non-zero weight but is missing from "
+                        f"teacher contract report {path}."
+                    )
+                adjusted[teacher_name] = 0.0
+                removed.append((teacher_name, "missing_from_report"))
+                continue
+            info = details.get(teacher_name) or {}
+            eligible = bool(info.get("eligible_for_per_qubit_supervision", False))
+            if not eligible:
+                reason = (
+                    f"eligible={eligible}, available={info.get('available')}, "
+                    f"per_qubit_output={info.get('per_qubit_output')}, "
+                    f"parity_valid_rate={info.get('parity_valid_rate')}, "
+                    f"decode_exception_rate={info.get('decode_exception_rate')}"
+                )
+                if strict:
+                    raise ValueError(
+                        f"Teacher '{teacher_name}' is not eligible under contract policy: {reason}"
+                    )
+                adjusted[teacher_name] = 0.0
+                removed.append((teacher_name, reason))
+
+        if removed and rank == 0:
+            removed_str = ", ".join(f"{name} ({reason})" for name, reason in removed)
+            print(f"[teacher-contract] Disabled teachers: {removed_str}")
+
+        if sum(adjusted.values()) <= 0.0:
+            raise ValueError(
+                "All teachers disabled after applying teacher contract policy. "
+                "Adjust --teacher-mix or contract thresholds."
+            )
+        return adjusted
 
     bandit = None
     prev_epoch_loss = None
@@ -1159,8 +1320,9 @@ def train_inprocess(ns) -> str:
             code = get_code(family, distance=args.distance)
             # Initialize teachers once per epoch
             teacher_mix = _parse_teacher_mix(
-                getattr(args, "teacher_mix", "mwpf=1.0,mwpm=0.0,lsd=0.0")
+                getattr(args, "teacher_mix", "lsd=0.7,mwpm=0.3,mwpf=0.0")
             )
+            teacher_mix = _apply_teacher_contract_policy(teacher_mix)
             label_teacher_weight = sum(
                 teacher_mix.get(k, 0.0) for k in ("mwpf", "mwpm", "lsd", "nvqldpc", "oracle")
             )
@@ -1987,7 +2149,13 @@ class OnlineSurfaceDataset(IterableDataset):
 
                 # LSD
                 if lsd_teacher is not None and (ex_lsd is not None and ez_lsd is not None):
-                    bits_global = ex_lsd if side == "Z" else ez_lsd
+                    # decode_batch_xz(synX, synZ) returns:
+                    # - first output from Hx/synX branch (Z-error channel)
+                    # - second output from Hz/synZ branch (X-error channel)
+                    # split_components_for_side uses:
+                    # - side "Z" -> Hz/synZ (X-error channel)
+                    # - side "X" -> Hx/synX (Z-error channel)
+                    bits_global = ez_lsd if side == "Z" else ex_lsd
                     if qubit_indices.size and bits_global.size > qubit_indices.max():
                         bits_local = bits_global[qubit_indices].astype(np.uint8)
                         outputs["lsd"] = (bits_local, int(bits_local.sum()))
@@ -2005,7 +2173,7 @@ class OnlineSurfaceDataset(IterableDataset):
 
                 # NvQldpc (GPU BP+OSD)
                 if nvqldpc_teacher is not None and (ex_nq is not None and ez_nq is not None):
-                    bits_global = ex_nq if side == "Z" else ez_nq
+                    bits_global = ez_nq if side == "Z" else ex_nq
                     if qubit_indices.size and bits_global.size > qubit_indices.max():
                         bits_local = bits_global[qubit_indices].astype(np.uint8)
                         outputs["nvqldpc"] = (bits_local, int(bits_local.sum()))
