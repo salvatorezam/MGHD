@@ -1,15 +1,12 @@
 #!/usr/bin/env python
 """
 Evaluate a trained MGHD model on a range of distances and physical error rates.
-Compares MGHD against DEM-based MWPM (Stim+PyMatching) and LSD teachers.
-
-Key insight: The DEM-based MWPM is the correct baseline because it uses Stim's
-detector error model which properly captures the decoder graph structure.
+Compares MGHD against parity-check teachers (MWPM/LSD/MWPF proxy) on the same
+shot stream.
 """
 
 import argparse
 import json
-import time
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -21,14 +18,6 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-try:
-    import stim
-    import pymatching
-    STIM_AVAILABLE = True
-except ImportError:
-    STIM_AVAILABLE = False
-    print("Warning: stim/pymatching not available. DEM-MWPM baseline will be disabled.")
-
 from mghd.codes.registry import get_code
 from mghd.core.core import MGHDDecoderPublic
 from mghd.decoders.lsd.clustered import MGHDPrimaryClustered
@@ -37,113 +26,7 @@ from mghd.decoders.mwpm_ctx import MWPMatchingContext
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.samplers.cudaq_sampler import CudaQSampler
 from mghd.samplers.stim_sampler import StimSampler
-from mghd.utils.graphlike import is_graphlike
 from mghd.utils.metrics import logical_error_rate
-
-
-def create_dem_matcher(d: int, p: float, rounds: int = 1) -> "pymatching.Matching":
-    """Create a PyMatching decoder from Stim's detector error model.
-    
-    This is the CORRECT baseline because it uses Stim's DEM which properly
-    captures the decoder graph structure for surface codes.
-    
-    Args:
-        d: Code distance
-        p: Physical error rate (depolarizing noise after Cliffords)
-        rounds: Number of syndrome measurement rounds
-        
-    Returns:
-        PyMatching Matching object ready for decode_batch()
-    """
-    if not STIM_AVAILABLE:
-        return None
-    
-    circuit = stim.Circuit.generated(
-        "surface_code:rotated_memory_x",
-        distance=d,
-        rounds=rounds,
-        after_clifford_depolarization=p,
-    )
-    dem = circuit.detector_error_model(decompose_errors=True)
-    return pymatching.Matching.from_detector_error_model(dem)
-
-
-def sample_stim_native(d: int, p: float, n_shots: int, rounds: int = 1, seed: int = 42):
-    """Sample using Stim natively, returning detectors and observables.
-    
-    This generates samples that are compatible with the DEM-based MWPM decoder.
-    
-    Returns:
-        detectors: (n_shots, n_detectors) array
-        observables: (n_shots, n_observables) array
-    """
-    if not STIM_AVAILABLE:
-        raise RuntimeError("Stim not available")
-    
-    circuit = stim.Circuit.generated(
-        "surface_code:rotated_memory_x",
-        distance=d,
-        rounds=rounds,
-        after_clifford_depolarization=p,
-    )
-    
-    sampler = circuit.compile_detector_sampler(seed=seed)
-    detectors, observables = sampler.sample(n_shots, separate_observables=True)
-    
-    return detectors.astype(np.uint8), observables.astype(np.uint8)
-
-
-def _resolve_syndromes_from_stim(d: int, dets: np.ndarray) -> tuple:
-    """Convert Stim detectors to separate X and Z syndromes for MGHD.
-    
-    For rotated surface code with single-round measurement:
-    - Total detectors = d^2 - 1 (some are X-type, some are Z-type)
-    - We need to separate them based on the detector layout
-    
-    For now, we use a simple split assuming equal distribution.
-    This may need adjustment based on the actual Stim detector ordering.
-    
-    Args:
-        d: Code distance  
-        dets: (B, n_detectors) detector values from Stim
-        
-    Returns:
-        sx: (B, mx) X syndromes
-        sz: (B, mz) Z syndromes
-    """
-    B = dets.shape[0]
-    n_det = dets.shape[1]
-    
-    # For rotated surface code memory_x experiment:
-    # - d^2 - 1 total detectors for single round
-    # - Split roughly in half for X and Z
-    # The exact split depends on code layout, but for symmetric codes it's close to equal
-    
-    # For d=3: 8 detectors (4 X, 4 Z)
-    # For d=5: 24 detectors (12 X, 12 Z) 
-    # For d=7: 48 detectors (24 X, 24 Z)
-    
-    # Simple split: first half X, second half Z
-    mx = (d * d - 1) // 2 + ((d * d - 1) % 2)  # Ceiling for odd
-    mz = (d * d - 1) // 2
-    
-    # Ensure we don't exceed detector count
-    mx = min(mx, n_det)
-    mz = min(mz, n_det - mx)
-    
-    sx = dets[:, :mx].astype(np.uint8)
-    sz = dets[:, mx:mx+mz].astype(np.uint8)
-    
-    # Pad to match expected dimensions if needed
-    expected_mx = (d * d - 1) // 2 + 1 if (d * d - 1) % 2 else (d * d - 1) // 2
-    expected_mz = (d * d - 1) // 2
-    
-    if sx.shape[1] < expected_mx:
-        sx = np.pad(sx, ((0, 0), (0, expected_mx - sx.shape[1])), mode='constant')
-    if sz.shape[1] < expected_mz:
-        sz = np.pad(sz, ((0, 0), (0, expected_mz - sz.shape[1])), mode='constant')
-    
-    return sx, sz
 
 
 @dataclass
@@ -243,29 +126,58 @@ def align_preds(preds, obs_true):
     return preds
 
 def evaluate(args):
+
     # Load model
     print(f"Loading model from {args.checkpoint}...")
     device = "cuda" if args.cuda else "cpu"
+    node_feat_dim = int(getattr(args, "node_feat_dim", 8))
+
+    def _load_state(path: str):
+        payload = torch.load(path, map_location="cpu")
+        if isinstance(payload, dict) and "model" in payload and isinstance(payload["model"], dict):
+            return payload["model"]
+        if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
+            return payload["state_dict"]
+        return payload if isinstance(payload, dict) else {}
+
     try:
         decoder_public = MGHDDecoderPublic(
             args.checkpoint,
             device=device,
             profile=args.profile,
-            node_feat_dim=args.node_feat_dim,
+            node_feat_dim=node_feat_dim,
         )
     except RuntimeError as exc:
-        # If CUDA init fails, fall back to CPU but keep going.
-        if args.cuda and ("cuda" in str(exc).lower() or "cudnn" in str(exc).lower()):
-            print(f"Warning: CUDA failed ({exc}); falling back to CPU for evaluation.")
-            device = "cpu"
-            decoder_public = MGHDDecoderPublic(
-                args.checkpoint,
-                device=device,
-                profile=args.profile,
-                node_feat_dim=args.node_feat_dim,
-            )
-        else:
-            raise
+        # Retry once by inferring node feature width from checkpoint if mismatched.
+        retried = False
+        if "size mismatch for node_in.weight" in str(exc):
+            state = _load_state(args.checkpoint)
+            tensor = state.get("node_in.weight", None)
+            if tensor is not None and hasattr(tensor, "shape"):
+                inferred = int(tensor.shape[1])
+                if inferred != node_feat_dim:
+                    print(f"Warning: node_feat_dim={node_feat_dim} mismatch; retrying with {inferred}")
+                    node_feat_dim = inferred
+                    decoder_public = MGHDDecoderPublic(
+                        args.checkpoint,
+                        device=device,
+                        profile=args.profile,
+                        node_feat_dim=node_feat_dim,
+                    )
+                    retried = True
+        if not retried:
+            # If CUDA init fails, fall back to CPU but keep going.
+            if args.cuda and ("cuda" in str(exc).lower() or "cudnn" in str(exc).lower()):
+                print(f"Warning: CUDA failed ({exc}); falling back to CPU for evaluation.")
+                device = "cpu"
+                decoder_public = MGHDDecoderPublic(
+                    args.checkpoint,
+                    device=device,
+                    profile=args.profile,
+                    node_feat_dim=node_feat_dim,
+                )
+            else:
+                raise
     
     results = []
     if Path(args.output).exists():
@@ -309,20 +221,18 @@ def evaluate(args):
         
         # MWPM
         mwpm_ctx = MWPMatchingContext()
-        # Disable MWPM for CUDA-Q as the code definition might be non-graph-like (weight-4 columns)
-        # causing pymatching to fail or fallback, which is not a useful baseline.
-        mwpm_enabled = args.sampler != "cudaq"
-        
+        mwpm_enabled = True
+
         # LSD
         lsd = LSDTeacher(Hx_dense, Hz_dense)
 
-        # MWPF (hypergraph) — DISABLED: crashes with Rust panic on larger/complex syndromes
-        # that cannot be caught by Python exception handling
+        # MWPF (hypergraph / fault-id proxy baseline)
         mwpf_teacher = None
-        # try:
-        #     mwpf_teacher = MWPFTeacher(code)
-        # except Exception as exc:
-        #     print(f"  MWPFTeacher unavailable for d={d}: {exc}")
+        if not bool(getattr(args, "disable_mwpf", False)):
+            try:
+                mwpf_teacher = MWPFTeacher(code)
+            except Exception as exc:
+                print(f"  MWPFTeacher unavailable for d={d}: {exc}")
         
         for p in p_values:
             # Check if already computed
@@ -332,21 +242,9 @@ def evaluate(args):
 
             print(f"  Testing p={p}...")
             
-            # Create DEM-based MWPM matcher (the CORRECT baseline)
-            dem_matcher = None
-            if args.family == "surface" and STIM_AVAILABLE:
-                dem_matcher = create_dem_matcher(d, p, rounds=1)
-                if dem_matcher is not None:
-                    print(f"    Using DEM-based MWPM (Stim+PyMatching)")
-            
             # Setup sampler
-            use_stim_native = args.sampler == "stim_native"
-            
             if args.sampler == "stim":
                 sampler = StimSampler(rounds=1, dep=p)  # rounds=1 to match training (single-round phenomenological)
-            elif args.sampler == "stim_native":
-                # Will sample directly with Stim below
-                sampler = None
             elif args.sampler == "cudaq":
                 # CudaQSampler expects phys_p/noise_scale in profile_kwargs
                 pk = {"phys_p": p, "rounds": d}
@@ -360,17 +258,12 @@ def evaluate(args):
             else:
                 raise ValueError(f"Unknown sampler: {args.sampler}")
             
-            # Legacy MWPM matcher (for non-stim_native modes)
-            mwpm_stim_matcher = dem_matcher  # Use the same DEM-based matcher
-            
-            # For stim_native mode, also set up the DEM-MWPM baseline
-            failures_dem_mwpm = 0.0 if dem_matcher is not None else None
-
             total_shots = 0
             failures_mghd = 0.0
             failures_mwpm = 0.0 if mwpm_enabled else None
             failures_lsd = 0.0
             failures_mwpf = 0.0 if mwpf_teacher is not None else None
+            mghd_lsd_agree = 0
             
             # Batched evaluation (ceil division so we always process >0 when shots>0)
             n_batches = (args.shots + args.batch_size - 1) // args.batch_size
@@ -382,36 +275,22 @@ def evaluate(args):
                     break
 
                 # --- Sample data ---
-                if args.sampler == "stim_native":
-                    # Use native Stim sampling (detectors + observables directly)
-                    dets, obs_true = sample_stim_native(d, p, this_batch, rounds=1, seed=args.seed + b)
-                    # For DEM-MWPM, use detectors directly
-                    batch_dets = dets
-                    # Syndromes for MGHD - need to convert from Stim detectors
-                    # For single-round, Stim has d^2 - 1 detectors total
-                    # We need to map to sx, sz for MGHD
-                    sx, sz = _resolve_syndromes_from_stim(d, dets)
+                batch = sampler.sample(code, n_shots=this_batch, seed=args.seed + b)
+                obs_true = batch.obs
+
+                # For phenomenological sampler, use direct synX/synZ
+                # For CUDA-Q, detectors are in canonical Z→X order.
+                if hasattr(batch, 'synX') and hasattr(batch, 'synZ'):
+                    sx = batch.synX
+                    sz = batch.synZ
+                elif args.sampler == "cudaq":
+                    mz = int(code.Hz.shape[0])
+                    mx = int(code.Hx.shape[0])
+                    dets = np.asarray(batch.dets, dtype=np.uint8)
+                    sz = dets[:, :mz].astype(np.uint8)
+                    sx = dets[:, mz:mz + mx].astype(np.uint8)
                 else:
-                    batch = sampler.sample(code, n_shots=this_batch, seed=args.seed + b)
-                    obs_true = batch.obs
-                    batch_dets = batch.dets
-                    
-                    # For phenomenological sampler, use direct synX/synZ
-                    # For Stim/CUDA-Q, use _resolve_syndromes
-                    if hasattr(batch, 'synX') and hasattr(batch, 'synZ'):
-                        sx = batch.synX
-                        sz = batch.synZ
-                    else:
-                        sx, sz = _resolve_syndromes(code, batch.dets)
-                
-                # --- DEM-MWPM Decoding (the CORRECT baseline) ---
-                if dem_matcher is not None and failures_dem_mwpm is not None:
-                    preds_dem = dem_matcher.decode_batch(batch_dets if args.sampler == "stim_native" else batch.dets)
-                    # DEM-MWPM predicts logical observable directly
-                    preds_dem = align_preds(preds_dem, obs_true)
-                    ler_res_dem = logical_error_rate(obs_true, preds_dem)
-                    if ler_res_dem.ler_mean is not None:
-                        failures_dem_mwpm += float(ler_res_dem.ler_mean) * this_batch
+                    sx, sz = _resolve_syndromes(code, batch.dets)
                 
                 # --- MGHD Decoding ---
                 preds_mghd = []
@@ -439,18 +318,7 @@ def evaluate(args):
                 failures_mghd += float(ler_res_mghd.ler_mean) * this_batch
                 
                 # --- MWPM Decoding ---
-                if args.sampler == "stim" and mwpm_stim_matcher is not None:
-                    # Use Stim-based matching (fast and correct for surface code)
-                    preds_mwpm = mwpm_stim_matcher.decode_batch(batch.dets)
-                    # Align preds if necessary (usually Stim DEM obs match Stim sampler obs)
-                    preds_mwpm = align_preds(preds_mwpm, obs_true)
-                    
-                    ler_res_mwpm = logical_error_rate(obs_true, preds_mwpm)
-                    if ler_res_mwpm.ler_mean is None:
-                        print(f"MWPM LER Error: {ler_res_mwpm.notes}")
-                        sys.exit(1)
-                    failures_mwpm += float(ler_res_mwpm.ler_mean) * this_batch
-                elif mwpm_enabled and mwpm_ctx is not None:
+                if mwpm_enabled and mwpm_ctx is not None:
                     preds_mwpm = []
                     for i in range(this_batch):
                         ez_pm, _ = mwpm_ctx.decode(Hx_dense, sx[i], "Z")
@@ -488,6 +356,8 @@ def evaluate(args):
                     print(f"obs_true shape: {obs_true.shape}, preds_lsd shape: {preds_lsd.shape}")
                     sys.exit(1)
                 failures_lsd += float(ler_res_lsd.ler_mean) * this_batch
+                if preds_lsd.shape == preds_mghd.shape:
+                    mghd_lsd_agree += int(np.sum(np.all(preds_lsd == preds_mghd, axis=1)))
 
                 # --- MWPF Decoding (approximate ex/ez from fault_ids) ---
                 # NOTE: MWPF often crashes on large distances or complex syndromes.
@@ -530,11 +400,10 @@ def evaluate(args):
                 mwpm_str = f"{mwpm_ratio:.10f}" if mwpm_ratio is not None else "NA"
                 mwpf_ratio = None if failures_mwpf is None or total_shots == 0 else failures_mwpf / total_shots
                 mwpf_str = f"{mwpf_ratio:.10f}" if mwpf_ratio is not None else "NA"
-                dem_ratio = None if failures_dem_mwpm is None or total_shots == 0 else failures_dem_mwpm / total_shots
-                dem_str = f"{dem_ratio:.6f}" if dem_ratio is not None else "NA"
                 print(
                     f"    Batch {b+1}/{n_batches}: MGHD={failures_mghd/total_shots:.6f} "
-                    f"DEM-MWPM={dem_str} LSD={failures_lsd/total_shots:.6f}",
+                    f"MWPM={mwpm_str} MWPF={mwpf_str} "
+                    f"LSD={failures_lsd/total_shots:.6f}",
                     end="\r",
                 )
             
@@ -542,11 +411,10 @@ def evaluate(args):
             mwpm_final_str = f"{mwpm_final:.10f}" if mwpm_final is not None else "NA"
             mwpf_final = None if failures_mwpf is None or total_shots == 0 else failures_mwpf / total_shots
             mwpf_final_str = f"{mwpf_final:.10f}" if mwpf_final is not None else "NA"
-            dem_final = None if failures_dem_mwpm is None or total_shots == 0 else failures_dem_mwpm / total_shots
-            dem_final_str = f"{dem_final:.6f}" if dem_final is not None else "NA"
             print(
                 f"    Final: MGHD={failures_mghd/total_shots:.6f} "
-                f"DEM-MWPM={dem_final_str} LSD={failures_lsd/total_shots:.6f}"
+                f"MWPM={mwpm_final_str} MWPF={mwpf_final_str} "
+                f"LSD={failures_lsd/total_shots:.6f}"
             )
             
             results.append({
@@ -554,10 +422,10 @@ def evaluate(args):
                 "p": p,
                 "shots": total_shots,
                 "ler_mghd": failures_mghd / total_shots,
-                "ler_dem_mwpm": dem_final,  # The CORRECT baseline
-                "ler_mwpm": mwpm_final,      # Legacy Hz-based (may be wrong)
+                "ler_mwpm": mwpm_final,      # parity-check baseline on same shots
                 "ler_mwpf": mwpf_final,
-                "ler_lsd": failures_lsd / total_shots
+                "ler_lsd": failures_lsd / total_shots,
+                "obs_agreement_mghd_lsd": (mghd_lsd_agree / total_shots) if total_shots else None,
             })
             
             # Save results incrementally
@@ -687,14 +555,12 @@ def sanity_check_results(results):
 def plot_results(results, output_path):
     """Generate and save a clean LER plot from results."""
     # Organize data by distance
-    data_by_d = defaultdict(lambda: {"p": [], "mghd": [], "dem_mwpm": [], "mwpm": [], "mwpf": [], "lsd": []})
+    data_by_d = defaultdict(lambda: {"p": [], "mghd": [], "mwpm": [], "mwpf": [], "lsd": []})
     
     for res in results:
         d = res["distance"]
         data_by_d[d]["p"].append(res["p"])
         data_by_d[d]["mghd"].append(res["ler_mghd"])
-        if res.get("ler_dem_mwpm") is not None:
-            data_by_d[d]["dem_mwpm"].append(res["ler_dem_mwpm"])
         if res.get("ler_mwpm") is not None:
             data_by_d[d]["mwpm"].append(res["ler_mwpm"])
         if res.get("ler_mwpf") is not None:
@@ -735,14 +601,8 @@ def plot_results(results, output_path):
         # MGHD
         mghd_vals = np.array(data["mghd"])[idx]
         plt.loglog(p_vals, mghd_vals, marker=marker, linestyle='-', color=color, label=f'MGHD d={d}')
-        
-        # DEM-MWPM (the CORRECT baseline)
-        if data["dem_mwpm"]:
-            dem_vals = np.array(data["dem_mwpm"])[idx]
-            plt.loglog(p_vals, dem_vals, marker=marker, linestyle='--', color=color, alpha=0.7, label=f'DEM-MWPM d={d}')
-        
-        # Legacy MWPM (may be wrong)
-        if data["mwpm"] and not data["dem_mwpm"]:
+
+        if data["mwpm"]:
             mwpm_vals = np.array(data["mwpm"])[idx]
             plt.loglog(p_vals, mwpm_vals, marker=marker, linestyle='--', color=color, alpha=0.5, label=f'MWPM d={d}')
 
@@ -790,11 +650,10 @@ def _resolve_syndromes(code_obj, dets):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="""
-Evaluate a trained MGHD model against baselines (DEM-MWPM, LSD).
+Evaluate a trained MGHD model against baselines (MWPM, LSD, optional MWPF).
 
 Key samplers:
   - phenomenological: IID X/Z errors (matches synthetic training)  
-  - stim_native: Stim circuit-level with DEM-MWPM baseline (recommended for publication)
   - stim: Legacy Stim sampler
   - cudaq: CUDA-Q backend
 """)
@@ -808,14 +667,18 @@ Key samplers:
     parser.add_argument("--output", default="evaluation_results.json")
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--profile", default="S")
-    parser.add_argument("--node-feat-dim", type=int, default=8)
+    parser.add_argument("--node-feat-dim", type=int, default=9)
     parser.add_argument("--sampler", default="phenomenological", 
-                        choices=["stim", "stim_native", "cudaq", "phenomenological"],
+                        choices=["stim", "cudaq", "phenomenological"],
                         help="Sampler to use. "
                              "'phenomenological' (default) matches synthetic training setup with IID X/Z errors. "
-                             "'stim_native' uses Stim directly with DEM-MWPM baseline (recommended for publication). "
                              "'stim' uses legacy Stim sampler. "
                              "'cudaq' uses CUDA-Q backend.")
+    parser.add_argument(
+        "--disable-mwpf",
+        action="store_true",
+        help="Disable MWPF proxy baseline (useful if local MWPF install is unstable).",
+    )
     parser.add_argument(
         "--noise-scale",
         type=float,

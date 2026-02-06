@@ -187,12 +187,10 @@ class TeacherMix:
         erase_det_mask: Optional[np.ndarray] = None,
         context: Optional[Dict[str, Any]] = None,
         weight_overrides: Optional[Dict[str, Any]] = None,
-        dem_teacher: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Route one batch through a chosen teacher according to mix probs.
 
-        Returns a payload tagged with 'which' ∈ {mwpf, lsd, mwpm, mwpm_fallback},
-        and optionally dem_* keys when DEM guidance is enabled.
+        Returns a payload tagged with 'which' ∈ {mwpf, lsd, mwpm, mwpm_fallback}.
         """
         rng = rng or np.random.default_rng()
         r = float(rng.uniform())
@@ -235,36 +233,11 @@ class TeacherMix:
 
         col_w_x, col_w_z = _resolve_mwpm_weights(mwpm_weights)
 
-        dem_pred_obs: Optional[np.ndarray] = None
-        dem_key = None
-        if dem_teacher is not None:
-            try:
-                dem_out = dem_teacher.decode_batch(dets)
-            except Exception as exc:  # pragma: no cover - degrade gracefully
-                warnings.warn(
-                    f"DEM teacher failed ({exc}); continuing without DEM guidance.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            else:
-                raw_pred = dem_out.get("pred_obs")
-                if raw_pred is not None:
-                    dem_pred_obs = np.asarray(raw_pred, dtype=np.uint8)
-                dem_key = dem_out.get("which", "dem_matching")
-
-        def _augment(payload: Dict[str, Any]) -> Dict[str, Any]:
-            if dem_teacher is not None:
-                if dem_pred_obs is not None:
-                    payload["dem_pred_obs"] = dem_pred_obs
-                if dem_key:
-                    payload["dem_teacher"] = dem_key
-            return payload
-
         try:
             if self.mwpf is not None and r < self.mix.p_mwpf:
                 out = self.mwpf.decode_batch(dets, mwpf_scale=mwpf_scale)
                 out["which"] = "mwpf"
-                return _augment(out)
+                return out
             mwpm_threshold = self.mix.p_mwpf + self.mix.p_lsd
             if r < mwpm_threshold or not self._mwpm_enabled or self.mix.p_mwpm <= 0:
                 ex, ez = self.lsd.decode_batch_xz(
@@ -273,7 +246,7 @@ class TeacherMix:
                     llr_overrides=llr_override,
                     erase_mask=erase_data_mask,
                 )
-                return _augment({"which": "lsd", "ex": ex, "ez": ez})
+                return {"which": "lsd", "ex": ex, "ez": ez}
             if self.mwpm_x is None or self.mwpm_z is None:
                 self._disable_mwpm("mwpm_not_graphlike")
                 ex, ez = self.lsd.decode_batch_xz(
@@ -282,7 +255,7 @@ class TeacherMix:
                     llr_overrides=llr_override,
                     erase_mask=erase_data_mask,
                 )
-                return _augment({"which": "lsd", "ex": ex, "ez": ez})
+                return {"which": "lsd", "ex": ex, "ez": ez}
             try:
                 cx = self.mwpm_x.decode_batch(syndromes_x, column_weights=col_w_x)
                 cz = self.mwpm_z.decode_batch(syndromes_z, column_weights=col_w_z)
@@ -296,9 +269,9 @@ class TeacherMix:
                         llr_overrides=llr_override,
                         erase_mask=erase_data_mask,
                     )
-                    return _augment({"which": "lsd", "ex": ex, "ez": ez})
+                    return {"which": "lsd", "ex": ex, "ez": ez}
                 raise
-            return _augment({"which": "mwpm", "cx": cx, "cz": cz})
+            return {"which": "mwpm", "cx": cx, "cz": cz}
         except Exception as exc:  # pragma: no cover - protective fallback
             if self.mwpm_x is None or self.mwpm_z is None:
                 ex, ez = self.lsd.decode_batch_xz(
@@ -307,18 +280,16 @@ class TeacherMix:
                     llr_overrides=llr_override,
                     erase_mask=erase_data_mask,
                 )
-                return _augment({"which": "lsd", "ex": ex, "ez": ez, "error": str(exc)})
+                return {"which": "lsd", "ex": ex, "ez": ez, "error": str(exc)}
 
             cx = self.mwpm_x._gf2_decode(syndromes_x)
             cz = self.mwpm_z._gf2_decode(syndromes_z)
-            return _augment(
-                {
-                    "which": "mwpm_fallback",
-                    "cx": cx,
-                    "cz": cz,
-                    "error": str(exc),
-                }
-            )
+            return {
+                "which": "mwpm_fallback",
+                "cx": cx,
+                "cz": cz,
+                "error": str(exc),
+            }
 
     def _set_mix_probs(self, p_mwpf: float, p_lsd: float, p_mwpm: float) -> None:
         """Normalize and store mix probabilities, preserving total mass."""

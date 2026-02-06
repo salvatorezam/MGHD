@@ -12,7 +12,7 @@ def test_preflight_main_stubbed(monkeypatch, tmp_path):
             super().__init__(args, code, out, "")
 
     def fake_run(cmd, log_path):
-        return CP(cmd, 0, "LER_dem=0.001 LER_mix=0.002")
+        return CP(cmd, 0, "LER=0.002")
 
     monkeypatch.setattr(pf, "run", fake_run)
 

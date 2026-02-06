@@ -125,11 +125,15 @@ mghd-train \
   --epochs 30 --batch 512
 ```
 
+If the console entrypoints are not installed yet in your current environment, use:
+`python -m mghd.cli.make_cluster_crops ...` and `python -m mghd.cli.train ...`.
+
 Online (on-the-fly CUDA‑Q trajectories) with TAD + optional RL scaling and erasure awareness:
 
 ```bash
 mghd-train \
   --online \
+  --online-fast \
   --family surface --distance 3 \
   --sampler cudaq \
   --p-curriculum 0.01,0.006,0.003 --epochs-per-p 10 \
@@ -139,14 +143,14 @@ mghd-train \
   --online-rl \
   --erasure-frac 0.05 \
   --shots-per-epoch 256 \
+  --progress-seconds 15 \
   --save checkpoints/online
 ```
 
 Note: `mghd-train --online` trains MGHDv2 on parity-check crops with per-qubit supervision; it supports
-`--sampler cudaq` and `--sampler synthetic`. Circuit-level Stim detector streams require a separate
-DEM/fault-space or observable-level training workflow.
+`--sampler cudaq` and `--sampler synthetic`.
 
-Teacher evaluation (LER, DEM A/B, TAD weighting):
+Teacher evaluation (LER A/B + TAD weighting):
 
 ```bash
 mghd-teacher-eval \
@@ -198,7 +202,6 @@ mghd/
 │   ├── mwpf_teacher.py    # MWPF hypergraph decoder
 │   ├── lsd_teacher.py     # LSD (BP+OSD) decoder
 │   ├── mwpm_fallback.py   # Classical MWPM decoder
-│   ├── dem_matching.py       # DEM-based matching
 │   └── ensemble.py           # Teacher ensemble helpers
 │   └── lsd/clustered.py      # Projector + clustered decoder
 │
@@ -247,12 +250,11 @@ Main training interface with teacher-supervised learning.
 - `--sampler`: Sampling backend (`cudaq` or `stim`)
 - `--shots-per-batch`: Number of syndrome samples per batch
 - `--batches`: Number of batches per distance
-- `--dem-enable`: Use detector error model for training
 - `--context-source`: Context injection source (qiskit, cirq, cudaq)
 - `--rl-online`: Enable online reinforcement learning
 
 ### `mghd-teacher-eval`
-Teacher evaluation, LER estimation, and DEM A/B checks across families.
+Teacher evaluation and LER estimation across families.
 
 ### `mghd-make-crops`
 Generate offline crop datasets (packed subgraphs + labels) using teacher supervision. Useful for fast offline training or sharing reproducible corpora.
@@ -279,7 +281,7 @@ Notes:
 Comprehensive validation suite checking:
 - Dependency versions
 - PyTest suite execution
-- Stim + DEM A/B testing
+- Stim teacher A/B testing
 - CUDA-Q smoke tests
 - Logical error rate validation
 

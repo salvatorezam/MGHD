@@ -124,7 +124,9 @@ def cudaq_sample_surface_wrapper(
     if layout is None:
         from mghd.samplers.cudaq_backend.circuits import make_surface_layout_general
 
-        layout = make_surface_layout_general(d)
+        noise_model_kind = str(os.getenv("MGHD_NOISE_MODEL", "generic_cl")).strip().lower()
+        hardware_aware_d3 = noise_model_kind in {"garnet", "hardware", "profile"}
+        layout = make_surface_layout_general(d, hardware_aware_d3=hardware_aware_d3)
     if rng is None:
         rng = np.random.default_rng()
     from mghd.samplers.cudaq_backend.syndrome_gen import sample_surface_cudaq

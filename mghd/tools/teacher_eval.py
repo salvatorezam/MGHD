@@ -233,7 +233,7 @@ def main() -> None:
 
     - Samples detectors/observables via the chosen sampler (CUDA‑Q or Stim).
     - Packs detectors for teachers in canonical Z→X order.
-    - Routes batches through MWPF/LSD/MWPM/DEM mixes and reports LER.
+    - Routes batches through MWPF/LSD/MWPM mixes and reports LER.
     """
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -257,12 +257,7 @@ def main() -> None:
     p.add_argument("--p-mwpf", type=float, default=0.5)
     p.add_argument("--p-lsd", type=float, default=0.4)
     p.add_argument("--p-mwpm", type=float, default=0.1)
-    p.add_argument("--dem-enable", action="store_true")
-    p.add_argument("--dem-family", type=str, default=None)
-    p.add_argument("--dem-rounds", type=int, default=5)
-    p.add_argument("--dem-correlated", action="store_true")
-    p.add_argument("--dem-cache-dir", type=str, default="dem_cache")
-    p.add_argument("--dem-force-build", action="store_true")
+    p.add_argument("--rounds", type=int, default=5)
     p.add_argument(
         "--allow-mwpm-non-graphlike",
         dest="mwpm_graphlike_only",
@@ -317,11 +312,11 @@ def main() -> None:
 
             # Teacher stack
             graph_ok = Hx is not None and Hz is not None and is_graphlike(Hx) and is_graphlike(Hz)
-            pymatching_ok = args.dem_enable or graph_ok
+            pymatching_ok = graph_ok
             if sampler_name == "cudaq" and not pymatching_ok:
                 warnings.warn(
                     "PyMatching disabled (sampler=cudaq, "
-                    f"graphlike={graph_ok}, dem={args.dem_enable})",
+                    f"graphlike={graph_ok})",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -394,71 +389,6 @@ def main() -> None:
                             "profile": getattr(profile, "name", "unknown"),
                         }
 
-            dem_teacher = None
-            if args.dem_enable:
-                target_family = args.dem_family or family
-                if target_family not in {"surface"}:
-                    warnings.warn(
-                        "DEM build currently supported for {'surface'}; "
-                        f"skipping family='{target_family}'.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                else:
-                    try:
-                        import stim  # type: ignore
-                    except Exception as exc:
-                        warnings.warn(
-                            f"Stim not available for DEM construction: {exc}",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                    else:
-                        from mghd.decoders.dem_utils import build_surface_memory_dem, dem_cache_path
-
-                        try:
-                            from mghd.decoders.dem_matching import DEMMatchingTeacher
-                        except Exception as exc:
-                            warnings.warn(
-                                f"DEM matching unavailable: {exc}",
-                                RuntimeWarning,
-                                stacklevel=2,
-                            )
-                        else:
-                            profile_payload = profile_dict if profile_dict else {}
-                            cache_path = pathlib.Path(
-                                dem_cache_path(
-                                    args.dem_cache_dir,
-                                    target_family,
-                                    d,
-                                    args.dem_rounds,
-                                    profile_payload,
-                                )
-                            )
-                            dem_obj = None
-                            try:
-                                if not args.dem_force_build and cache_path.exists():
-                                    dem_obj = stim.DetectorErrorModel(cache_path.read_text())
-                                else:
-                                    dem_obj = build_surface_memory_dem(
-                                        distance=d,
-                                        rounds=args.dem_rounds,
-                                        profile=profile_payload,
-                                        decompose=not args.dem_correlated,
-                                    )
-                                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                                    cache_path.write_text(str(dem_obj))
-                                dem_teacher = DEMMatchingTeacher(
-                                    dem_obj,
-                                    correlated=args.dem_correlated,
-                                )
-                            except Exception as exc:
-                                warnings.warn(
-                                    f"Failed to prepare DEM teacher: {exc}",
-                                    RuntimeWarning,
-                                    stacklevel=2,
-                                )
-
             sampler_kwargs: dict[str, Any] = {}
             if sampler_name == "stim":
                 dep_value = None
@@ -468,17 +398,14 @@ def main() -> None:
                     )
                 if dep_value is None:
                     dep_value = 0.001
-                sampler_kwargs["rounds"] = args.dem_rounds
+                sampler_kwargs["rounds"] = args.rounds
                 sampler_kwargs["dep"] = float(dep_value)
             sampler = get_sampler(sampler_name, **sampler_kwargs)
 
             totals = {"mwpf": 0, "lsd": 0, "mwpm": 0, "mwpm_fallback": 0}
-            if dem_teacher is not None:
-                totals["dem_matching"] = 0
             t0 = time.time()
             true_chunks = []
             pred_chunks = []
-            dem_pred_chunks = []
             missing_obs_warned = False
 
             bandit = None
@@ -519,32 +446,13 @@ def main() -> None:
                     seed=int(rng.integers(1 << 32) - 1),
                 )
 
-                if (
-                    args.dem_enable
-                    and not missing_obs_warned
-                    and (batch.obs is None or batch.obs.size == 0)
-                ):
+                if not missing_obs_warned and (batch.obs is None or batch.obs.size == 0):
                     warnings.warn(
-                        "Sampler did not return logical observables; LER will be NA. "
-                        "Use --sampler stim for DEM validation or extend the sampler to emit obs.",
+                        "Sampler did not return logical observables; LER will be NA.",
                         RuntimeWarning,
                         stacklevel=2,
                     )
                     missing_obs_warned = True
-
-                if (
-                    dem_teacher is not None
-                    and getattr(dem_teacher, "num_detectors", None) is not None
-                    and batch.dets.shape[1] != dem_teacher.num_detectors
-                ):
-                    warnings.warn(
-                        "DEM teacher detector count mismatch. Ensure the sampler mirrors "
-                        "the Stim generator (--sampler stim) or align detectors "
-                        "(e.g., --dem-align).",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    dem_teacher = None
 
                 # Canonical detector order for teachers is Z then X. Ensure
                 # downstream per-basis teachers see consistent ordering.
@@ -564,12 +472,8 @@ def main() -> None:
                     rng=rng,
                     context=context_payload,
                     weight_overrides=overrides,
-                    dem_teacher=dem_teacher,
                 )
                 totals[out["which"]] = totals.get(out["which"], 0) + 1
-                dem_key = out.get("dem_teacher")
-                if dem_key:
-                    totals[dem_key] = totals.get(dem_key, 0) + 1
 
                 true_obs = getattr(batch, "obs", None)
                 true_arr = None
@@ -611,13 +515,6 @@ def main() -> None:
                         pred_arr = pred_arr[:, :true_obs.shape[1]]
                     pred_chunks.append(pred_arr)
 
-                dem_pred = out.get("dem_pred_obs")
-                if dem_pred is not None:
-                    dem_arr = np.asarray(dem_pred, dtype=np.uint8)
-                    if dem_arr.ndim == 1:
-                        dem_arr = dem_arr[np.newaxis, :]
-                    dem_pred_chunks.append(dem_arr)
-
                 if (
                     bandit is not None
                     and bandit_ctx is not None
@@ -641,21 +538,6 @@ def main() -> None:
                 samples = int(true_accum.shape[0]) if true_accum is not None else 0
                 ler = LEResult(None, None, samples, notes="obs unavailable")
             line = summary_line(family, d, args.batches, args.shots_per_batch, ler, dt, totals)
-
-            if dem_teacher is not None:
-                dem_accum = np.concatenate(dem_pred_chunks, axis=0) if dem_pred_chunks else None
-                if (
-                    true_accum is not None
-                    and dem_accum is not None
-                    and true_accum.shape == dem_accum.shape
-                ):
-                    dem_ler = logical_error_rate(true_accum, dem_accum)
-                    if dem_ler.ler_mean is not None:
-                        line += f" | LER_dem={dem_ler.ler_mean:.3e}"
-                    else:
-                        line += " | LER_dem=NA"
-                else:
-                    line += " | LER_dem=NA"
 
             print(line)
 

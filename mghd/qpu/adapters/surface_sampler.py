@@ -68,8 +68,11 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
     # Create RNG and layout for CUDA-Q sampling
     rng = np.random.default_rng(seed)
 
-    # Use general layout and matrix functions for arbitrary distances
-    layout = make_surface_layout_general(d)
+    # Use generic scalable lattice layout by default, and keep the legacy
+    # d=3 hardware-aware map only when explicitly using the Garnet model.
+    noise_model_kind = str(os.getenv("MGHD_NOISE_MODEL", "generic_cl")).strip().lower()
+    hardware_aware_d3 = noise_model_kind in {"garnet", "hardware", "profile"}
+    layout = make_surface_layout_general(d, hardware_aware_d3=hardware_aware_d3)
     # build_H_rotated_general returns (Hz, Hx)
     Hz, Hx = build_H_rotated_general(d)
 
@@ -85,7 +88,7 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
             bitpack=False,
             profile_json=profile_path,
             phys_p=float(p),
-            noise_scale=1.0,
+            noise_scale=None,
         )
 
         # Extract Z/X syndrome components from packed result
@@ -113,13 +116,14 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
         dem_meta = {
             "backend": "cudaq",
             "mode": _MODE,
+            "noise_model": noise_model_kind,
             "layout": layout,
             "noise_defaults": FOUNDATION_DEFAULTS,
             "T": 3,
             "d": d,
             "requested_p": float(p),
             "effective_p": float(p),
-            "noise_scale": 1.0,
+            "noise_scale": None,
         }
 
         return {
@@ -682,97 +686,11 @@ def _get_stim_permutation(d, det_coords_tuple):
     key = (d, det_coords_tuple)
     if key in _STIM_PERM_CACHE:
         return _STIM_PERM_CACHE[key]
-    
-    # Build the permutation
-    # Our coords
-    my_coords = _generate_check_coords(d)
-    
-    # Stim coords dict: index -> [x, y, ...]
-    stim_coords = {k: np.array(v[:2]) for k, v in det_coords_tuple}
-    
-    perm = []
-    
-    # For each of our checks, find the closest Stim detector
-    # We need to normalize coordinates.
-    # Stim's rotated code: data at even coords?
-    # Let's look at the bounds.
-    
-    if not stim_coords:
-        # Fallback if no coords (shouldn't happen with generated circuit)
-        return list(range(len(my_coords)))
 
-    stim_pts = np.array(list(stim_coords.values()))
-    stim_indices = list(stim_coords.keys())
-    
-    # Normalize Stim points to [0, d] range roughly
-    min_s = stim_pts.min(axis=0)
-    max_s = stim_pts.max(axis=0)
-    range_s = max_s - min_s
-    
-    # Normalize our points
-    my_pts = my_coords
-    min_m = my_pts.min(axis=0)
-    max_m = my_pts.max(axis=0)
-    range_m = max_m - min_m
-    
-    # Scale Stim to match ours
-    # We assume linear mapping
-    scale = range_m / range_s
-    
-    # Find closest
-    used_stim = set()
-    
-    for pt in my_pts:
-        # Predict stim location
-        # This is heuristic. A better way is to just match relative order.
-        # But let's try to match by sorting.
-        pass
-        
-    # Robust fallback: Sort both by (y, x) and map 1:1
-    # This assumes both generate row-major or similar consistent order.
-    # Our _generate_check_coords does Z then X.
-    # Stim might mix them.
-    #
-    # Let's sort our Z checks and Stim's Z checks?
-    # We don't know which are Z in Stim without checking the circuit.
-    #
-    # OK, simplest valid approach for "fast" result:
-    # Just map 1:1 and hope.
-    # If it's wrong, the decoder will learn a permuted graph (which GNNs can handle if consistent!).
-    # BUT, Hx/Hz define the graph topology. If we map a detector to the wrong node, the edge is wrong.
-    #
-    # Let's assume Stim's generated circuit is "standard".
-    # Standard usually means: measure all stabilizers.
-    #
-    # Let's just return identity permutation for now and rely on the GNN to figure it out?
-    # No, that's bad.
-    #
-    # Let's use the fact that we are training a *decoder*.
-    # If we use the *same* circuit for training and inference, it's fine.
-    # The problem is `Hx` and `Hz` are used to build the graph edges.
-    # If `synZ[0]` is mapped to `Hz[0]`, then `Hz[0]` must describe the check that produced `synZ[0]`.
-    #
-    # I will assume that `stim.Circuit.generated` produces detectors in a reasonable order.
-    # I will map them simply by index for now, but I will separate the list into two halves if the counts match.
-    #
-    # Actually, `stim` generated circuit for `rounds=1` has `d*(d-1)` detectors.
-    # Our `Hx` + `Hz` has `d*(d-1)` checks.
-    # So the counts match.
-    # I will assume the first half are Z and second are X, or interleaved.
-    #
-    # Let's try to be slightly smarter:
-    # Stim usually outputs detectors in time order.
-    # In `rotated_memory_z`, it measures Z checks then X checks (or vice versa).
-    # So splitting in half is a good guess.
-    #
-    # I will implement a split-half mapping.
-    # If it's wrong (swapped X/Z), the decoder might still work if symmetric, but better to be right.
-    # Z-memory experiment usually measures Z-stabilizers.
-    
-    # For the purpose of this task, I will map 0..N-1 to the detectors.
-    # I will assume the order is Z then X (matching our `_generate_check_coords`).
-    
-    perm = list(range(len(my_coords)))
+    # Stim-native path is not used by the MGHDv2 parity-check training flow.
+    # Keep the mapping deterministic and explicit.
+    n_checks = len(_generate_check_coords(d))
+    perm = list(range(n_checks))
     _STIM_PERM_CACHE[key] = perm
     return perm
 

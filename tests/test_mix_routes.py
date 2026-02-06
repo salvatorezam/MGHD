@@ -20,12 +20,7 @@ def test_mix_routes_lsd_and_erasure_surface():
     assert out2.get("which") in {"erasure_surface_ml", "erasure_peeling"}
 
 
-def test_mix_routes_with_dem_and_weight_overrides():
-    class FakeDEMMatching:
-        def decode_batch(self, dets):
-            B = dets.shape[0]
-            return {"which": "dem_matching", "pred_obs": np.zeros((B, 1), dtype=np.uint8)}
-
+def test_mix_routes_with_weight_overrides():
     code = get_code("surface", distance=3)
     mix = TeacherMix(code, code.Hx, code.Hz, mix_cfg=MixConfig(p_mwpf=0.0, p_lsd=1.0, p_mwpm=0.0))
     dets = np.zeros((1, code.Hx.shape[0] + code.Hz.shape[0]), dtype=np.uint8)
@@ -36,9 +31,5 @@ def test_mix_routes_with_dem_and_weight_overrides():
         "mwpf_scale": {0: 1.0},
         "mwpm_weights": (np.ones(code.Hx.shape[1]), np.ones(code.Hz.shape[1])),
     }
-    out = mix.route_batch(
-        dets, sx, sz, dem_teacher=FakeDEMMatching(), weight_overrides=weight_overrides
-    )
-    assert out.get("dem_teacher") == "dem_matching"
-    if "dem_pred_obs" in out:
-        assert out["dem_pred_obs"].shape[0] == 1
+    out = mix.route_batch(dets, sx, sz, weight_overrides=weight_overrides)
+    assert out.get("which") in {"lsd", "mwpm", "mwpm_fallback"}

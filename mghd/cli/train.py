@@ -38,7 +38,6 @@ from mghd.decoders.lsd_teacher import LSDTeacher
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.mwpm_ctx import MWPMatchingContext
 from mghd.decoders.nvqldpc_teacher import NvQldpcTeacher
-from mghd.decoders.dem_matching import DEMMatchingTeacher, _HAVE_PM as _HAVE_PYMATCHING
 from mghd.qpu.adapters.surface_sampler import sample_round, split_components_for_side
 from mghd.tad import context as tad_context
 from mghd.tad import weighting as tad_weighting
@@ -455,6 +454,64 @@ def train_inprocess(ns) -> str:
         ),
     )
     parser.add_argument(
+        "--noise-model",
+        type=str,
+        default="auto",
+        choices=["auto", "garnet", "generic_cl"],
+        help=(
+            "Noise model family for sampler=cudaq. "
+            "'auto' selects garnet when --qpu-profile is set, else generic_cl."
+        ),
+    )
+    parser.add_argument(
+        "--generic-p1q",
+        type=float,
+        default=0.0015,
+        help="Base 1Q depolarizing probability for generic_cl noise.",
+    )
+    parser.add_argument(
+        "--generic-p2q",
+        type=float,
+        default=0.01,
+        help="Base 2Q depolarizing probability for generic_cl noise.",
+    )
+    parser.add_argument(
+        "--generic-pidle",
+        type=float,
+        default=0.0008,
+        help="Base idle error probability per idle_ref_ns for generic_cl noise.",
+    )
+    parser.add_argument(
+        "--generic-pmeas0",
+        type=float,
+        default=0.02,
+        help="Base readout assignment error P(meas=1|state=0) for generic_cl noise.",
+    )
+    parser.add_argument(
+        "--generic-pmeas1",
+        type=float,
+        default=0.02,
+        help="Base readout assignment error P(meas=0|state=1) for generic_cl noise.",
+    )
+    parser.add_argument(
+        "--generic-phook",
+        type=float,
+        default=0.0,
+        help="Optional correlated hook-error probability per CZ for generic_cl noise.",
+    )
+    parser.add_argument(
+        "--generic-pcrosstalk",
+        type=float,
+        default=0.0,
+        help="Optional spectator crosstalk probability per active layer for generic_cl noise.",
+    )
+    parser.add_argument(
+        "--generic-idle-ref-ns",
+        type=float,
+        default=20.0,
+        help="Reference layer duration for generic idle scaling.",
+    )
+    parser.add_argument(
         "--phenomenological",
         action="store_true",
         help="Shortcut for requesting the fast phenomenological sampler (sets sampler=synthetic)",
@@ -479,6 +536,14 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--parity-lambda", type=float, default=0.03)
     parser.add_argument("--projection-aware", type=int, default=1)
+    parser.add_argument(
+        "--online-fast",
+        action="store_true",
+        help=(
+            "Speed-oriented online settings. Disables expensive projection/parity auxiliaries "
+            "and enables periodic progress heartbeats."
+        ),
+    )
     parser.add_argument("--label-smoothing", type=float, default=0.13831652882929857)
     parser.add_argument(
         "--use-focal", action="store_true", help="Use focal loss for per-qubit labels"
@@ -506,6 +571,15 @@ def train_inprocess(ns) -> str:
     parser.add_argument("--seed", type=int, default=42)
     # Progress reporting (prints per epoch; 1 = only near end, 0 = disable mid-epoch prints)
     parser.add_argument("--progress-prints", type=int, default=1)
+    parser.add_argument(
+        "--progress-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, emit periodic progress heartbeats every N seconds "
+            "(useful when per-epoch logging is sparse)."
+        ),
+    )
     # Optional post-run teacher comparison report (writes teacher_eval.txt)
     parser.add_argument("--post-eval", action="store_true")
     parser.add_argument("--post-eval-sampler", type=str, default="stim")
@@ -588,6 +662,17 @@ def train_inprocess(ns) -> str:
         sampler_choice = "synthetic"
         args.sampler = "synthetic"
 
+    generic_env_keys = (
+        "MGHD_GENERIC_P1Q",
+        "MGHD_GENERIC_P2Q",
+        "MGHD_GENERIC_PIDLE",
+        "MGHD_GENERIC_PMEAS0",
+        "MGHD_GENERIC_PMEAS1",
+        "MGHD_GENERIC_PHOOK",
+        "MGHD_GENERIC_PCROSSTALK",
+        "MGHD_GENERIC_IDLE_REF_NS",
+    )
+
     # Set environment variables for sampling backend
     # - "stim": Use Stim circuit-level noise (MGHD_SAMPLER=stim)
     # - "synthetic": Use fast phenomenological noise (MGHD_SYNTHETIC=1)
@@ -595,12 +680,40 @@ def train_inprocess(ns) -> str:
     if sampler_choice == "stim":
         os.environ["MGHD_SAMPLER"] = "stim"
         os.environ.pop("MGHD_SYNTHETIC", None)
+        os.environ.pop("MGHD_NOISE_MODEL", None)
+        for key in generic_env_keys:
+            os.environ.pop(key, None)
     elif sampler_choice == "synthetic":
         os.environ["MGHD_SYNTHETIC"] = "1"
         os.environ.pop("MGHD_SAMPLER", None)
+        os.environ.pop("MGHD_NOISE_MODEL", None)
+        for key in generic_env_keys:
+            os.environ.pop(key, None)
     elif sampler_choice == "cudaq":
         os.environ.pop("MGHD_SYNTHETIC", None)
         os.environ.pop("MGHD_SAMPLER", None)
+        noise_model = str(getattr(args, "noise_model", "auto")).lower()
+        if noise_model == "auto":
+            noise_model = "garnet" if getattr(args, "qpu_profile", None) else "generic_cl"
+        os.environ["MGHD_NOISE_MODEL"] = noise_model
+        if noise_model == "generic_cl":
+            os.environ["MGHD_GENERIC_P1Q"] = str(float(getattr(args, "generic_p1q", 0.0015)))
+            os.environ["MGHD_GENERIC_P2Q"] = str(float(getattr(args, "generic_p2q", 0.01)))
+            os.environ["MGHD_GENERIC_PIDLE"] = str(float(getattr(args, "generic_pidle", 0.0008)))
+            os.environ["MGHD_GENERIC_PMEAS0"] = str(float(getattr(args, "generic_pmeas0", 0.02)))
+            os.environ["MGHD_GENERIC_PMEAS1"] = str(float(getattr(args, "generic_pmeas1", 0.02)))
+            os.environ["MGHD_GENERIC_PHOOK"] = str(float(getattr(args, "generic_phook", 0.0)))
+            os.environ["MGHD_GENERIC_PCROSSTALK"] = str(
+                float(getattr(args, "generic_pcrosstalk", 0.0))
+            )
+            os.environ["MGHD_GENERIC_IDLE_REF_NS"] = str(
+                float(getattr(args, "generic_idle_ref_ns", 20.0))
+            )
+        else:
+            for key in generic_env_keys:
+                os.environ.pop(key, None)
+        if rank == 0:
+            print(f"CUDA-Q noise model: {noise_model}")
 
     if bool(getattr(args, "online", False)) and sampler_choice == "stim":
         raise ValueError(
@@ -841,6 +954,22 @@ def train_inprocess(ns) -> str:
 
     loader = None
     use_online = bool(getattr(args, "online", False))
+    if use_online and bool(getattr(args, "online_fast", False)):
+        if int(getattr(args, "projection_aware", 0)) != 0:
+            args.projection_aware = 0
+        if float(getattr(args, "parity_lambda", 0.0)) != 0.0:
+            args.parity_lambda = 0.0
+        if int(getattr(args, "progress_prints", 0)) <= 1:
+            args.progress_prints = 20
+        if float(getattr(args, "progress_seconds", 0.0)) <= 0.0:
+            args.progress_seconds = 20.0
+        if int(getattr(args, "prefetch_factor", 0)) < 4:
+            args.prefetch_factor = 4
+        if rank == 0:
+            print(
+                "[online-fast] Enabled: projection_aware=0 parity_lambda=0 "
+                f"progress_prints={args.progress_prints} progress_seconds={args.progress_seconds}"
+            )
     if not use_online:
         ds = CropShardDataset(args.data_root)
         sampler = make_bucket_sampler(ds, stage="stage1", seed=args.seed)
@@ -867,6 +996,17 @@ def train_inprocess(ns) -> str:
             else None,
             "epochs_per_p": int(getattr(args, "epochs_per_p", 1)),
             "teacher_mix": getattr(args, "teacher_mix", None),
+            "noise_model": os.environ.get("MGHD_NOISE_MODEL", None),
+            "generic_noise": {
+                "p1q": os.environ.get("MGHD_GENERIC_P1Q", None),
+                "p2q": os.environ.get("MGHD_GENERIC_P2Q", None),
+                "pidle": os.environ.get("MGHD_GENERIC_PIDLE", None),
+                "pmeas0": os.environ.get("MGHD_GENERIC_PMEAS0", None),
+                "pmeas1": os.environ.get("MGHD_GENERIC_PMEAS1", None),
+                "phook": os.environ.get("MGHD_GENERIC_PHOOK", None),
+                "pcrosstalk": os.environ.get("MGHD_GENERIC_PCROSSTALK", None),
+                "idle_ref_ns": os.environ.get("MGHD_GENERIC_IDLE_REF_NS", None),
+            },
             "qpu_profile": getattr(args, "qpu_profile", None),
             "context_source": getattr(args, "context_source", None),
             "erasure_frac": float(getattr(args, "erasure_frac", 0.0)),
@@ -874,6 +1014,8 @@ def train_inprocess(ns) -> str:
             "epochs": int(args.epochs),
             "batch": int(args.batch),
             "seed": int(args.seed),
+            "online_fast": bool(getattr(args, "online_fast", False)),
+            "progress_seconds": float(getattr(args, "progress_seconds", 0.0)),
         }
         (save_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2))
     except Exception:
@@ -962,7 +1104,6 @@ def train_inprocess(ns) -> str:
             "mwpf": 0.0,
             "mwpm": 0.0,
             "lsd": 0.0,
-            "dem_mwpm": 0.0,
             "nvqldpc": 0.0,
             "oracle": 0.0,
         }
@@ -985,7 +1126,6 @@ def train_inprocess(ns) -> str:
 
     bandit = None
     prev_epoch_loss = None
-    warned_dem_mwpm = False
     # Optional curriculum over p for online mode
     p_list = None
     if use_online and getattr(args, "p_curriculum", None):
@@ -996,6 +1136,7 @@ def train_inprocess(ns) -> str:
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0 = time.time()
+        last_heartbeat = t0
         total_loss = 0.0
         n_items = 0
         if use_online:
@@ -1027,15 +1168,8 @@ def train_inprocess(ns) -> str:
                 raise ValueError(
                     "Invalid `--teacher-mix`: no label-producing teachers selected. "
                     "This MGHDv2 training loop requires per-qubit labels from one of "
-                    "`mwpf`, `mwpm`, `lsd`, `nvqldpc`, or `oracle`. "
-                    "`dem_mwpm` produces observable-only predictions and cannot supervise MGHDv2."
+                    "`mwpf`, `mwpm`, `lsd`, `nvqldpc`, or `oracle`."
                 )
-            if teacher_mix.get("dem_mwpm", 0.0) > 0.0 and not warned_dem_mwpm:
-                print(
-                    "[warn] `dem_mwpm` is ignored for MGHDv2 per-qubit training "
-                    "(it produces observable-only outputs)."
-                )
-                warned_dem_mwpm = True
 
             # TAD context/overrides
             qpu_prof, ctx_vec, llr_overrides = _build_tad_for_code(code)
@@ -1049,7 +1183,7 @@ def train_inprocess(ns) -> str:
                     bandit = None
 
             # Setup DataLoader for parallel generation
-            workers = max(1, int(getattr(args, "workers", 4)))
+            workers = max(0, int(getattr(args, "workers", 0)))
             shots_target = int(getattr(args, "shots_per_epoch", args.batch))
 
             # Divide shots among ranks
@@ -1070,7 +1204,7 @@ def train_inprocess(ns) -> str:
                 num_workers=workers,
                 collate_fn=collate_packed,
                 pin_memory=True if torch.cuda.is_available() else False,
-                persistent_workers=True if workers > 0 else False,
+                persistent_workers=bool(workers > 0),
                 prefetch_factor=int(getattr(args, "prefetch_factor", 2)) if workers > 0 else None,
             )
 
@@ -1194,6 +1328,21 @@ def train_inprocess(ns) -> str:
                     if p_epoch is not None:
                         prog["p"] = float(p_epoch)
                     print(json.dumps(prog, separators=(",", ":")), flush=True)
+                heartbeat_s = float(getattr(args, "progress_seconds", 0.0))
+                now = time.time()
+                if rank == 0 and heartbeat_s > 0.0 and (now - last_heartbeat) >= heartbeat_s:
+                    hb = {
+                        "heartbeat": True,
+                        "epoch": int(epoch),
+                        "step": int(steps_done),
+                        "avg": float(total_loss / max(n_items, 1)),
+                        "secs": float(now - t0),
+                        "items": int(n_items),
+                    }
+                    if p_epoch is not None:
+                        hb["p"] = float(p_epoch)
+                    print(json.dumps(hb, separators=(",", ":")), flush=True)
+                    last_heartbeat = now
         else:
             steps_done = 0
             steps_total = len(loader) if hasattr(loader, "__len__") else 0
@@ -1318,6 +1467,20 @@ def train_inprocess(ns) -> str:
                         "secs": float(time.time() - t0),
                     }
                     print(json.dumps(prog, separators=(",", ":")), flush=True)
+                heartbeat_s = float(getattr(args, "progress_seconds", 0.0))
+                now = time.time()
+                if rank == 0 and heartbeat_s > 0.0 and (now - last_heartbeat) >= heartbeat_s:
+                    hb = {
+                        "heartbeat": True,
+                        "epoch": int(epoch),
+                        "step": int(steps_done),
+                        "steps": int(steps_total),
+                        "avg": float(total_loss / max(n_items, 1)),
+                        "secs": float(now - t0),
+                        "items": int(n_items),
+                    }
+                    print(json.dumps(hb, separators=(",", ":")), flush=True)
+                    last_heartbeat = now
 
         sched.step()
         dt = time.time() - t0
@@ -1546,7 +1709,7 @@ class OnlineSurfaceDataset(IterableDataset):
 
         # Parse distance curriculum
         self.distances = [self.args.distance]
-        if self.args.distance_curriculum:
+        if getattr(self.args, "distance_curriculum", None):
             try:
                 self.distances = [
                     int(x) for x in self.args.distance_curriculum.split(",") if x.strip()
@@ -1599,9 +1762,7 @@ class OnlineSurfaceDataset(IterableDataset):
             if d not in _WORKER_TEACHERS_CACHE:
                 _WORKER_TEACHERS_CACHE[d] = self._init_teachers_for_d(d)
 
-            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher, dem_mwpm_teacher, dem = (
-                _WORKER_TEACHERS_CACHE[d]
-            )
+            mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher = _WORKER_TEACHERS_CACHE[d]
 
             # Handle erasure
             erase_local = None
@@ -1648,7 +1809,6 @@ class OnlineSurfaceDataset(IterableDataset):
                 d,
                 erase_local,
                 nvqldpc_teacher=nvqldpc_teacher,
-                dem_mwpm_teacher=dem_mwpm_teacher,
             )
 
             shots_done += 1
@@ -1664,11 +1824,6 @@ class OnlineSurfaceDataset(IterableDataset):
             seed=0,
             profile_path=self.args.qpu_profile if getattr(self.args, "qpu_profile", None) else None,
         )
-
-        # Check if we're using Stim native sampling (with DEM)
-        use_stim_native = sample.get("dem_meta", {}).get("backend") == "stim_native"
-        dem = sample.get("dem_meta", {}).get("dem")
-        dem_matcher = sample.get("dem_meta", {}).get("matcher")
 
         Hx = np.asarray(sample["Hx"], dtype=np.uint8)
         Hz = np.asarray(sample["Hz"], dtype=np.uint8)
@@ -1696,7 +1851,6 @@ class OnlineSurfaceDataset(IterableDataset):
         use_mwpm = self.teacher_mix.get("mwpm", 0.0) > 0.0
         use_lsd = self.teacher_mix.get("lsd", 0.0) > 0.0
         use_nvqldpc = self.teacher_mix.get("nvqldpc", 0.0) > 0.0
-        use_dem_mwpm = self.teacher_mix.get("dem_mwpm", 0.0) > 0.0
 
         mwpf_teacher = None
         if use_mwpf:
@@ -1720,16 +1874,7 @@ class OnlineSurfaceDataset(IterableDataset):
             # should propagate rather than silently disabling the teacher.
             nvqldpc_teacher = NvQldpcTeacher(code.Hx, code.Hz)
 
-        # DEM-based MWPM teacher (uses Stim's DEM directly - most accurate)
-        dem_mwpm_teacher = None
-        if (use_dem_mwpm or use_stim_native) and dem is not None and _HAVE_PYMATCHING:
-            try:
-                dem_mwpm_teacher = DEMMatchingTeacher(dem)
-            except Exception as e:
-                print(f"Warning: Failed to create DEMMatchingTeacher: {e}")
-                dem_mwpm_teacher = None
-
-        return mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher, dem_mwpm_teacher, dem
+        return mwpf_teacher, mwpm_ctx, lsd_teacher, nvqldpc_teacher
 
     def _process_sample(
         self,
@@ -1742,7 +1887,6 @@ class OnlineSurfaceDataset(IterableDataset):
         d,
         erase_local=None,
         nvqldpc_teacher=None,
-        dem_mwpm_teacher=None,
     ):
         # Logic extracted from the main loop
 
@@ -1802,17 +1946,6 @@ class OnlineSurfaceDataset(IterableDataset):
                 syndromes_z=sample["synZ"][None, :],
             )
             ex_nq, ez_nq = ex_arr[0], ez_arr[0]
-
-        # Compute DEM-MWPM once per sample (uses Stim's DEM directly)
-        dem_mwpm_pred = None
-        if dem_mwpm_teacher is not None and use_native_dets:
-            try:
-                out = dem_mwpm_teacher.decode_batch(dets_global)
-                dem_mwpm_pred = out.get("pred_obs", None)
-                if dem_mwpm_pred is not None:
-                    dem_mwpm_pred = dem_mwpm_pred[0]  # Single sample
-            except Exception:
-                dem_mwpm_pred = None
 
         oracle_enabled = self.teacher_mix.get("oracle", 0.0) > 0.0
         oracle_ex = sample.get("ex_glob", None)

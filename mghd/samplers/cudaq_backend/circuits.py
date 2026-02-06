@@ -527,68 +527,70 @@ def make_surface_layout_d3_include_edge(edge: tuple[int, int] = (10, 11)) -> dic
     return bad_layout
 
 
-def make_surface_layout_general(d: int) -> dict[str, Any]:
-    """
-    Create a general surface code layout for arbitrary distance d.
+def _make_surface_layout_lattice(d: int) -> dict[str, Any]:
+    """Build a device-agnostic rotated-surface layout on a virtual lattice."""
+    # Derive check structure from the same parity-check matrices used by the
+    # decoder/training pipeline so syndrome dimensions always stay consistent.
+    hz, hx = build_H_rotated_general(d)
+    n_data = int(d * d)
+    n_z_checks = int(hz.shape[0])
+    n_x_checks = int(hx.shape[0])
 
-    Args:
-        d: Code distance
-
-    Returns:
-        Layout dictionary with qubit assignments and gate schedules
-    """
-    if d == 3:
-        return make_surface_layout_d3_avoid_bad_edges()
-
-    n_data = d * d
-    n_z_checks = d * (d - 1)
-    n_x_checks = (d - 1) * d
-
-    # Data qubits: 0 to d²-1 (row-major order)
     data_qubits = list(range(n_data))
-
-    # Ancilla qubits: start after data qubits
     ancilla_z = list(range(n_data, n_data + n_z_checks))
     ancilla_x = list(range(n_data + n_z_checks, n_data + n_z_checks + n_x_checks))
 
-    # Build CZ layers for syndrome extraction
-    # Layer 1: Z stabilizers (horizontal connections)
-    cz_layer_1 = []
-    z_anc_idx = 0
-    for row in range(d):
-        for col in range(d - 1):
-            anc = ancilla_z[z_anc_idx]
-            q1 = row * d + col
-            q2 = row * d + col + 1
-            cz_layer_1.extend([(anc, q1), (anc, q2)])
-            z_anc_idx += 1
+    max_w = 1
+    if hz.size:
+        max_w = max(max_w, int(np.max(np.sum(hz, axis=1))))
+    if hx.size:
+        max_w = max(max_w, int(np.max(np.sum(hx, axis=1))))
+    n_layers = max(1, max_w)
+    cz_layers: list[list[tuple[int, int]]] = [[] for _ in range(n_layers)]
 
-    # Layer 2: X stabilizers (vertical connections)
-    cz_layer_2 = []
-    x_anc_idx = 0
-    for row in range(d - 1):
-        for col in range(d):
-            anc = ancilla_x[x_anc_idx]
-            q1 = row * d + col
-            q2 = (row + 1) * d + col
-            cz_layer_2.extend([(anc, q1), (anc, q2)])
-            x_anc_idx += 1
+    # Z-check ancillas
+    for ci in range(n_z_checks):
+        anc = ancilla_z[ci]
+        q_ids = np.flatnonzero(hz[ci]).astype(int).tolist()
+        for li, q in enumerate(q_ids):
+            cz_layers[li % n_layers].append((anc, int(q)))
 
-    # PRX layers for ancilla reset/measurement
-    prx_layer_z = [(anc, "z") for anc in ancilla_z]  # Z basis for Z stabilizers
-    prx_layer_x = [(anc, "x") for anc in ancilla_x]  # X basis for X stabilizers
+    # X-check ancillas
+    for ci in range(n_x_checks):
+        anc = ancilla_x[ci]
+        q_ids = np.flatnonzero(hx[ci]).astype(int).tolist()
+        for li, q in enumerate(q_ids):
+            cz_layers[li % n_layers].append((anc, int(q)))
+
+    # PRX layers for ancilla prep/measurement
+    prx_layer_z = [(anc, "z") for anc in ancilla_z]
+    prx_layer_x = [(anc, "x") for anc in ancilla_x]
 
     return {
         "data": data_qubits,
         "ancilla_z": ancilla_z,
         "ancilla_x": ancilla_x,
-        "cz_layers": [cz_layer_1, cz_layer_2],
+        "cz_layers": cz_layers,
         "prx_layers": [prx_layer_z, prx_layer_x],
         "total_qubits": n_data + n_z_checks + n_x_checks,
         "distance": d,
         "code_type": "rotated_surface",
         "syndrome_schedule": "alternating",  # Z then X measurements
     }
+
+
+def make_surface_layout_general(d: int, hardware_aware_d3: bool = True) -> dict[str, Any]:
+    """
+    Create a surface code layout for arbitrary distance d.
+
+    Parameters
+    - d: code distance
+    - hardware_aware_d3: when True, keeps the legacy d=3 Garnet-biased layout.
+      When False, uses the virtual lattice layout for d=3 as well.
+    """
+    if d == 3 and hardware_aware_d3:
+        return make_surface_layout_d3_avoid_bad_edges()
+    return _make_surface_layout_lattice(d)
 
 
 def make_surface_layout_d3_avoid_bad_edges() -> dict[str, Any]:
@@ -732,11 +734,8 @@ def build_round_surface(layout: dict[str, Any], round_idx: int) -> CudaQKernel:
         if prx_ops:
             kernel.add_layer(prx_ops, "PRX_PREP")
 
-    # Add CZ layers (typically 2 layers for surface codes)
+    # Add CZ layers (device-agnostic layouts may require >2 sub-layers)
     for layer_idx, cz_layer in enumerate(cz_layers):
-        if layer_idx >= 2:  # Limit to 2 CZ layers per round
-            break
-
         # Filter CZ operations relevant to current stabilizer type
         relevant_czs = []
         for q1, q2 in cz_layer:
