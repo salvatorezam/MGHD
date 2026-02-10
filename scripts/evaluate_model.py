@@ -9,7 +9,6 @@ phenomenological p_data).
 
 import argparse
 import json
-import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -29,8 +28,20 @@ from mghd.decoders.mwpm_ctx import MWPMatchingContext
 from mghd.decoders.mwpf_teacher import MWPFTeacher
 from mghd.decoders.nvqldpc_teacher import NvQldpcTeacher
 from mghd.samplers.cudaq_sampler import CudaQSampler
+from mghd.samplers.cudaq_backend.noise_config import (
+    axis_from_noise_spec,
+    resolve_canonical_noise_spec,
+)
 from mghd.samplers.stim_sampler import StimSampler
 from mghd.utils.metrics import logical_error_rate
+
+try:  # Optional faster MWPM baseline via pymatching decode_batch
+    import pymatching as _pm  # type: ignore
+
+    _HAVE_PYMATCHING = True
+except Exception:
+    _pm = None  # type: ignore
+    _HAVE_PYMATCHING = False
 
 try:  # Optional CUDA-Q QEC python API (tensor-network decoder track)
     import cudaq_qec as qec  # type: ignore
@@ -43,7 +54,7 @@ except Exception:
 
 @dataclass
 class PhenomenologicalBatch:
-    """Sample batch from phenomenological noise model."""
+    """Sample batch from code-capacity-style noise model (data-only errors)."""
     dets: np.ndarray  # Combined syndromes [synX | synZ] for compatibility
     obs: np.ndarray   # Logical observables
     synX: np.ndarray  # X-stabilizer syndromes (detect Z errors)
@@ -54,7 +65,7 @@ class PhenomenologicalBatch:
 
 
 class PhenomenologicalSampler:
-    """Sampler that generates IID phenomenological noise on surface codes.
+    """Sampler that generates IID code-capacity-style noise on surface codes.
     
     This produces both X and Z syndromes from independent data qubit errors,
     matching the training setup used with CUDA-Q.
@@ -120,29 +131,35 @@ class PhenomenologicalSampler:
             synZ=synZ.astype(np.uint8),
             err_x=err_x,
             err_z=err_z,
-            meta={'sampler': 'phenomenological', 'p': self.p},
+            meta={"sampler": "code_capacity", "p": float(self.p)},
         )
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except Exception:
-        return float(default)
-
-
 def _resolve_noise_axis_and_params(
-    *, sampler: str, p_input: float, noise_scale: float | None
+    *,
+    sampler: str,
+    p_input: float,
+    noise_scale: float | None,
+    noise_model: str | None = None,
+    overrides: dict | None = None,
 ) -> tuple[str, float, dict]:
     """Return canonical axis name/value and resolved noise parameters."""
     sampler = str(sampler).lower()
-    if sampler == "phenomenological":
-        resolved = {
-            "noise_model_family": "phenomenological_iid",
-            "p_data": float(p_input),
-            "p_meas": float(p_input),
-        }
-        return "p_data", float(p_input), resolved
+    if sampler in {"code_capacity", "phenomenological"}:
+        mode = "code_capacity" if sampler == "code_capacity" else "phenomenological"
+        spec = resolve_canonical_noise_spec(
+            requested_phys_p=float(p_input),
+            noise_scale=noise_scale,
+            overrides={
+                "noise_model": mode,
+                "p_data": (overrides or {}).get("p_data", p_input),
+                "p_meas": (overrides or {}).get("p_meas", p_input if mode == "phenomenological" else 0.0),
+            },
+        )
+        axis_name, axis_value = axis_from_noise_spec(spec, float(p_input))
+        resolved = dict(spec.to_dict())
+        resolved["noise_model_family"] = mode
+        return axis_name, float(axis_value), resolved
 
     if sampler == "stim":
         resolved = {
@@ -153,36 +170,15 @@ def _resolve_noise_axis_and_params(
         return "p_data", float(p_input), resolved
 
     if sampler == "cudaq":
-        family = str(os.getenv("MGHD_NOISE_MODEL", "generic_cl")).strip().lower()
-        if family in {"generic", "generic_cl", "generic-circuit"}:
-            if noise_scale is not None:
-                lam = float(noise_scale)
-            else:
-                p_ref = 0.03
-                lam = max(1e-3, min(5.0, float(p_input) / p_ref))
-            resolved = {
-                "noise_model_family": "generic_cl",
-                "requested_phys_p": float(p_input),
-                "lambda_scale": float(lam),
-                "p_ref": 0.03,
-                "p_1q": _env_float("MGHD_GENERIC_P1Q", 0.0015) * lam,
-                "p_2q": _env_float("MGHD_GENERIC_P2Q", 0.01) * lam,
-                "p_idle": _env_float("MGHD_GENERIC_PIDLE", 0.0008) * lam,
-                "p_meas0": _env_float("MGHD_GENERIC_PMEAS0", 0.02) * lam,
-                "p_meas1": _env_float("MGHD_GENERIC_PMEAS1", 0.02) * lam,
-                "p_hook": _env_float("MGHD_GENERIC_PHOOK", 0.0) * lam,
-                "p_crosstalk": _env_float("MGHD_GENERIC_PCROSSTALK", 0.0) * lam,
-                "idle_ref_ns": _env_float("MGHD_GENERIC_IDLE_REF_NS", 20.0),
-            }
-            return "lambda_scale", float(lam), resolved
-
-        # Hardware/profile modes keep requested p as axis by default.
-        resolved = {
-            "noise_model_family": family if family else "cudaq_profile",
-            "requested_phys_p": float(p_input),
-            "noise_scale": float(noise_scale) if noise_scale is not None else None,
-        }
-        return "p_phys_requested", float(p_input), resolved
+        spec = resolve_canonical_noise_spec(
+            requested_phys_p=float(p_input),
+            noise_scale=noise_scale,
+            overrides={"noise_model": noise_model, **(overrides or {})},
+        )
+        axis_name, axis_value = axis_from_noise_spec(spec, float(p_input))
+        resolved = dict(spec.to_dict())
+        resolved["noise_model_family"] = resolved.get("noise_model_name")
+        return axis_name, float(axis_value), resolved
 
     # Fallback for unknown sampler paths.
     return "p", float(p_input), {"noise_model_family": sampler}
@@ -258,6 +254,27 @@ def align_preds(preds, obs_true):
         return preds[:, 1:]
     return preds
 
+
+def _shot_failures(obs_true: np.ndarray, preds: np.ndarray) -> int:
+    true_arr = np.asarray(obs_true, dtype=np.uint8)
+    pred_arr = np.asarray(preds, dtype=np.uint8)
+    if true_arr.shape != pred_arr.shape:
+        return 0
+    mism = np.bitwise_xor(true_arr, pred_arr)
+    return int(np.sum(np.any(mism != 0, axis=1)))
+
+
+def _mwpm_decode_batch(matcher, syndromes: np.ndarray) -> np.ndarray:
+    synd = (np.asarray(syndromes, dtype=np.uint8) & 1)
+    if hasattr(matcher, "decode_batch"):
+        out = matcher.decode_batch(synd)
+        return (np.asarray(out, dtype=np.uint8) & 1)
+    # Fallback loop (older pymatching)
+    corr = np.zeros((synd.shape[0], int(getattr(matcher, "num_edges", 0))), dtype=np.uint8)
+    for i in range(synd.shape[0]):
+        corr[i] = (np.asarray(matcher.decode(synd[i]), dtype=np.uint8) & 1)
+    return corr
+
 def evaluate(args):
 
     # Load model
@@ -313,13 +330,15 @@ def evaluate(args):
                 raise
     
     results = []
-    if Path(args.output).exists():
+    if bool(getattr(args, "append_output", False)) and Path(args.output).exists():
         try:
             with open(args.output, "r") as f:
                 results = json.load(f)
             print(f"Loaded {len(results)} existing results from {args.output}")
         except json.JSONDecodeError:
             print(f"Could not load existing results from {args.output}, starting fresh.")
+    elif Path(args.output).exists():
+        print(f"Output exists at {args.output}; starting fresh (use --append-output to resume).")
 
     distances = [int(d) for d in args.distances.split(",")]
     p_values = [float(p) for p in args.p_values.split(",")]
@@ -350,15 +369,44 @@ def evaluate(args):
         # Use non-batched decode path for robustness across distances.
         # The batched path can retain stale internal state on some larger-distance
         # component patterns and intermittently misindex samples.
-        mghd_Z = MGHDPrimaryClustered(Hx_sparse, decoder_public, batched=False)
-        mghd_X = MGHDPrimaryClustered(Hz_sparse, decoder_public, batched=False)
+        # Side semantics must match online training:
+        # - side "X" => Hx/synX branch (Z-error channel)
+        # - side "Z" => Hz/synZ branch (X-error channel)
+        mghd_Z = MGHDPrimaryClustered(
+            Hx_sparse,
+            decoder_public,
+            side="X",
+            halo=int(getattr(args, "mghd_halo", 1)),
+            projection_mode=str(getattr(args, "mghd_projection_mode", "always")),
+            batched=False,
+        )
+        mghd_X = MGHDPrimaryClustered(
+            Hz_sparse,
+            decoder_public,
+            side="Z",
+            halo=int(getattr(args, "mghd_halo", 1)),
+            projection_mode=str(getattr(args, "mghd_projection_mode", "always")),
+            batched=False,
+        )
         
-        # MWPM
-        mwpm_ctx = MWPMatchingContext()
-        mwpm_enabled = True
+        # MWPM (baseline)
+        mwpm_enabled = not bool(getattr(args, "disable_mwpm", False))
+        mwpm_ctx = MWPMatchingContext() if mwpm_enabled else None
+        mwpm_matcher_z = None
+        mwpm_matcher_x = None
+        if mwpm_enabled and _HAVE_PYMATCHING:
+            try:
+                mwpm_matcher_z = _pm.Matching((Hx_dense % 2).astype(np.uint8))  # Z-error channel
+                mwpm_matcher_x = _pm.Matching((Hz_dense % 2).astype(np.uint8))  # X-error channel
+            except Exception as exc:
+                print(f"  pymatching MWPM unavailable for d={d}: {exc}")
+                mwpm_matcher_z = None
+                mwpm_matcher_x = None
 
         # LSD
-        lsd = LSDTeacher(Hx_dense, Hz_dense)
+        lsd = None
+        if not bool(getattr(args, "disable_lsd", False)):
+            lsd = LSDTeacher(Hx_dense, Hz_dense)
 
         # MWPF (hypergraph / fault-id proxy baseline)
         mwpf_teacher = None
@@ -387,11 +435,38 @@ def evaluate(args):
                 continue
 
             print(f"  Testing p={p}...")
+            noise_overrides = {
+                "lambda_scale": getattr(args, "lambda_scale", None),
+                "noise_ramp": getattr(args, "noise_ramp", None),
+                "p_data": getattr(args, "p_data", None),
+                "p_meas": getattr(args, "p_meas", None),
+                "p_1q": getattr(args, "p_1q", None),
+                "p_2q": getattr(args, "p_2q", None),
+                "p_idle": getattr(args, "p_idle", None),
+                "p_meas0": getattr(args, "p_meas0", None),
+                "p_meas1": getattr(args, "p_meas1", None),
+                "p_hook": getattr(args, "p_hook", None),
+                "p_xtalk": getattr(args, "p_xtalk", None),
+                "p_erase": getattr(args, "p_erase", None),
+                "p_long_range": getattr(args, "p_long_range", None),
+            }
+            noise_overrides = {k: v for k, v in noise_overrides.items() if v is not None}
             x_axis_name, x_axis_value, resolved_noise = _resolve_noise_axis_and_params(
                 sampler=args.sampler,
                 p_input=p,
                 noise_scale=getattr(args, "noise_scale", None),
+                noise_model=getattr(args, "noise_model", None),
+                overrides=noise_overrides,
             )
+
+            # MGHDv2 consumes a global token that includes `p` and `log10(p)` (see `pack_cluster`).
+            # Ensure the clustered decoder passes the correct per-point value, otherwise MGHD
+            # is effectively evaluated at a constant `p` regardless of the sweep.
+            try:
+                mghd_Z.default_p = float(x_axis_value)
+                mghd_X.default_p = float(x_axis_value)
+            except Exception:
+                pass
 
             tn_decoder_z = None
             tn_decoder_x = None
@@ -435,21 +510,55 @@ def evaluate(args):
                 pk = {"phys_p": p, "rounds": d}
                 if getattr(args, "noise_scale", None) is not None:
                     pk["noise_scale"] = float(args.noise_scale)
+                if getattr(args, "noise_model", None) is not None:
+                    pk["noise_model"] = str(getattr(args, "noise_model"))
+                for key in (
+                    "lambda_scale",
+                    "noise_ramp",
+                    "p_data",
+                    "p_meas",
+                    "p_1q",
+                    "p_2q",
+                    "p_idle",
+                    "p_meas0",
+                    "p_meas1",
+                    "p_hook",
+                    "p_xtalk",
+                    "p_erase",
+                    "p_long_range",
+                ):
+                    val = getattr(args, key, None)
+                    if val is not None:
+                        pk[key] = val
                 sampler = CudaQSampler(device_profile="garnet", profile_kwargs=pk)
-            elif args.sampler == "phenomenological":
+            elif args.sampler in {"code_capacity", "phenomenological"}:
                 # Phenomenological sampler generates IID X/Z errors with both syndrome types
                 # This matches the training setup better than Stim's circuit-level simulation
                 sampler = PhenomenologicalSampler(p=p)
             else:
                 raise ValueError(f"Unknown sampler: {args.sampler}")
+
+            # Keep clustered MGHD decoder metadata aligned with the current sweep point.
+            # This matters once d/p conditioning is enabled in pack_cluster(). g_token.
+            try:
+                mghd_Z.default_p = float(p)
+                mghd_X.default_p = float(p)
+            except Exception:
+                pass
             
             total_shots = 0
             failures_mghd = 0.0
             failures_mwpm = 0.0 if mwpm_enabled else None
-            failures_lsd = 0.0
+            failures_lsd = 0.0 if lsd is not None else None
             failures_nvqldpc = 0.0 if nvqldpc_teacher is not None else None
             failures_mwpf = 0.0 if mwpf_teacher is not None else None
             failures_tn = 0.0 if (tn_decoder_z is not None or tn_decoder_x is not None) else None
+            shot_failures_mghd = 0
+            shot_failures_mwpm = 0 if mwpm_enabled else None
+            shot_failures_lsd = 0 if lsd is not None else None
+            shot_failures_nvqldpc = 0 if nvqldpc_teacher is not None else None
+            shot_failures_mwpf = 0 if mwpf_teacher is not None else None
+            shot_failures_tn = 0 if (tn_decoder_z is not None or tn_decoder_x is not None) else None
             mghd_lsd_agree = 0
             mghd_decode_errors = 0
             nvqldpc_decode_errors = 0
@@ -521,16 +630,23 @@ def evaluate(args):
                     print(f"obs_true shape: {obs_true.shape}, preds_mghd shape: {preds_mghd.shape}")
                     sys.exit(1)
                 failures_mghd += float(ler_res_mghd.ler_mean) * this_batch
+                shot_failures_mghd += _shot_failures(obs_true, preds_mghd)
                 
                 # --- MWPM Decoding ---
-                if mwpm_enabled and mwpm_ctx is not None:
-                    preds_mwpm = []
-                    for i in range(this_batch):
-                        ez_pm, _ = mwpm_ctx.decode(Hx_dense, sx[i], "Z")
-                        ex_pm, _ = mwpm_ctx.decode(Hz_dense, sz[i], "X")
-                        obs_pred = code.data_to_observables(ex_pm, ez_pm)
-                        preds_mwpm.append(obs_pred)
-                    preds_mwpm = np.array(preds_mwpm, dtype=np.uint8)
+                if mwpm_enabled and mwpm_ctx is not None and failures_mwpm is not None:
+                    if mwpm_matcher_z is not None and mwpm_matcher_x is not None:
+                        ez_pm = _mwpm_decode_batch(mwpm_matcher_z, sx)
+                        ex_pm = _mwpm_decode_batch(mwpm_matcher_x, sz)
+                    else:
+                        # Slow fallback (keeps evaluation working without pymatching decode_batch)
+                        ez_pm = np.zeros((this_batch, Hx_dense.shape[1]), dtype=np.uint8)
+                        ex_pm = np.zeros((this_batch, Hz_dense.shape[1]), dtype=np.uint8)
+                        for i in range(this_batch):
+                            ez_pm[i], _ = mwpm_ctx.decode(Hx_dense, sx[i], "Z")
+                            ex_pm[i], _ = mwpm_ctx.decode(Hz_dense, sz[i], "X")
+
+                    preds_mwpm = code.data_to_observables(ex_pm, ez_pm)
+                    preds_mwpm = np.asarray(preds_mwpm, dtype=np.uint8)
                     preds_mwpm = align_preds(preds_mwpm, obs_true)
                     ler_res_mwpm = logical_error_rate(obs_true, preds_mwpm)
                     if ler_res_mwpm.ler_mean is None:
@@ -538,6 +654,8 @@ def evaluate(args):
                         print(f"obs_true shape: {obs_true.shape}, preds_mwpm shape: {preds_mwpm.shape}")
                         sys.exit(1)
                     failures_mwpm += float(ler_res_mwpm.ler_mean) * this_batch
+                    if shot_failures_mwpm is not None:
+                        shot_failures_mwpm += _shot_failures(obs_true, preds_mwpm)
                 
                 # --- LSD Decoding ---
                 # NOTE: LSDTeacher.decode_batch_xz returns (ex, ez) where:
@@ -547,22 +665,22 @@ def evaluate(args):
                 # So the naming is misleading - we need to swap:
                 #   The "ex" output is actually ez (Z errors from sx via Hx)
                 #   The "ez" output is actually ex (X errors from sz via Hz)
-                ez_lsd, ex_lsd = lsd.decode_batch_xz(sx, sz)  # Swapped!
-                preds_lsd = []
-                for i in range(this_batch):
-                    obs_pred = code.data_to_observables(ex_lsd[i], ez_lsd[i])
-                    preds_lsd.append(obs_pred)
-                preds_lsd = np.array(preds_lsd, dtype=np.uint8)
-                preds_lsd = align_preds(preds_lsd, obs_true)
-                
-                ler_res_lsd = logical_error_rate(obs_true, preds_lsd)
-                if ler_res_lsd.ler_mean is None:
-                    print(f"LSD LER Error: {ler_res_lsd.notes}")
-                    print(f"obs_true shape: {obs_true.shape}, preds_lsd shape: {preds_lsd.shape}")
-                    sys.exit(1)
-                failures_lsd += float(ler_res_lsd.ler_mean) * this_batch
-                if preds_lsd.shape == preds_mghd.shape:
-                    mghd_lsd_agree += int(np.sum(np.all(preds_lsd == preds_mghd, axis=1)))
+                if lsd is not None and failures_lsd is not None:
+                    ez_lsd, ex_lsd = lsd.decode_batch_xz(sx, sz)  # Swapped!
+                    preds_lsd = code.data_to_observables(ex_lsd, ez_lsd)
+                    preds_lsd = np.asarray(preds_lsd, dtype=np.uint8)
+                    preds_lsd = align_preds(preds_lsd, obs_true)
+
+                    ler_res_lsd = logical_error_rate(obs_true, preds_lsd)
+                    if ler_res_lsd.ler_mean is None:
+                        print(f"LSD LER Error: {ler_res_lsd.notes}")
+                        print(f"obs_true shape: {obs_true.shape}, preds_lsd shape: {preds_lsd.shape}")
+                        sys.exit(1)
+                    failures_lsd += float(ler_res_lsd.ler_mean) * this_batch
+                    if shot_failures_lsd is not None:
+                        shot_failures_lsd += _shot_failures(obs_true, preds_lsd)
+                    if preds_lsd.shape == preds_mghd.shape:
+                        mghd_lsd_agree += int(np.sum(np.all(preds_lsd == preds_mghd, axis=1)))
 
                 # --- NvQldpc Decoding (GPU BP+OSD teacher) ---
                 if nvqldpc_teacher is not None and failures_nvqldpc is not None:
@@ -579,9 +697,12 @@ def evaluate(args):
                         ler_res_nvq = logical_error_rate(obs_true, preds_nvq)
                         if ler_res_nvq.ler_mean is not None:
                             failures_nvqldpc += float(ler_res_nvq.ler_mean) * this_batch
+                            if shot_failures_nvqldpc is not None:
+                                shot_failures_nvqldpc += _shot_failures(obs_true, preds_nvq)
                     except Exception:
                         nvqldpc_decode_errors += this_batch
                         failures_nvqldpc = None
+                        shot_failures_nvqldpc = None
 
                 # --- Tensor-Network Observable Decoder ---
                 if failures_tn is not None and (tn_decoder_z is not None or tn_decoder_x is not None):
@@ -602,9 +723,12 @@ def evaluate(args):
                             ler_res_tn = logical_error_rate(obs_true, preds_tn_arr)
                             if ler_res_tn.ler_mean is not None:
                                 failures_tn += float(ler_res_tn.ler_mean) * this_batch
+                                if shot_failures_tn is not None:
+                                    shot_failures_tn += _shot_failures(obs_true, preds_tn_arr)
                     except Exception:
                         tn_decode_errors += this_batch
                         failures_tn = None
+                        shot_failures_tn = None
 
                 # --- MWPF Decoding (approximate ex/ez from fault_ids) ---
                 # NOTE: MWPF often crashes on large distances or complex syndromes.
@@ -636,10 +760,13 @@ def evaluate(args):
                             ler_res_mwpf = logical_error_rate(obs_true, preds_mwpf)
                             if ler_res_mwpf.ler_mean is not None:
                                 failures_mwpf += float(ler_res_mwpf.ler_mean) * this_batch
+                                if shot_failures_mwpf is not None:
+                                    shot_failures_mwpf += _shot_failures(obs_true, preds_mwpf)
                     except Exception as exc:
                         print(f"\n  MWPF decode failed at d={d}, p={p}: {type(exc).__name__}")
                         # Disable MWPF for the rest of this evaluation
                         failures_mwpf = None
+                        shot_failures_mwpf = None
                 
                 total_shots += this_batch
                 
@@ -653,11 +780,13 @@ def evaluate(args):
                 nvq_str = f"{nvq_ratio:.10f}" if nvq_ratio is not None else "NA"
                 tn_ratio = None if failures_tn is None or total_shots == 0 else failures_tn / total_shots
                 tn_str = f"{tn_ratio:.10f}" if tn_ratio is not None else "NA"
+                lsd_ratio = None if failures_lsd is None or total_shots == 0 else failures_lsd / total_shots
+                lsd_str = f"{lsd_ratio:.10f}" if lsd_ratio is not None else "NA"
                 print(
                     f"    Batch {b+1}/{n_batches}: MGHD={failures_mghd/total_shots:.6f} "
                     f"MWPM={mwpm_str} MWPF={mwpf_str} NVQ={nvq_str} TN={tn_str} "
                     f"MGHD_err={mghd_decode_errors} NVQ_err={nvqldpc_decode_errors} TN_err={tn_decode_errors} "
-                    f"LSD={failures_lsd/total_shots:.6f}",
+                    f"LSD={lsd_str}",
                     end="\r",
                 )
             
@@ -669,26 +798,46 @@ def evaluate(args):
             nvq_final_str = f"{nvq_final:.10f}" if nvq_final is not None else "NA"
             tn_final = None if failures_tn is None or total_shots == 0 else failures_tn / total_shots
             tn_final_str = f"{tn_final:.10f}" if tn_final is not None else "NA"
+            lsd_final = None if failures_lsd is None or total_shots == 0 else failures_lsd / total_shots
+            lsd_final_str = f"{lsd_final:.10f}" if lsd_final is not None else "NA"
             print(
                 f"    Final: MGHD={failures_mghd/total_shots:.6f} "
                 f"MWPM={mwpm_final_str} MWPF={mwpf_final_str} NVQ={nvq_final_str} TN={tn_final_str} "
                 f"MGHD_err={mghd_decode_errors} NVQ_err={nvqldpc_decode_errors} TN_err={tn_decode_errors} "
-                f"LSD={failures_lsd/total_shots:.6f}"
+                f"LSD={lsd_final_str}"
             )
             
             results.append({
                 "distance": d,
                 "p": p,
+                "mghd_halo": int(getattr(args, "mghd_halo", 1)),
                 "x_axis_name": x_axis_name,
                 "x_axis_value": x_axis_value,
                 "resolved_noise": resolved_noise,
+                "noise_params_resolved": resolved_noise,
                 "shots": total_shots,
                 "ler_mghd": failures_mghd / total_shots,
                 "ler_mwpm": mwpm_final,      # parity-check baseline on same shots
                 "ler_mwpf": mwpf_final,
-                "ler_lsd": failures_lsd / total_shots,
+                "ler_lsd": lsd_final,
                 "ler_nvqldpc": nvq_final,
                 "ler_tn": tn_final,
+                "ler_shot_mghd": (shot_failures_mghd / total_shots) if total_shots else None,
+                "ler_shot_mwpm": (shot_failures_mwpm / total_shots)
+                if (shot_failures_mwpm is not None and total_shots)
+                else None,
+                "ler_shot_mwpf": (shot_failures_mwpf / total_shots)
+                if (shot_failures_mwpf is not None and total_shots)
+                else None,
+                "ler_shot_lsd": (shot_failures_lsd / total_shots)
+                if (shot_failures_lsd is not None and total_shots)
+                else None,
+                "ler_shot_nvqldpc": (shot_failures_nvqldpc / total_shots)
+                if (shot_failures_nvqldpc is not None and total_shots)
+                else None,
+                "ler_shot_tn": (shot_failures_tn / total_shots)
+                if (shot_failures_tn is not None and total_shots)
+                else None,
                 "decoder_output_classes": {
                     "mghd": "per_qubit",
                     "mwpm": "per_qubit",
@@ -709,12 +858,30 @@ def evaluate(args):
                     "mghd": _wilson_ci(failures_mghd, total_shots),
                     "mwpm": _wilson_ci(failures_mwpm, total_shots) if failures_mwpm is not None else None,
                     "mwpf": _wilson_ci(failures_mwpf, total_shots) if failures_mwpf is not None else None,
-                    "lsd": _wilson_ci(failures_lsd, total_shots),
+                    "lsd": _wilson_ci(failures_lsd, total_shots) if failures_lsd is not None else None,
                     "nvqldpc": _wilson_ci(failures_nvqldpc, total_shots)
                     if failures_nvqldpc is not None
                     else None,
                     "tensor_network_decoder": _wilson_ci(failures_tn, total_shots)
                     if failures_tn is not None
+                    else None,
+                },
+                "confidence_intervals_95_shot": {
+                    "mghd": _wilson_ci(float(shot_failures_mghd), total_shots),
+                    "mwpm": _wilson_ci(float(shot_failures_mwpm), total_shots)
+                    if shot_failures_mwpm is not None
+                    else None,
+                    "mwpf": _wilson_ci(float(shot_failures_mwpf), total_shots)
+                    if shot_failures_mwpf is not None
+                    else None,
+                    "lsd": _wilson_ci(float(shot_failures_lsd), total_shots)
+                    if shot_failures_lsd is not None
+                    else None,
+                    "nvqldpc": _wilson_ci(float(shot_failures_nvqldpc), total_shots)
+                    if shot_failures_nvqldpc is not None
+                    else None,
+                    "tensor_network_decoder": _wilson_ci(float(shot_failures_tn), total_shots)
+                    if shot_failures_tn is not None
                     else None,
                 },
                 "obs_agreement_mghd_lsd": (mghd_lsd_agree / total_shots) if total_shots else None,
@@ -740,6 +907,7 @@ def evaluate(args):
     plot_results(
         results,
         args.output,
+        metric=str(getattr(args, "plot_metric", "shot")),
         y_min=getattr(args, "y_min", None),
         y_max=getattr(args, "y_max", None),
     )
@@ -852,8 +1020,12 @@ def sanity_check_results(results):
         print("✓ All sanity checks passed!")
     print("="*60 + "\n")
 
-def plot_results(results, output_path, y_min=None, y_max=None):
+def plot_results(results, output_path, *, metric: str = "shot", y_min=None, y_max=None):
     """Generate and save a clean LER plot from results."""
+    if metric not in {"shot", "logical_mean"}:
+        raise ValueError("--plot-metric must be 'shot' or 'logical_mean'")
+    field = "ler_shot" if metric == "shot" else "ler"
+    suffix = "shot" if metric == "shot" else "logical_mean"
     # Organize data by distance
     x_axis_name = None
     data_by_d = defaultdict(
@@ -872,23 +1044,33 @@ def plot_results(results, output_path, y_min=None, y_max=None):
         d = res["distance"]
         x_value = float(res.get("x_axis_value", res.get("p", 0.0)))
         data_by_d[d]["x"].append(x_value)
-        data_by_d[d]["mghd"].append(res["ler_mghd"])
+        data_by_d[d]["mghd"].append(res.get(f"{field}_mghd", res.get("ler_mghd")))
         if x_axis_name is None:
             x_axis_name = str(res.get("x_axis_name", "p"))
         data_by_d[d]["mwpm"].append(
-            float(res["ler_mwpm"]) if res.get("ler_mwpm") is not None else np.nan
+            float(res.get(f"{field}_mwpm", res.get("ler_mwpm")))
+            if res.get(f"{field}_mwpm", res.get("ler_mwpm")) is not None
+            else np.nan
         )
         data_by_d[d]["mwpf"].append(
-            float(res["ler_mwpf"]) if res.get("ler_mwpf") is not None else np.nan
+            float(res.get(f"{field}_mwpf", res.get("ler_mwpf")))
+            if res.get(f"{field}_mwpf", res.get("ler_mwpf")) is not None
+            else np.nan
         )
         data_by_d[d]["lsd"].append(
-            float(res["ler_lsd"]) if res.get("ler_lsd") is not None else np.nan
+            float(res.get(f"{field}_lsd", res.get("ler_lsd")))
+            if res.get(f"{field}_lsd", res.get("ler_lsd")) is not None
+            else np.nan
         )
         data_by_d[d]["nvqldpc"].append(
-            float(res["ler_nvqldpc"]) if res.get("ler_nvqldpc") is not None else np.nan
+            float(res.get(f"{field}_nvqldpc", res.get("ler_nvqldpc")))
+            if res.get(f"{field}_nvqldpc", res.get("ler_nvqldpc")) is not None
+            else np.nan
         )
         data_by_d[d]["tn"].append(
-            float(res["ler_tn"]) if res.get("ler_tn") is not None else np.nan
+            float(res.get(f"{field}_tn", res.get("ler_tn")))
+            if res.get(f"{field}_tn", res.get("ler_tn")) is not None
+            else np.nan
         )
 
     if y_min is not None and y_min > 0:
@@ -1002,18 +1184,18 @@ def plot_results(results, output_path, y_min=None, y_max=None):
     axis_label = x_axis_name if x_axis_name is not None else "p"
     plt.xlabel(f"{axis_label}")
     plt.ylabel("Logical Error Rate (LER)")
-    plt.title("Logical Error Rate vs Noise Axis")
+    plt.title(f"Logical Error Rate vs Noise Axis ({suffix})")
     if y_min is not None or y_max is not None:
         lo = y_min if y_min is not None else None
         hi = y_max if y_max is not None else None
         plt.ylim(lo, hi)
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
     
-    plot_file_png = str(Path(output_path).with_suffix('.png'))
-    plot_file_pdf = str(Path(output_path).with_suffix('.pdf'))
+    plot_file_png = str(Path(output_path).with_suffix(f".{suffix}.png"))
+    plot_file_pdf = str(Path(output_path).with_suffix(f".{suffix}.pdf"))
     
-    plt.savefig(plot_file_png, dpi=300, bbox_inches='tight')
-    plt.savefig(plot_file_pdf, bbox_inches='tight')
+    plt.savefig(plot_file_png, dpi=300, bbox_inches="tight")
+    plt.savefig(plot_file_pdf, bbox_inches="tight")
     print(f"Plots saved to {plot_file_png} and {plot_file_pdf}")
 
 def _resolve_syndromes(code_obj, dets):
@@ -1039,7 +1221,8 @@ if __name__ == "__main__":
 Evaluate a trained MGHD model against baselines (MWPM, LSD, optional MWPF).
 
 Key samplers:
-  - phenomenological: IID X/Z errors (matches synthetic training)  
+  - code_capacity: IID X/Z errors on data qubits (matches synthetic training)
+  - phenomenological: alias for code_capacity (deprecated)
   - stim: Legacy Stim sampler
   - cudaq: CUDA-Q backend
 """)
@@ -1051,19 +1234,50 @@ Key samplers:
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="evaluation_results.json")
+    parser.add_argument(
+        "--append-output",
+        action="store_true",
+        help="Append/skip against existing output JSON instead of starting fresh.",
+    )
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--profile", default="S")
     parser.add_argument("--node-feat-dim", type=int, default=9)
-    parser.add_argument("--sampler", default="phenomenological", 
-                        choices=["stim", "cudaq", "phenomenological"],
-                        help="Sampler to use. "
-                             "'phenomenological' (default) matches synthetic training setup with IID X/Z errors. "
-                             "'stim' uses legacy Stim sampler. "
-                             "'cudaq' uses CUDA-Q backend.")
+    parser.add_argument(
+        "--sampler",
+        default="code_capacity",
+        choices=["stim", "cudaq", "code_capacity", "phenomenological"],
+        help=(
+            "Sampler to use. "
+            "'code_capacity' (default) matches synthetic training setup with IID X/Z data errors. "
+            "'phenomenological' is an alias for 'code_capacity' (deprecated). "
+            "'stim' uses legacy Stim sampler. "
+            "'cudaq' uses CUDA-Q backend."
+        ),
+    )
+    parser.add_argument(
+        "--plot-metric",
+        default="shot",
+        choices=["shot", "logical_mean"],
+        help=(
+            "Which metric to plot. "
+            "'shot' plots per-shot logical-failure probability (any logical bit differs). "
+            "'logical_mean' plots the mean logical mismatch rate (averaged over logical bits)."
+        ),
+    )
     parser.add_argument(
         "--disable-mwpf",
         action="store_true",
         help="Disable MWPF proxy baseline (useful if local MWPF install is unstable).",
+    )
+    parser.add_argument(
+        "--disable-mwpm",
+        action="store_true",
+        help="Disable MWPM baseline (useful when CPU-bound and only MGHD is needed).",
+    )
+    parser.add_argument(
+        "--disable-lsd",
+        action="store_true",
+        help="Disable LSD baseline (useful when CPU-bound and only MGHD is needed).",
     )
     parser.add_argument(
         "--enable-nvqldpc",
@@ -1098,6 +1312,38 @@ Key samplers:
         help="Optional global noise scale for CUDA-Q Garnet sampler (cudaq only).",
     )
     parser.add_argument(
+        "--noise-model",
+        type=str,
+        default="circuit_standard",
+        choices=[
+            "code_capacity",
+            "phenomenological",
+            "circuit_standard",
+            "circuit_augmented",
+            "generic_cl",
+            "garnet",
+        ],
+        help="Canonical noise model name for cudaq sampler/eval metadata.",
+    )
+    parser.add_argument("--lambda-scale", type=float, default=None)
+    parser.add_argument(
+        "--noise-ramp",
+        type=str,
+        default="ramp0",
+        choices=["ramp0", "ramp1", "ramp2", "ramp3"],
+    )
+    parser.add_argument("--p-data", type=float, default=None)
+    parser.add_argument("--p-meas", type=float, default=None)
+    parser.add_argument("--p-1q", type=float, default=None)
+    parser.add_argument("--p-2q", type=float, default=None)
+    parser.add_argument("--p-idle", type=float, default=None)
+    parser.add_argument("--p-meas0", type=float, default=None)
+    parser.add_argument("--p-meas1", type=float, default=None)
+    parser.add_argument("--p-hook", type=float, default=None)
+    parser.add_argument("--p-xtalk", type=float, default=None)
+    parser.add_argument("--p-erase", type=float, default=None)
+    parser.add_argument("--p-long-range", type=float, default=None)
+    parser.add_argument(
         "--mghd-error-policy",
         default="raise",
         choices=["raise", "zero"],
@@ -1105,6 +1351,26 @@ Key samplers:
             "How to handle MGHD decode exceptions. "
             "'raise' aborts evaluation (default, strict). "
             "'zero' records all-zero MGHD prediction for failed shots."
+        ),
+    )
+    parser.add_argument(
+        "--mghd-halo",
+        type=int,
+        default=1,
+        help=(
+            "Cluster halo for MGHDPrimaryClustered during evaluation. "
+            "Use 1 to match the training-side component splitter neighborhood."
+        ),
+    )
+    parser.add_argument(
+        "--mghd-projection-mode",
+        type=str,
+        default="always",
+        choices=["always", "if_needed", "none"],
+        help=(
+            "Parity projection mode inside MGHD clustered decode: "
+            "'always' (default), 'if_needed' (only if raw bits violate parity), "
+            "or 'none' (raw thresholded bits)."
         ),
     )
     parser.add_argument(
@@ -1121,4 +1387,6 @@ Key samplers:
     )
     
     args = parser.parse_args()
+    if args.sampler == "phenomenological":
+        print("Warning: --sampler phenomenological is deprecated; use --sampler code_capacity.")
     evaluate(args)

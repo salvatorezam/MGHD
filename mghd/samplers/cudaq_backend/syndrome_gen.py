@@ -582,6 +582,20 @@ def sample_surface_cudaq(
     phys_p: float = None,
     noise_scale: float = None,
     profile_json: str | None = None,
+    noise_model: str | None = None,
+    lambda_scale: float | None = None,
+    noise_ramp: str | None = None,
+    p_data: float | None = None,
+    p_meas: float | None = None,
+    p_1q: float | None = None,
+    p_2q: float | None = None,
+    p_idle: float | None = None,
+    p_meas0: float | None = None,
+    p_meas1: float | None = None,
+    p_hook: float | None = None,
+    p_xtalk: float | None = None,
+    p_erase: float | None = None,
+    p_long_range: float | None = None,
 ) -> np.ndarray:
     """
     Sample surface code syndromes using CUDA-Q with circuit-level noise.
@@ -614,6 +628,80 @@ def sample_surface_cudaq(
             scale = max(1e-3, min(5.0, float(phys_p) / p_ref))
         except Exception:
             scale = 1.0
+
+    # Preferred backend: native CUDA-Q shot trajectories with Kraus-channel
+    # noise model. This is the clean circuit-level path for sampler='cudaq'.
+    backend_kind = str(os.getenv("MGHD_CUDAQ_BACKEND", "trajectory_kraus")).strip().lower()
+    if backend_kind in {"trajectory_kraus", "trajectory", "kraus"}:
+        try:
+            from .trajectory_kraus import sample_surface_trajectory_kraus
+
+            def _env_float(name: str) -> float | None:
+                val = os.getenv(name, None)
+                if val is None or str(val).strip() == "":
+                    return None
+                try:
+                    return float(val)
+                except Exception:
+                    return None
+
+            traj_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            overrides = {
+                "noise_model": noise_model if noise_model is not None else os.getenv("MGHD_NOISE_MODEL", None),
+                "noise_ramp": noise_ramp if noise_ramp is not None else os.getenv("MGHD_NOISE_RAMP", None),
+                "lambda_scale": (
+                    float(lambda_scale)
+                    if lambda_scale is not None
+                    else _env_float("MGHD_LAMBDA_SCALE")
+                ),
+                "p_data": p_data if p_data is not None else _env_float("MGHD_P_DATA"),
+                "p_meas": p_meas if p_meas is not None else _env_float("MGHD_P_MEAS"),
+                "p_1q": p_1q if p_1q is not None else _env_float("MGHD_P_1Q"),
+                "p_2q": p_2q if p_2q is not None else _env_float("MGHD_P_2Q"),
+                "p_idle": p_idle if p_idle is not None else _env_float("MGHD_P_IDLE"),
+                "p_meas0": p_meas0 if p_meas0 is not None else _env_float("MGHD_P_MEAS0"),
+                "p_meas1": p_meas1 if p_meas1 is not None else _env_float("MGHD_P_MEAS1"),
+                "p_hook": p_hook if p_hook is not None else _env_float("MGHD_P_HOOK"),
+                "p_xtalk": p_xtalk if p_xtalk is not None else _env_float("MGHD_P_XTALK"),
+                "p_erase": p_erase if p_erase is not None else _env_float("MGHD_P_ERASE"),
+                "p_long_range": (
+                    p_long_range if p_long_range is not None else _env_float("MGHD_P_LONG_RANGE")
+                ),
+            }
+            overrides = {k: v for k, v in overrides.items() if v is not None}
+            traj = sample_surface_trajectory_kraus(
+                layout=layout,
+                batch_size=batch_size,
+                rounds=max(T, 2),
+                phys_p=phys_p,
+                noise_scale=(noise_scale if noise_scale is not None else lambda_scale),
+                seed=traj_seed,
+                noise_overrides=overrides,
+            )
+            syn_x = np.asarray(traj["syn_x"], dtype=np.uint8)
+            syn_z = np.asarray(traj["syn_z"], dtype=np.uint8)
+            data_readout = np.asarray(traj["data_readout"], dtype=np.uint8)
+
+            # Keep legacy packed contract used by sampler wrappers:
+            # [synX | 2*synZ | (x_err + 2*z_err)].
+            # For native trajectories, we expose final Z-basis data readout as
+            # an X-error proxy and keep Z-error proxy at zero.
+            synd_block = np.concatenate([syn_x, (syn_z << 1)], axis=1).astype(np.uint8)
+            err_x = (data_readout & 1).astype(np.uint8)
+            err_z = np.zeros_like(err_x, dtype=np.uint8)
+            err_block = (err_x + 2 * err_z).astype(np.uint8)
+            packed = np.concatenate([synd_block, err_block], axis=1).astype(np.uint8)
+            return packed
+        except Exception as exc:
+            strict_backend = os.getenv("MGHD_CUDAQ_BACKEND_STRICT", "0") == "1"
+            if strict_backend:
+                raise RuntimeError(
+                    "MGHD_CUDAQ_BACKEND=trajectory_kraus failed and strict mode is enabled."
+                ) from exc
+            print(
+                "Warning: native CUDA-Q Kraus trajectory backend failed; "
+                f"falling back to legacy simulator path ({exc})."
+            )
 
     # Resolve noise model family:
     # - explicit MGHD_NOISE_MODEL env if set

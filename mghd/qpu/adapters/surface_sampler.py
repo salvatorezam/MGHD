@@ -41,6 +41,19 @@ _MODE = os.getenv("MGHD_MODE", "foundation")  # {"foundation","student"}
 _NEIGHBOR_CACHE: dict[tuple, np.ndarray] = {}
 
 
+def _check_coords_from_H(H: np.ndarray, coords_q: np.ndarray) -> np.ndarray:
+    """Derive check coordinates from row support of H to preserve row ordering."""
+    H_bin = np.asarray(H, dtype=np.uint8)
+    q_xy = np.asarray(coords_q, dtype=np.float32)
+    m = int(H_bin.shape[0])
+    coords = np.zeros((m, 2), dtype=np.float32)
+    for row in range(m):
+        idx = np.flatnonzero(H_bin[row])
+        if idx.size:
+            coords[row] = q_xy[idx].mean(axis=0)
+    return coords
+
+
 def _use_synth() -> bool:
     """Check if synthetic sampling should be used (evaluated at call time)."""
     return os.getenv("MGHD_SYNTHETIC", "0") == "1"
@@ -109,14 +122,22 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
         Hx_measured = Hx[:n_x_checks, :]
         Hz_measured = Hz[:n_z_checks, :]
 
-        # Generate coordinate information for clustering (Z→X order for checks)
+        # Generate coordinate information for clustering (Z→X order for checks),
+        # aligned to the exact H row ordering returned in this sample.
         coords_q = _generate_qubit_coords(d)
-        coords_c = _generate_check_coords(d)
+        coords_c = np.vstack(
+            [
+                _check_coords_from_H(Hz_measured, coords_q),
+                _check_coords_from_H(Hx_measured, coords_q),
+            ]
+        ).astype(np.float32)
 
         dem_meta = {
             "backend": "cudaq",
             "mode": _MODE,
             "noise_model": noise_model_kind,
+            "oracle_labels_valid": False,
+            "oracle_label_source": "data_readout_proxy",
             "layout": layout,
             "noise_defaults": FOUNDATION_DEFAULTS,
             "T": 3,
@@ -146,14 +167,17 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
 
 def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
     """
-    Synthetic fallback using proper phenomenological noise on valid surface code.
+    Synthetic fallback using a code-capacity-style noise model (data-only errors).
     Generates valid Hx/Hz matrices and consistent syndromes so MWPM works.
     """
     rng = np.random.default_rng(seed)
 
-    # 1. Build valid surface code matrices
-    # build_H_rotated_general returns (Hz, Hx)
-    Hz, Hx = build_H_rotated_general(d)
+    # 1. Build canonical surface code matrices (must match get_code/eval path)
+    from mghd.codes.registry import get_code
+
+    code = get_code("surface", distance=int(d))
+    Hx = np.asarray(code.Hx, dtype=np.uint8)
+    Hz = np.asarray(code.Hz, dtype=np.uint8)
     
     n_data = d * d
     
@@ -173,9 +197,14 @@ def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
     # X-checks detect Z-errors: synX = Hx @ err_z
     synX = (Hx @ err_z) % 2
 
-    # Generate coordinate grids (checks are Z then X)
+    # Generate coordinate grids (checks are Z then X, matching matrix row order)
     coords_q = _generate_qubit_coords(d)
-    coords_c = _generate_check_coords(d)  # Z first then X
+    coords_c = np.vstack(
+        [
+            _check_coords_from_H(Hz, coords_q),
+            _check_coords_from_H(Hx, coords_q),
+        ]
+    ).astype(np.float32)
 
     return {
         "Hx": Hx.astype(np.uint8),
@@ -186,7 +215,14 @@ def _synthetic_sample_round(d: int, p: float, seed: int) -> dict[str, Any]:
         "ez_glob": err_z.astype(np.uint8),
         "coords_q": coords_q,
         "coords_c": coords_c,
-        "dem_meta": {"synthetic": True, "effective_p": p, "model": "phenomenological"},
+        "dem_meta": {
+            "synthetic": True,
+            "effective_p": float(p),
+            "model": "code_capacity_iid",
+            "oracle_labels_valid": True,
+            "oracle_label_source": "sampled_data_pauli",
+            "matrix_source": "codes.registry.surface",
+        },
     }
 
 
@@ -267,6 +303,7 @@ def split_components_for_side(
     synX: np.ndarray,
     coords_q: np.ndarray,
     coords_c: np.ndarray,
+    halo: int = 1,
 ) -> list[dict[str, Any]]:
     """
     Build connected components + 1-hop halo for the chosen side ('Z' or 'X').
@@ -286,8 +323,10 @@ def split_components_for_side(
     else:
         raise ValueError(f"Unknown side: {side}")
 
-    # Try fast Numba path first
-    if _NUMBA_AVAILABLE:
+    halo = int(max(0, int(halo)))
+
+    # Try fast Numba path first (supports halo=1 neighborhood expansion only).
+    if _NUMBA_AVAILABLE and halo == 1:
         try:
             # Build or retrieve cached neighbor list
             global _NEIGHBOR_CACHE
@@ -375,7 +414,7 @@ def split_components_for_side(
         from mghd.decoders.lsd import clustered as cc
 
         H_sparse = sp.csr_matrix(H)
-        check_groups, qubit_groups = cc.active_components(H_sparse, synd_bits, halo=1)
+        check_groups, qubit_groups = cc.active_components(H_sparse, synd_bits, halo=halo)
 
         components = []
         for check_indices, qubit_indices in zip(check_groups, qubit_groups):
@@ -434,6 +473,7 @@ def _fallback_split_components(
     synX: np.ndarray,
     coords_q: np.ndarray,
     coords_c: np.ndarray,
+    halo: int = 1,
 ) -> list[dict[str, Any]]:
     """Fallback component splitting when clustering module not available"""
 

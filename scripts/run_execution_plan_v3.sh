@@ -58,9 +58,8 @@ case "${MODE}" in
       --distance 7 \
       --distance-curriculum 3,5,7 \
       --sampler synthetic \
-      --teacher-mix "${TEACHER_MIX_A:-lsd=0.7,mwpm=0.3,mwpf=0.0}" \
-      --teacher-contract-report "${OUT_ROOT}/teacher_contract_report.json" \
-      --teacher-contract-strict \
+      --teacher-mix "${TEACHER_MIX_A:-oracle=1.0,lsd=0.0,mwpm=0.0,mwpf=0.0}" \
+      --teacher-selection "${TEACHER_SELECTION_A:-min_weight}" \
       --p-curriculum "${P_CURR_A:-0.01,0.008,0.006,0.004,0.003,0.002,0.001}" \
       --epochs-per-p "${EPOCHS_PER_P_A:-5}" \
       --epochs "${EPOCHS_A:-35}" \
@@ -69,7 +68,7 @@ case "${MODE}" in
       --workers "${WORKERS_A:-8}" \
       --prefetch-factor "${PREFETCH_A:-8}" \
       --amp "${AMP_A:-bf16}" \
-      --save "${OUT_ROOT}/phase_a_phenomenological"
+      --save "${OUT_ROOT}/phase_a_code_capacity"
     ;;
 
   phase_b)
@@ -80,14 +79,13 @@ case "${MODE}" in
       --distance 7 \
       --distance-curriculum 3,5,7 \
       --sampler cudaq \
-      --noise-model generic_cl \
-      --generic-p1q "${GENERIC_P1Q_B:-0.0015}" \
-      --generic-p2q "${GENERIC_P2Q_B:-0.01}" \
-      --generic-pidle "${GENERIC_PIDLE_B:-0.0008}" \
-      --generic-pmeas0 "${GENERIC_PMEAS0_B:-0.02}" \
-      --generic-pmeas1 "${GENERIC_PMEAS1_B:-0.02}" \
-      --generic-phook "${GENERIC_PHOOK_B:-0.002}" \
-      --generic-pcrosstalk "${GENERIC_PCROSSTALK_B:-0.0005}" \
+      --noise-model circuit_standard \
+      --p-1q "${GENERIC_P1Q_B:-0.0015}" \
+      --p-2q "${GENERIC_P2Q_B:-0.01}" \
+      --p-idle "${GENERIC_PIDLE_B:-0.0008}" \
+      --p-meas0 "${GENERIC_PMEAS0_B:-0.02}" \
+      --p-meas1 "${GENERIC_PMEAS1_B:-0.02}" \
+      --noise-ramp ramp1 \
       --teacher-mix "${TEACHER_MIX_B:-lsd=0.6,mwpm=0.2,nvqldpc=0.2,mwpf=0.0}" \
       --teacher-contract-report "${OUT_ROOT}/teacher_contract_report.json" \
       --p-curriculum "${P_CURR_B:-0.01,0.008,0.006,0.004,0.003,0.002,0.001}" \
@@ -109,14 +107,17 @@ case "${MODE}" in
       --distance 9 \
       --distance-curriculum 3,5,7,9 \
       --sampler cudaq \
-      --noise-model generic_cl \
-      --generic-p1q "${GENERIC_P1Q_C:-0.0015}" \
-      --generic-p2q "${GENERIC_P2Q_C:-0.012}" \
-      --generic-pidle "${GENERIC_PIDLE_C:-0.0008}" \
-      --generic-pmeas0 "${GENERIC_PMEAS0_C:-0.02}" \
-      --generic-pmeas1 "${GENERIC_PMEAS1_C:-0.02}" \
-      --generic-phook "${GENERIC_PHOOK_C:-0.01}" \
-      --generic-pcrosstalk "${GENERIC_PCROSSTALK_C:-0.002}" \
+      --noise-model circuit_augmented \
+      --p-1q "${GENERIC_P1Q_C:-0.0015}" \
+      --p-2q "${GENERIC_P2Q_C:-0.012}" \
+      --p-idle "${GENERIC_PIDLE_C:-0.0008}" \
+      --p-meas0 "${GENERIC_PMEAS0_C:-0.02}" \
+      --p-meas1 "${GENERIC_PMEAS1_C:-0.02}" \
+      --p-hook "${GENERIC_PHOOK_C:-0.01}" \
+      --p-xtalk "${GENERIC_PCROSSTALK_C:-0.002}" \
+      --p-erase "${GENERIC_PERASE_C:-0.001}" \
+      --p-long-range "${GENERIC_PLONG_C:-0.001}" \
+      --noise-ramp ramp3 \
       --teacher-mix "${TEACHER_MIX_C:-lsd=0.5,mwpm=0.2,nvqldpc=0.3,mwpf=0.0}" \
       --teacher-contract-report "${OUT_ROOT}/teacher_contract_report.json" \
       --p-curriculum "${P_CURR_C:-0.01,0.008,0.006,0.004,0.003,0.002,0.001}" \
@@ -149,7 +150,7 @@ case "${MODE}" in
       --sampler "${EVAL_SAMPLER:-cudaq}" \
       --cuda \
       --disable-mwpf \
-      --mghd-error-policy raise \
+      --mghd-error-policy "${MGHD_ERROR_POLICY:-raise}" \
       --output "${OUT_ROOT}/eval_main.json" \
       "${EXTRA_EVAL_FLAGS[@]}"
     ;;

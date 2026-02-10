@@ -315,7 +315,38 @@ def pack_cluster(
     xy01 = np.vstack([xy_q01, xy_c01]).astype(np.float32)
 
     _, _, bw, bh = bbox_xywh
+    x0, y0, bw, bh = bbox_xywh
     g_list: List[float] = [float(k), float(r), float(bw), float(bh)]
+    # Always expose global regime metadata so the model can separate distance/noise regimes.
+    p_safe = float(max(float(p), 1e-12))
+    g_list.extend([float(d), p_safe, float(math.log10(p_safe))])
+    # Boundary-awareness features (critical for distance scaling on surface codes).
+    # Local bbox-normalized coordinates alone are translationally ambiguous; add
+    # global crop position and boundary proximity so d=3/d=5 regimes are separable.
+    lattice_span = float(max(1, 2 * max(int(d) - 1, 1)))
+    x_min_g = 0.0
+    x_max_g = float(max(0, 2 * (int(d) - 1)))
+    y_min_g = float(-(int(d) - 1))
+    y_max_g = float(int(d) - 1)
+
+    x1 = float(x0 + max(int(bw) - 1, 0))
+    y1 = float(y0 + max(int(bh) - 1, 0))
+    cx = 0.5 * (float(x0) + x1)
+    cy = 0.5 * (float(y0) + y1)
+
+    cx01 = float(np.clip((cx - x_min_g) / max(1.0, x_max_g - x_min_g), 0.0, 1.0))
+    cy01 = float(np.clip((cy - y_min_g) / max(1.0, y_max_g - y_min_g), 0.0, 1.0))
+    bw01 = float(np.clip(float(max(int(bw), 1)) / (lattice_span + 1.0), 0.0, 1.0))
+    bh01 = float(np.clip(float(max(int(bh), 1)) / (lattice_span + 1.0), 0.0, 1.0))
+
+    dist_left = max(0.0, float(x0) - x_min_g)
+    dist_right = max(0.0, x_max_g - x1)
+    dist_bottom = max(0.0, float(y0) - y_min_g)
+    dist_top = max(0.0, y_max_g - y1)
+    min_bdry01 = float(
+        np.clip(min(dist_left, dist_right, dist_bottom, dist_top) / max(1.0, lattice_span), 0.0, 1.0)
+    )
+    g_list.extend([cx01, cy01, bw01, bh01, min_bdry01])
     for key in ("size", "radius", "ecc", "bdensity"):
         if key in kappa_stats:
             g_list.append(float(kappa_stats[key]))
@@ -475,11 +506,13 @@ def pack_cluster(
 
 
 class GraphDecoderCore(nn.Module):
-    """Iterative message-passing core used by MGHDv2's graph head.
+    """Lightweight bidirectional message passing core used by MGHDv2.
 
-    Runs a small MLP for edge messages and a GRU to update node states for a
-    fixed number of iterations; exposes a 2‑logit per‑node head at each step
-    (the caller typically takes the last step).
+    Design goals:
+    - Keep the graph block simple and hardware-friendly (no deep edge MLP stack).
+    - Preserve explicit iterative message passing.
+    - Ensure syndrome information can flow checks↔data in one iteration by
+      symmetrizing edge directions internally.
     """
 
     def __init__(
@@ -501,21 +534,24 @@ class GraphDecoderCore(nn.Module):
         self.n_edge_features = n_edge_features
         self.n_node_outputs = n_node_outputs
 
-        self.final_digits = nn.Linear(self.n_node_features, self.n_node_outputs)
-        self.msg_net = nn.Sequential(
-            nn.Linear(2 * n_node_features + n_edge_features, msg_net_size),
-            nn.ReLU(),
-            nn.Dropout(msg_net_dropout_p),
-            nn.Linear(msg_net_size, msg_net_size),
-            nn.ReLU(),
-            nn.Dropout(msg_net_dropout_p),
-            nn.Linear(msg_net_size, msg_net_size),
-            nn.ReLU(),
-            nn.Dropout(msg_net_dropout_p),
-            nn.Linear(msg_net_size, n_edge_features),
+        # Keep the legacy attribute name `msg_net` for compatibility with tests
+        # and old instrumentation, but use a single linear projection only.
+        self.msg_net = nn.Linear(
+            2 * self.n_node_features + self.n_edge_features,
+            self.n_edge_features,
+            bias=False,
         )
-        self.gru = nn.GRU(input_size=n_edge_features + n_node_inputs, hidden_size=n_node_features)
-        self.gru_drop = nn.Dropout(gru_dropout_p)
+        self.msg_drop = nn.Dropout(msg_net_dropout_p)
+        self.node_in_proj = (
+            nn.Identity()
+            if self.n_node_inputs == self.n_node_features
+            else nn.Linear(self.n_node_inputs, self.n_node_features, bias=False)
+        )
+        self.edge_to_state = nn.Linear(self.n_edge_features, self.n_node_features, bias=False)
+        self.state_to_state = nn.Linear(self.n_node_features, self.n_node_features, bias=False)
+        self.state_norm = nn.LayerNorm(self.n_node_features)
+        self.state_drop = nn.Dropout(gru_dropout_p)
+        self.final_digits = nn.Linear(self.n_node_features, self.n_node_outputs)
 
     def forward(
         self,
@@ -534,10 +570,11 @@ class GraphDecoderCore(nn.Module):
         - [T, N, 2] logits (T iterations)
         """
         device = node_inputs.device
-        node_states = torch.zeros(node_inputs.shape[0], self.n_node_features, device=device)
+        node_states = self.node_in_proj(node_inputs)
+        n_nodes = node_inputs.shape[0]
         outputs_tensor = torch.zeros(
             self.n_iters,
-            node_inputs.shape[0],
+            n_nodes,
             self.n_node_outputs,
             device=device,
         )
@@ -552,21 +589,26 @@ class GraphDecoderCore(nn.Module):
                 )
             else:
                 edge_feat = edge_attr.to(node_inputs.device, dtype=node_inputs.dtype)
-            msg_in = torch.cat((node_states[src_ids], node_states[dst_ids], edge_feat), dim=1)
-            messages = self.msg_net(msg_in)
-            agg_msg = torch.zeros(
-                node_inputs.shape[0], self.n_edge_features, device=device, dtype=messages.dtype
-            )
-            agg_msg.index_add_(dim=0, index=dst_ids, source=messages)
-            gru_inputs = torch.cat((agg_msg, node_inputs), dim=1)
 
-            _, node_states = self.gru(
-                gru_inputs.view(1, node_inputs.shape[0], -1),
-                node_states.view(1, node_inputs.shape[0], -1),
+            # Symmetrize Tanner/jump edges so checks and data exchange messages.
+            msg_in_fwd = torch.cat((node_states[src_ids], node_states[dst_ids], edge_feat), dim=1)
+            msg_in_rev = torch.cat((node_states[dst_ids], node_states[src_ids], edge_feat), dim=1)
+            msg_fwd = self.msg_drop(self.msg_net(msg_in_fwd))
+            msg_rev = self.msg_drop(self.msg_net(msg_in_rev))
+            agg_msg = torch.zeros((n_nodes, self.n_edge_features), device=device, dtype=msg_fwd.dtype)
+            agg_msg.index_add_(dim=0, index=dst_ids, source=msg_fwd)
+            agg_msg.index_add_(dim=0, index=src_ids, source=msg_rev)
+
+            # Degree-normalized aggregation keeps scale stable across distances.
+            deg = torch.bincount(dst_ids, minlength=n_nodes) + torch.bincount(
+                src_ids, minlength=n_nodes
             )
-            node_states = node_states.squeeze(0)
+            deg = deg.to(node_inputs.dtype).clamp_min_(1.0)
+            agg_msg = agg_msg / deg.unsqueeze(1)
+
+            delta = self.edge_to_state(agg_msg) + self.state_to_state(node_states)
+            node_states = self.state_norm(node_states + self.state_drop(delta))
             outputs_tensor[i] = self.final_digits(node_states)
-            node_states = self.gru_drop(node_states)
 
         return outputs_tensor
 
@@ -812,13 +854,19 @@ class GraphDecoderAdapter(nn.Module):
 class MGHDv2(nn.Module):
     """Distance-agnostic MGHD v2 with Mamba, channel attention, and graph message passing."""
 
+    _PROFILE_PRESETS: Dict[str, Dict[str, int]] = {
+        "S": {"d_model": 192, "d_state": 80, "n_iters": 8},
+        "M": {"d_model": 256, "d_state": 96, "n_iters": 10},
+        "L": {"d_model": 320, "d_state": 128, "n_iters": 12},
+    }
+
     def __init__(
         self,
         profile: str = "S",
         *,
-        d_model: int = 192,
-        d_state: int = 80,
-        n_iters: int = 8,
+        d_model: Optional[int] = None,
+        d_state: Optional[int] = None,
+        n_iters: Optional[int] = None,
         node_feat_dim: int = 9,
         edge_feat_dim: int = 3,
         g_dim: Optional[int] = None,
@@ -828,9 +876,22 @@ class MGHDv2(nn.Module):
         gnn_gru_dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        profile_key = str(profile).upper().strip()
+        if profile_key not in self._PROFILE_PRESETS:
+            profile_key = "S"
+        preset = self._PROFILE_PRESETS[profile_key]
+        d_model = int(preset["d_model"] if d_model is None else d_model)
+        d_state = int(preset["d_state"] if d_state is None else d_state)
+        n_iters = int(preset["n_iters"] if n_iters is None else n_iters)
+
         if g_dim is None:
-            g_dim = max(8, node_feat_dim)
+            # pack_cluster mandatory prefix:
+            # [k, r, bw, bh, d, p, log10(p), cx01, cy01, bw01, bh01, min_bdry01]
+            g_dim = 12
+        self.profile = profile_key
         self.d_model = d_model
+        self.d_state = d_state
+        self.n_iters = n_iters
         self.seq_encoder = SequenceEncoder(d_model=d_model, d_state=d_state)
         self.se = ChannelSE(channels=d_model, reduction=int(se_reduction))
         self.gnn = GraphDecoderAdapter(
@@ -843,14 +904,14 @@ class MGHDv2(nn.Module):
         )
         self.node_in = nn.Linear(node_feat_dim, d_model)
         self.edge_in = nn.Linear(edge_feat_dim, d_model)
-        self.g_proj: Optional[nn.Linear] = None
+        self.g_proj: nn.Module = nn.Linear(int(g_dim), self.node_in.out_features)
 
     def forward(self, packed: PackedCrop) -> Tuple[torch.Tensor, torch.Tensor]:
         x = packed.x_nodes.float()
         eidx = packed.edge_index.long()
         eatt = packed.edge_attr.float()
         emask = packed.edge_mask.bool()
-        gtok = packed.g_token.float()
+        gtok = self._prepare_g_token(packed.g_token.float())
 
         # Guard against feature-dim mismatches (e.g., erasure channel optional)
         if self.node_in.in_features != x.shape[-1]:
@@ -864,14 +925,8 @@ class MGHDv2(nn.Module):
             node_type = packed.node_type.long()
 
             if gtok.dim() == 2:
-                g_dim = gtok.size(-1)
-                if self.g_proj is None or self.g_proj.in_features != g_dim:
-                    self.ensure_g_proj(g_dim, gtok.device)
                 g_bias = self.g_proj(gtok).unsqueeze(1).expand(batch_size, nodes_pad, -1)
             else:
-                g_dim = gtok.numel()
-                if self.g_proj is None or self.g_proj.in_features != g_dim:
-                    self.ensure_g_proj(g_dim, gtok.device)
                 g_bias = self.g_proj(gtok.view(-1)).view(1, 1, -1).expand(batch_size, nodes_pad, -1)
 
             x = self.node_in(x) + g_bias
@@ -894,14 +949,8 @@ class MGHDv2(nn.Module):
         node_type = packed.node_type.long()
 
         if gtok.dim() == 2:
-            g_dim = gtok.size(-1)
-            if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.ensure_g_proj(g_dim, gtok.device)
             g_bias = self.g_proj(gtok).unsqueeze(1).expand(1, nodes_pad, -1).reshape(nodes_pad, -1)
         else:
-            g_dim = gtok.numel()
-            if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.ensure_g_proj(g_dim, gtok.device)
             g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0).expand(nodes_pad, -1)
 
         x = self.node_in(x) + g_bias
@@ -915,6 +964,26 @@ class MGHDv2(nn.Module):
         x = self.se(x.unsqueeze(0)).squeeze(0)
         logits = self.gnn(x, eidx, e, nmask, emask)
         return logits, nmask
+
+    def _prepare_g_token(self, gtok: torch.Tensor) -> torch.Tensor:
+        """Pad/truncate global token to the projection width without rebuilding layers."""
+        if self.g_proj is None:
+            return gtok
+        if hasattr(self.g_proj, "has_uninitialized_params") and self.g_proj.has_uninitialized_params():  # type: ignore[attr-defined]
+            return gtok
+        in_features = getattr(self.g_proj, "in_features", None)
+        if in_features is None:
+            return gtok
+        want = int(in_features)
+        have = int(gtok.shape[-1]) if gtok.ndim >= 1 else 0
+        if have == want:
+            return gtok
+        if have > want:
+            return gtok[..., :want]
+        pad_shape = list(gtok.shape)
+        pad_shape[-1] = want - have
+        pad = torch.zeros(pad_shape, dtype=gtok.dtype, device=gtok.device)
+        return torch.cat([gtok, pad], dim=-1)
 
     def allocate_static_batch(
         self,
@@ -1004,8 +1073,19 @@ class MGHDv2(nn.Module):
     def set_message_iters(self, n_iters: Optional[int]) -> None:
         self.gnn.set_iteration_override(n_iters)
 
+    def _align_g_proj(self, g_dim: int, device: torch.device) -> None:
+        """Initialize g-token projection when missing; avoid runtime module replacement."""
+        if self.g_proj is None:
+            self.ensure_g_proj(g_dim, device)
+            return
+        has_lazy = hasattr(self.g_proj, "has_uninitialized_params")
+        if has_lazy and self.g_proj.has_uninitialized_params():  # type: ignore[attr-defined]
+            return
+        return
+
     def ensure_g_proj(self, g_dim: int, device: torch.device) -> None:
-        if self.g_proj is None or self.g_proj.in_features != g_dim:
+        in_features = getattr(self.g_proj, "in_features", None) if self.g_proj is not None else None
+        if self.g_proj is None or in_features is None or int(in_features) != int(g_dim):
             layer = nn.Linear(g_dim, self.node_in.out_features)
             layer.to(device)
             self.g_proj = layer
@@ -1076,6 +1156,15 @@ class MGHDDecoderPublic:
         self.device = torch.device(device)
         state_dict = _load_state_dict(ckpt_path)
         self.model = MGHDv2(profile=profile, node_feat_dim=node_feat_dim)
+        # Restore lazily-created projection layers before state_dict load so
+        # checkpointed tensors are not silently dropped.
+        if "node_in.weight" in state_dict and torch.is_tensor(state_dict["node_in.weight"]):
+            self.model.ensure_node_in(int(state_dict["node_in.weight"].shape[1]), self.device)
+        if "edge_in.weight" in state_dict and torch.is_tensor(state_dict["edge_in.weight"]):
+            self.model.ensure_edge_in(int(state_dict["edge_in.weight"].shape[1]), self.device)
+        if "g_proj.weight" in state_dict and torch.is_tensor(state_dict["g_proj.weight"]):
+            self.model.ensure_g_proj(int(state_dict["g_proj.weight"].shape[1]), self.device)
+
         self.model.load_state_dict(state_dict, strict=False)
         self.model.to(self.device).eval()
 
@@ -1194,17 +1283,46 @@ class MGHDDecoderPublic:
         n_checks, n_qubits = H_dense.shape
         edges = int(H_dense.sum())
         kappa_stats = dict(meta.get("kappa_stats", {}))
-        if "size" not in kappa_stats:
-            kappa_stats["size"] = float(n_checks + n_qubits)
+
+        xy_qubit = np.asarray(meta["xy_qubit"], dtype=np.int32)
+        xy_check = np.asarray(meta.get("xy_check", np.zeros((0, 2), dtype=np.int32)))
+
+        bbox = meta.get("bbox_xywh", None)
+        if bbox is None:
+            bbox = meta.get("bbox", None)
+        if bbox is None:
+            all_xy = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
+            if all_xy.size:
+                mins = all_xy.min(axis=0)
+                maxs = all_xy.max(axis=0)
+                bbox = (
+                    int(mins[0]),
+                    int(mins[1]),
+                    int(maxs[0] - mins[0] + 1),
+                    int(maxs[1] - mins[1] + 1),
+                )
+            else:
+                bbox = (0, 0, 1, 1)
+        bbox_xywh = tuple(int(v) for v in bbox)
+
+        add_jump_edges = bool(meta.get("add_jump_edges", True))
+        jump_k = int(meta.get("jump_k", 2))
+        g_extra = meta.get("g_extra", None)
+        if g_extra is not None:
+            g_extra = np.asarray(g_extra, dtype=np.float32).ravel()
+        # jump-edge construction can include diagonal/self links after powering
+        # adjacency, so reserve up to n_qubits^2 extra directed edges.
+        est_jump_edges = (n_qubits * n_qubits) if add_jump_edges else 0
+        edge_cap = max(edges + est_jump_edges, 1)
 
         pack = pack_cluster(
             H_sub=H_dense,
-            xy_qubit=np.asarray(meta["xy_qubit"], dtype=np.int32),
-            xy_check=np.asarray(meta.get("xy_check", np.zeros((0, 2), dtype=np.int32))),
+            xy_qubit=xy_qubit,
+            xy_check=xy_check,
             synd_Z_then_X_bits=s_sub,
             k=int(meta.get("k", n_qubits)),
             r=int(meta.get("r", 0)),
-            bbox_xywh=tuple(int(v) for v in meta.get("bbox", (0, 0, 1, 1))),
+            bbox_xywh=bbox_xywh,
             kappa_stats=kappa_stats,
             y_bits_local=np.zeros(n_qubits, dtype=np.uint8),
             side=str(meta.get("side", "Z")),
@@ -1212,10 +1330,12 @@ class MGHDDecoderPublic:
             p=float(meta.get("p", 0.0)),
             seed=0,
             N_max=n_qubits + n_checks,
-            E_max=max(edges, 1),
+            E_max=edge_cap,
             S_max=max(n_checks, 1),
             bucket_spec=bucket_spec,
-            add_jump_edges=False,
+            add_jump_edges=add_jump_edges,
+            jump_k=jump_k,
+            g_extra=g_extra,
         )
         return pack
 

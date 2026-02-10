@@ -32,7 +32,7 @@ def _as_dense_uint8(M) -> np.ndarray:
     return A.astype(np.uint8) & 1
 
 
-def gf2_row_echelon(A: np.ndarray):
+def gf2_row_echelon(A: np.ndarray, pivot_cols: int | None = None):
     """Gaussian elimination over GF(2) returning row-echelon form and pivots.
 
     Parameters
@@ -44,9 +44,10 @@ def gf2_row_echelon(A: np.ndarray):
     """
     A = (A & 1).astype(np.uint8).copy()
     m, n = A.shape
+    n_pivot = n if pivot_cols is None else max(0, min(int(pivot_cols), n))
     pivots = []
     r = 0
-    for c in range(n):
+    for c in range(n_pivot):
         idx = None
         for i in range(r, m):
             if A[i, c]:
@@ -71,7 +72,8 @@ def gf2_solve_particular(H: sp.csr_matrix, s: np.ndarray) -> np.ndarray:
     Hn = _as_dense_uint8(H)
     b = np.asarray(s, dtype=np.uint8).ravel().copy()
     A = np.concatenate([Hn, b[:, None]], axis=1)
-    R, piv = gf2_row_echelon(A)
+    # Only pivot on the original H columns (not the augmented RHS column).
+    R, piv = gf2_row_echelon(A, pivot_cols=Hn.shape[1])
     m, n1 = Hn.shape
     e = np.zeros(n1, dtype=np.uint8)
     for r, c in reversed(piv):
@@ -260,7 +262,12 @@ def ml_parity_project(
     p = np.clip(np.asarray(p_flip, dtype=np.float64), eps, 1 - eps)
     w = np.log((1 - p) / p)
 
-    e0 = gf2_solve_particular(sp.csr_matrix(H_sub), s_sub)  # particular
+    try:
+        e0 = gf2_solve_particular(sp.csr_matrix(H_sub), s_sub)  # particular
+    except Exception:
+        if stats_out is not None:
+            stats_out.update(states_visited=0, states_pruned=0)
+        return greedy_parity_project(sp.csr_matrix(H_sub), s_sub, p_flip)
     N = gf2_nullspace(sp.csr_matrix(H_sub))  # n_sub × r
     r = N.shape[1]
 
@@ -356,7 +363,12 @@ def ml_parity_project_torch(
     w = np.log((1 - p) / p).astype(np.float32)
 
     Hs = sp.csr_matrix(H_sub)
-    e0 = gf2_solve_particular(Hs, s_sub)
+    try:
+        e0 = gf2_solve_particular(Hs, s_sub)
+    except Exception:
+        if stats_out is not None:
+            stats_out.update(states_visited=0, states_pruned=0)
+        return greedy_parity_project(Hs, s_sub, p_flip)
     N = gf2_nullspace(Hs)
     r = int(N.shape[1])
     if r == 0 or r > r_cap:
@@ -546,10 +558,12 @@ class MGHDPrimaryClustered:
         H: sp.csr_matrix,
         mghd: Any,
         *,
+        side: str | None = None,
         halo: int = 0,
         thresh: float = 0.5,
         temp: float = 1.0,
         r_cap: int = 20,
+        projection_mode: str = "always",
         batched: bool = True,
         tier0_enable: bool = True,
         tier0_k_max: int | None = None,
@@ -571,8 +585,12 @@ class MGHDPrimaryClustered:
         self.thresh = float(thresh)
         self.temp = float(temp)
         self.r_cap = int(r_cap)
+        mode = str(projection_mode).strip().lower()
+        if mode not in {"always", "if_needed", "none"}:
+            mode = "always"
+        self.projection_mode = mode
         self.mb_mode = "batched" if batched else "unbatched"
-        self.side = self._infer_side()
+        self.side = self._infer_side(side)
         self.tier0_enable = bool(tier0_enable)
         self.model_version = getattr(self.mghd, "model_version", "v2")
         self.distance = self._infer_distance()
@@ -646,8 +664,13 @@ class MGHDPrimaryClustered:
         except Exception:
             pass
 
-    def _infer_side(self) -> str:
-        return "Z"
+    def _infer_side(self, side: str | None) -> str:
+        if side is None:
+            return "Z"
+        value = str(side).strip().upper()
+        if value not in {"X", "Z"}:
+            raise ValueError(f"Invalid side='{side}'. Expected 'X' or 'Z'.")
+        return value
 
     def decode(self, s: np.ndarray, perf_only: bool = False) -> Dict[str, Any]:
         s = np.asarray(s, dtype=np.uint8).ravel()
@@ -657,17 +680,37 @@ class MGHDPrimaryClustered:
         subproblems: List[Dict[str, Any]] = []
         for checks, qubits in zip(check_comps, qubit_comps):
             H_sub, s_sub, q_l2g, c_l2g = extract_subproblem(H, s, checks, qubits)
+            xy_qubit = self.coords_qubit[q_l2g]
+            xy_check = self.coords_check[c_l2g]
+            all_coords = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
+            mins = all_coords.min(axis=0) if all_coords.size else np.array([0.0, 0.0], dtype=np.float32)
+            maxs = all_coords.max(axis=0) if all_coords.size else np.array([0.0, 0.0], dtype=np.float32)
+            bbox_xywh = (
+                int(mins[0]),
+                int(mins[1]),
+                int(maxs[0] - mins[0] + 1),
+                int(maxs[1] - mins[1] + 1),
+            )
+            k_local = int(H_sub.shape[0])  # local checks
+            r_local = int(H_sub.shape[1])  # local data qubits
             extra_meta = {
-                "xy_qubit": self.coords_qubit[q_l2g],
-                "xy_check": self.coords_check[c_l2g],
-                "k": int(H_sub.shape[1]),
-                "r": int(H_sub.shape[1] - np.linalg.matrix_rank(_as_dense_uint8(H_sub))),
-                "bbox": (0, 0, 1, 1),
-                "kappa_stats": {"size": float(H_sub.shape[0] + H_sub.shape[1])},
+                "xy_qubit": xy_qubit,
+                "xy_check": xy_check,
+                "k": k_local,
+                "r": r_local,
+                "bbox_xywh": bbox_xywh,
+                "kappa_stats": {
+                    "k": k_local,
+                    "r": r_local,
+                    "density": float(k_local / max(1, r_local)),
+                    "syndrome_weight": int(np.asarray(s_sub, dtype=np.uint8).sum()),
+                },
                 "side": self.side,
                 "d": self.distance,
                 "p": float(self.default_p or 0.01),
                 "seed": 0,
+                "add_jump_edges": True,
+                "jump_k": 2,
             }
             subproblems.append(
                 {
@@ -752,24 +795,29 @@ class MGHDPrimaryClustered:
             if probs.shape[0] != H_sub.shape[1]:
                 raise AssertionError("Probability vector length mismatch for subgraph")
             t_p0 = self._time.perf_counter()
-            # First try ML projection (torch-accelerated when available)
-            if _TORCH_OK:
-                try:
-                    e_sub = ml_parity_project_torch(H_sub, s_sub, probs, r_cap=self.r_cap)
-                except Exception:
-                    e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
-            else:
-                e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
-            # Ensure parity constraints are satisfied; if not, fall back to greedy projection.
-            parity = (H_sub @ e_sub) % 2
-            parity = np.asarray(parity).ravel().astype(np.uint8) % 2
             target = s_sub.astype(np.uint8) % 2
-            if not np.array_equal(parity, target):
-                # Fallback: greedy projection is cheap and usually restores parity.
-                # Under circuit-level noise (e.g., CUDA-Q Garnet), syndromes may be
-                # slightly inconsistent with the CSS H due to measurement errors,
-                # so we treat parity mismatches as best-effort rather than fatal.
-                e_sub = greedy_parity_project(H_sub, s_sub, probs)
+            raw_bits = (np.asarray(probs, dtype=np.float64) > float(self.thresh)).astype(np.uint8)
+            if self.projection_mode == "none":
+                e_sub = raw_bits
+            else:
+                use_projection = True
+                if self.projection_mode == "if_needed":
+                    raw_parity = np.asarray((H_sub @ raw_bits) % 2).ravel().astype(np.uint8) % 2
+                    if np.array_equal(raw_parity, target):
+                        use_projection = False
+                if use_projection:
+                    if _TORCH_OK:
+                        try:
+                            e_sub = ml_parity_project_torch(H_sub, s_sub, probs, r_cap=self.r_cap)
+                        except Exception:
+                            e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
+                    else:
+                        e_sub = ml_parity_project(H_sub, s_sub, probs, r_cap=self.r_cap)
+                    parity = np.asarray((H_sub @ e_sub) % 2).ravel().astype(np.uint8) % 2
+                    if not np.array_equal(parity, target):
+                        e_sub = greedy_parity_project(H_sub, s_sub, probs)
+                else:
+                    e_sub = raw_bits
             t_proj += (self._time.perf_counter() - t_p0) * 1e6
             e[q_l2g] ^= e_sub.astype(np.uint8)
 
