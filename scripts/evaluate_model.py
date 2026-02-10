@@ -377,7 +377,7 @@ def evaluate(args):
             decoder_public,
             side="X",
             halo=int(getattr(args, "mghd_halo", 1)),
-            projection_mode=str(getattr(args, "mghd_projection_mode", "always")),
+            projection_mode=str(getattr(args, "mghd_projection_mode", "if_needed")),
             batched=False,
         )
         mghd_X = MGHDPrimaryClustered(
@@ -385,7 +385,7 @@ def evaluate(args):
             decoder_public,
             side="Z",
             halo=int(getattr(args, "mghd_halo", 1)),
-            projection_mode=str(getattr(args, "mghd_projection_mode", "always")),
+            projection_mode=str(getattr(args, "mghd_projection_mode", "if_needed")),
             batched=False,
         )
         
@@ -1365,11 +1365,12 @@ Key samplers:
     parser.add_argument(
         "--mghd-projection-mode",
         type=str,
-        default="always",
+        default="if_needed",
         choices=["always", "if_needed", "none"],
         help=(
             "Parity projection mode inside MGHD clustered decode: "
-            "'always' (default), 'if_needed' (only if raw bits violate parity), "
+            "'if_needed' (default; only if raw bits violate parity), "
+            "'always' (force projection), "
             "or 'none' (raw thresholded bits)."
         ),
     )

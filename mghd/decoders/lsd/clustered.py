@@ -563,7 +563,7 @@ class MGHDPrimaryClustered:
         thresh: float = 0.5,
         temp: float = 1.0,
         r_cap: int = 20,
-        projection_mode: str = "always",
+        projection_mode: str = "if_needed",
         batched: bool = True,
         tier0_enable: bool = True,
         tier0_k_max: int | None = None,
@@ -587,7 +587,7 @@ class MGHDPrimaryClustered:
         self.r_cap = int(r_cap)
         mode = str(projection_mode).strip().lower()
         if mode not in {"always", "if_needed", "none"}:
-            mode = "always"
+            mode = "if_needed"
         self.projection_mode = mode
         self.mb_mode = "batched" if batched else "unbatched"
         self.side = self._infer_side(side)

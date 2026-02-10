@@ -13,16 +13,15 @@ All circuits are constructed as CUDA-Q kernels with proper noise application.
 """
 
 from collections import defaultdict
+import importlib.util
 from typing import Any
 
 import numpy as np
 
-try:
-    import cudaq  # noqa: F401
-
-    CUDAQ_AVAILABLE = True
-except ImportError:
-    CUDAQ_AVAILABLE = False
+# Never import CUDA-Q at module import time; it can initialize CUDA runtime
+# before the training CLI selects devices, which breaks torch CUDA probing.
+CUDAQ_AVAILABLE = importlib.util.find_spec("cudaq") is not None
+if not CUDAQ_AVAILABLE:
     print("Warning: CUDA-Q not available. Using fallback implementation.")
 
 

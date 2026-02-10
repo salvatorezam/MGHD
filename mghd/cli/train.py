@@ -748,6 +748,17 @@ def train_inprocess(ns) -> str:
         ),
     )
     parser.add_argument(
+        "--component-scope",
+        type=str,
+        default="active",
+        choices=["active", "full"],
+        help=(
+            "Crop extraction scope for online mode: "
+            "'active' keeps connected active components (faster), "
+            "'full' keeps one full side graph per shot-side (better global distance signal)."
+        ),
+    )
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -1272,6 +1283,7 @@ def train_inprocess(ns) -> str:
                 [int(x) for x in str(getattr(args, "distance_curriculum", "")).split(",") if x.strip()]
                 or [int(args.distance)]
             ),
+            "component_scope": str(getattr(args, "component_scope", "active")),
             "online": use_online,
             "p": base_p,
             "p_curriculum": p_curriculum_vals if p_curriculum_vals else None,
@@ -2597,17 +2609,61 @@ class OnlineSurfaceDataset(IterableDataset):
         if oracle_label_mode not in {"raw", "channel_ml"}:
             oracle_label_mode = "channel_ml"
 
+        component_scope = str(getattr(self.args, "component_scope", "active")).lower()
         for side in ("Z", "X"):
-            comps = split_components_for_side(
-                side=side,
-                Hx=sample["Hx"],
-                Hz=sample["Hz"],
-                synZ=sample["synZ"],
-                synX=sample["synX"],
-                coords_q=sample["coords_q"],
-                coords_c=sample["coords_c"],
-                halo=int(getattr(self.args, "cluster_halo", 0)),
-            )
+            if component_scope == "full":
+                if side == "Z":
+                    H_sub = np.asarray(sample["Hz"], dtype=np.uint8)
+                    synd_bits_full = np.asarray(sample["synZ"], dtype=np.uint8)
+                    xy_check = np.asarray(sample["coords_c"][: len(synd_bits_full)], dtype=np.float32)
+                else:
+                    H_sub = np.asarray(sample["Hx"], dtype=np.uint8)
+                    synd_bits_full = np.asarray(sample["synX"], dtype=np.uint8)
+                    z_len = len(sample["synZ"])
+                    xy_check = np.asarray(
+                        sample["coords_c"][z_len : z_len + len(synd_bits_full)],
+                        dtype=np.float32,
+                    )
+
+                qubit_indices_full = np.arange(H_sub.shape[1], dtype=np.int32)
+                check_indices_full = np.arange(H_sub.shape[0], dtype=np.int32)
+                xy_qubit_full = np.asarray(sample["coords_q"][qubit_indices_full], dtype=np.float32)
+                all_coords = np.vstack([xy_qubit_full, xy_check])
+                x_min, y_min = all_coords.min(axis=0)
+                x_max, y_max = all_coords.max(axis=0)
+
+                comps = [
+                    {
+                        "H_sub": H_sub,
+                        "xy_qubit": xy_qubit_full,
+                        "xy_check": xy_check,
+                        "synd_bits": synd_bits_full,
+                        "bbox_xywh": [x_min, y_min, x_max - x_min + 1, y_max - y_min + 1],
+                        "k": int(H_sub.shape[0]),
+                        "r": int(H_sub.shape[1]),
+                        "kappa_stats": {
+                            "k": int(H_sub.shape[0]),
+                            "r": int(H_sub.shape[1]),
+                            "density": float(H_sub.shape[0]) / max(1, float(H_sub.shape[1])),
+                            "syndrome_weight": int(synd_bits_full.sum()),
+                            "component_id": 0,
+                            "scope": "full",
+                        },
+                        "qubit_indices": qubit_indices_full,
+                        "check_indices": check_indices_full,
+                    }
+                ]
+            else:
+                comps = split_components_for_side(
+                    side=side,
+                    Hx=sample["Hx"],
+                    Hz=sample["Hz"],
+                    synZ=sample["synZ"],
+                    synX=sample["synX"],
+                    coords_q=sample["coords_q"],
+                    coords_c=sample["coords_c"],
+                    halo=int(getattr(self.args, "cluster_halo", 0)),
+                )
             for comp in comps:
                 H_sub = comp["H_sub"]
                 synd_bits = comp["synd_bits"]
