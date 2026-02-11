@@ -1580,6 +1580,8 @@ def train_inprocess(ns) -> str:
         last_heartbeat = t0
         total_loss = 0.0
         n_items = 0
+        distance_loss_sum: dict[int, float] = defaultdict(float)
+        distance_item_count: dict[int, int] = defaultdict(int)
         if use_online:
             # Select p for this epoch (curriculum if provided)
             if p_list:
@@ -1778,6 +1780,41 @@ def train_inprocess(ns) -> str:
                     batch_size = B
                     total_loss += batch_loss.detach().item() * batch_size
                     n_items += batch_size
+                    with torch.no_grad():
+                        batch_metas = getattr(packed.meta, "batch_metas", None)
+                        if batch_metas:
+                            dist_ids = torch.as_tensor(
+                                [
+                                    int(getattr(meta_i, "d", getattr(args, "distance", 0)))
+                                    for meta_i in batch_metas
+                                ],
+                                device=logits_reshaped.device,
+                                dtype=torch.long,
+                            )
+                            for dist_id in torch.unique(dist_ids):
+                                sample_sel = dist_ids == dist_id
+                                if not bool(torch.any(sample_sel)):
+                                    continue
+                                logits_sel = logits_reshaped[sample_sel].reshape(-1, 2)
+                                mask_sel = node_mask_reshaped[sample_sel].reshape(-1)
+                                type_sel = node_type_reshaped[sample_sel].reshape(-1)
+                                y_sel = packed.y_bits[sample_sel].reshape(-1)
+                                d_loss = bce_binary_head_loss(
+                                    logits_sel,
+                                    mask_sel,
+                                    type_sel,
+                                    y_sel,
+                                    sample_weight=None,
+                                    label_smoothing=args.label_smoothing,
+                                ).detach()
+                                d_key = int(dist_id.item())
+                                d_count = int(sample_sel.sum().item())
+                                distance_loss_sum[d_key] += float(d_loss.item()) * d_count
+                                distance_item_count[d_key] += d_count
+                        else:
+                            d_key = int(getattr(args, "distance", 0))
+                            distance_loss_sum[d_key] += float(batch_loss.detach().item()) * int(batch_size)
+                            distance_item_count[d_key] += int(batch_size)
                     steps_done += 1
 
                     if prog_stride and (steps_done % prog_stride == 0) and rank == 0:
@@ -1805,6 +1842,10 @@ def train_inprocess(ns) -> str:
                             "secs": float(now - t0),
                             "items": int(n_items),
                         }
+                        if distance_item_count:
+                            hb["distance_counts"] = {
+                                str(k): int(v) for k, v in sorted(distance_item_count.items())
+                            }
                         if p_epoch is not None:
                             hb["p"] = float(p_epoch)
                         print(json.dumps(hb, separators=(",", ":")), flush=True)
@@ -1951,7 +1992,26 @@ def train_inprocess(ns) -> str:
         sched.step()
         dt = time.time() - t0
         avg = total_loss / max(n_items, 1)
-        history.append({"epoch": epoch, "loss": avg, "count": n_items, "secs": dt})
+        epoch_distance_loss = {
+            str(k): float(distance_loss_sum[k] / max(distance_item_count.get(k, 1), 1))
+            for k in sorted(distance_loss_sum.keys())
+            if distance_item_count.get(k, 0) > 0
+        }
+        epoch_distance_counts = {
+            str(k): int(distance_item_count[k])
+            for k in sorted(distance_item_count.keys())
+            if distance_item_count[k] > 0
+        }
+        history.append(
+            {
+                "epoch": epoch,
+                "loss": avg,
+                "count": n_items,
+                "secs": dt,
+                "distance_loss": epoch_distance_loss if epoch_distance_loss else None,
+                "distance_counts": epoch_distance_counts if epoch_distance_counts else None,
+            }
+        )
         # Bandit posterior update with simple reward: 1.0 if loss decreased, else 0.0
         if bandit is not None and prev_epoch_loss is not None and ctx_vec is not None:
             reward = 1.0 if avg < prev_epoch_loss else 0.0
@@ -1985,6 +2045,10 @@ def train_inprocess(ns) -> str:
             log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
             if use_online:
                 log_obj["p"] = float(p_epoch if "p_epoch" in locals() else getattr(args, "p", 0.0))
+            if epoch_distance_loss:
+                log_obj["distance_loss"] = epoch_distance_loss
+            if epoch_distance_counts:
+                log_obj["distance_counts"] = epoch_distance_counts
             # Print epoch summary and flush so users see it promptly
             print(json.dumps(log_obj, separators=(",", ":")), flush=True)
 
@@ -2254,10 +2318,23 @@ class OnlineSurfaceDataset(IterableDataset):
                 )
             pending_by_d[distance] = []
 
-        shots_done = 0
-        while shots_done < shots_for_this_worker:
-            # Pick a distance for this shot
-            d = int(rng.choice(self.distances))
+        # Build a balanced per-worker distance schedule for this epoch.
+        # This avoids random distance skew within an epoch and gives cleaner
+        # multi-distance supervision statistics.
+        distance_schedule: list[int] = []
+        if len(self.distances) == 1:
+            distance_schedule = [int(self.distances[0])] * int(shots_for_this_worker)
+        else:
+            repeats, remainder = divmod(int(shots_for_this_worker), len(self.distances))
+            for dist in self.distances:
+                distance_schedule.extend([int(dist)] * int(repeats))
+            if remainder > 0:
+                tail = [int(x) for x in self.distances]
+                rng.shuffle(tail)
+                distance_schedule.extend(tail[:remainder])
+            rng.shuffle(distance_schedule)
+
+        for d in distance_schedule:
 
             # Per-shot seed
             shot_seed = int(rng.integers(0, 2**31 - 1))
@@ -2311,8 +2388,6 @@ class OnlineSurfaceDataset(IterableDataset):
             pending_by_d[d].append((sample, shot_seed, erase_local))
             if len(pending_by_d[d]) >= decode_bs:
                 yield from _flush_distance(d)
-
-            shots_done += 1
 
         for d in list(pending_by_d.keys()):
             if pending_by_d[d]:
@@ -2818,6 +2893,8 @@ class OnlineSurfaceDataset(IterableDataset):
                     S_max=self.args.S_max if hasattr(self.args, "S_max") else 512,
                     g_extra=self.ctx_vec if hasattr(self, "ctx_vec") else None,
                     erase_local=local_erasure,
+                    add_jump_edges=False,
+                    jump_k=1,
                 )
                 # We don't validate contract here to save time, or we can.
                 # _validate_packed_contract(pack, self.args.node_feat_dim, self.args.edge_feat_dim)

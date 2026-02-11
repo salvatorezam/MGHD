@@ -289,7 +289,7 @@ def pack_cluster(
     E_max: Optional[int],
     S_max: Optional[int],
     bucket_spec: Optional[Sequence[Tuple[int, int, int]]] = None,
-    add_jump_edges: bool = True,
+    add_jump_edges: bool = False,
     jump_k: int = 2,
     g_extra: Optional[np.ndarray] = None,
     erase_local: Optional[np.ndarray] = None,
@@ -905,6 +905,12 @@ class MGHDv2(nn.Module):
         self.node_in = nn.Linear(node_feat_dim, d_model)
         self.edge_in = nn.Linear(edge_feat_dim, d_model)
         self.g_proj: nn.Module = nn.Linear(int(g_dim), self.node_in.out_features)
+        # FiLM-style global conditioning:
+        # - g_proj provides additive shift
+        # - g_scale_proj provides bounded multiplicative scale around 1.0
+        self.g_scale_proj: nn.Module = nn.Linear(int(g_dim), self.node_in.out_features)
+        nn.init.zeros_(self.g_scale_proj.weight)
+        nn.init.zeros_(self.g_scale_proj.bias)
 
     def forward(self, packed: PackedCrop) -> Tuple[torch.Tensor, torch.Tensor]:
         x = packed.x_nodes.float()
@@ -924,12 +930,17 @@ class MGHDv2(nn.Module):
             nmask = packed.node_mask.bool()
             node_type = packed.node_type.long()
 
+            x = self.node_in(x)
             if gtok.dim() == 2:
                 g_bias = self.g_proj(gtok).unsqueeze(1).expand(batch_size, nodes_pad, -1)
+                g_scale = self.g_scale_proj(gtok).unsqueeze(1).expand(batch_size, nodes_pad, -1)
             else:
-                g_bias = self.g_proj(gtok.view(-1)).view(1, 1, -1).expand(batch_size, nodes_pad, -1)
+                g_vec = gtok.view(-1)
+                g_bias = self.g_proj(g_vec).view(1, 1, -1).expand(batch_size, nodes_pad, -1)
+                g_scale = self.g_scale_proj(g_vec).view(1, 1, -1).expand(batch_size, nodes_pad, -1)
 
-            x = self.node_in(x) + g_bias
+            # Keep modulation bounded for stable training across p/d sweeps.
+            x = x * (1.0 + 0.5 * torch.tanh(g_scale)) + g_bias
             x = self.seq_encoder(
                 x,
                 packed.seq_idx.long(),
@@ -948,12 +959,18 @@ class MGHDv2(nn.Module):
         nmask = packed.node_mask.bool()
         node_type = packed.node_type.long()
 
+        x = self.node_in(x)
         if gtok.dim() == 2:
             g_bias = self.g_proj(gtok).unsqueeze(1).expand(1, nodes_pad, -1).reshape(nodes_pad, -1)
+            g_scale = (
+                self.g_scale_proj(gtok).unsqueeze(1).expand(1, nodes_pad, -1).reshape(nodes_pad, -1)
+            )
         else:
-            g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0).expand(nodes_pad, -1)
+            g_vec = gtok.view(-1)
+            g_bias = self.g_proj(g_vec).unsqueeze(0).expand(nodes_pad, -1)
+            g_scale = self.g_scale_proj(g_vec).unsqueeze(0).expand(nodes_pad, -1)
 
-        x = self.node_in(x) + g_bias
+        x = x * (1.0 + 0.5 * torch.tanh(g_scale)) + g_bias
         e = self.edge_in(eatt)
         x = self.seq_encoder(
             x,
@@ -1089,6 +1106,21 @@ class MGHDv2(nn.Module):
             layer = nn.Linear(g_dim, self.node_in.out_features)
             layer.to(device)
             self.g_proj = layer
+        scale_in = (
+            getattr(self.g_scale_proj, "in_features", None)
+            if getattr(self, "g_scale_proj", None) is not None
+            else None
+        )
+        if (
+            getattr(self, "g_scale_proj", None) is None
+            or scale_in is None
+            or int(scale_in) != int(g_dim)
+        ):
+            scale = nn.Linear(g_dim, self.node_in.out_features)
+            nn.init.zeros_(scale.weight)
+            nn.init.zeros_(scale.bias)
+            scale.to(device)
+            self.g_scale_proj = scale
 
     def ensure_node_in(self, in_features: int, device: torch.device) -> None:
         if self.node_in.in_features != in_features:

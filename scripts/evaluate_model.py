@@ -377,6 +377,7 @@ def evaluate(args):
             decoder_public,
             side="X",
             halo=int(getattr(args, "mghd_halo", 1)),
+            component_scope=str(getattr(args, "mghd_component_scope", "active")),
             projection_mode=str(getattr(args, "mghd_projection_mode", "if_needed")),
             batched=False,
         )
@@ -385,6 +386,7 @@ def evaluate(args):
             decoder_public,
             side="Z",
             halo=int(getattr(args, "mghd_halo", 1)),
+            component_scope=str(getattr(args, "mghd_component_scope", "active")),
             projection_mode=str(getattr(args, "mghd_projection_mode", "if_needed")),
             batched=False,
         )
@@ -811,6 +813,7 @@ def evaluate(args):
                 "distance": d,
                 "p": p,
                 "mghd_halo": int(getattr(args, "mghd_halo", 1)),
+                "mghd_component_scope": str(getattr(args, "mghd_component_scope", "active")),
                 "x_axis_name": x_axis_name,
                 "x_axis_value": x_axis_value,
                 "resolved_noise": resolved_noise,
@@ -1360,6 +1363,17 @@ Key samplers:
         help=(
             "Cluster halo for MGHDPrimaryClustered during evaluation. "
             "Use 1 to match the training-side component splitter neighborhood."
+        ),
+    )
+    parser.add_argument(
+        "--mghd-component-scope",
+        type=str,
+        default="active",
+        choices=["active", "full"],
+        help=(
+            "Cluster scope for MGHD during evaluation: "
+            "'active' decodes connected active syndrome components (default), "
+            "'full' decodes one full side graph per shot."
         ),
     )
     parser.add_argument(

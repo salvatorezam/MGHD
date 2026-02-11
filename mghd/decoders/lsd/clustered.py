@@ -560,6 +560,7 @@ class MGHDPrimaryClustered:
         *,
         side: str | None = None,
         halo: int = 0,
+        component_scope: str = "active",
         thresh: float = 0.5,
         temp: float = 1.0,
         r_cap: int = 20,
@@ -582,6 +583,10 @@ class MGHDPrimaryClustered:
         self.H = H.tocsr()
         self.mghd = mghd
         self.halo = int(halo)
+        scope = str(component_scope).strip().lower()
+        if scope not in {"active", "full"}:
+            scope = "active"
+        self.component_scope = scope
         self.thresh = float(thresh)
         self.temp = float(temp)
         self.r_cap = int(r_cap)
@@ -676,10 +681,12 @@ class MGHDPrimaryClustered:
         s = np.asarray(s, dtype=np.uint8).ravel()
         H = self.H
 
-        check_comps, qubit_comps = active_components(H, s, halo=self.halo)
         subproblems: List[Dict[str, Any]] = []
-        for checks, qubits in zip(check_comps, qubit_comps):
-            H_sub, s_sub, q_l2g, c_l2g = extract_subproblem(H, s, checks, qubits)
+        if self.component_scope == "full":
+            q_l2g = np.arange(H.shape[1], dtype=np.int64)
+            c_l2g = np.arange(H.shape[0], dtype=np.int64)
+            H_sub = H
+            s_sub = s
             xy_qubit = self.coords_qubit[q_l2g]
             xy_check = self.coords_check[c_l2g]
             all_coords = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
@@ -691,36 +698,89 @@ class MGHDPrimaryClustered:
                 int(maxs[0] - mins[0] + 1),
                 int(maxs[1] - mins[1] + 1),
             )
-            k_local = int(H_sub.shape[0])  # local checks
-            r_local = int(H_sub.shape[1])  # local data qubits
-            extra_meta = {
-                "xy_qubit": xy_qubit,
-                "xy_check": xy_check,
-                "k": k_local,
-                "r": r_local,
-                "bbox_xywh": bbox_xywh,
-                "kappa_stats": {
-                    "k": k_local,
-                    "r": r_local,
-                    "density": float(k_local / max(1, r_local)),
-                    "syndrome_weight": int(np.asarray(s_sub, dtype=np.uint8).sum()),
-                },
-                "side": self.side,
-                "d": self.distance,
-                "p": float(self.default_p or 0.01),
-                "seed": 0,
-                "add_jump_edges": True,
-                "jump_k": 2,
-            }
+            k_local = int(H_sub.shape[0])
+            r_local = int(H_sub.shape[1])
             subproblems.append(
                 {
                     "H_sub": H_sub,
                     "s_sub": s_sub,
                     "q_l2g": q_l2g,
                     "c_l2g": c_l2g,
-                    "extra": extra_meta,
+                    "extra": {
+                        "xy_qubit": xy_qubit,
+                        "xy_check": xy_check,
+                        "k": k_local,
+                        "r": r_local,
+                        "bbox_xywh": bbox_xywh,
+                        "kappa_stats": {
+                            "k": k_local,
+                            "r": r_local,
+                            "density": float(k_local / max(1, r_local)),
+                            "syndrome_weight": int(np.asarray(s_sub, dtype=np.uint8).sum()),
+                            "scope": "full",
+                        },
+                        "side": self.side,
+                        "d": self.distance,
+                        "p": float(self.default_p or 0.01),
+                        "seed": 0,
+                        "add_jump_edges": False,
+                        "jump_k": 1,
+                    },
                 }
             )
+        else:
+            check_comps, qubit_comps = active_components(H, s, halo=self.halo)
+            for checks, qubits in zip(check_comps, qubit_comps):
+                H_sub, s_sub, q_l2g, c_l2g = extract_subproblem(H, s, checks, qubits)
+                xy_qubit = self.coords_qubit[q_l2g]
+                xy_check = self.coords_check[c_l2g]
+                all_coords = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
+                mins = (
+                    all_coords.min(axis=0)
+                    if all_coords.size
+                    else np.array([0.0, 0.0], dtype=np.float32)
+                )
+                maxs = (
+                    all_coords.max(axis=0)
+                    if all_coords.size
+                    else np.array([0.0, 0.0], dtype=np.float32)
+                )
+                bbox_xywh = (
+                    int(mins[0]),
+                    int(mins[1]),
+                    int(maxs[0] - mins[0] + 1),
+                    int(maxs[1] - mins[1] + 1),
+                )
+                k_local = int(H_sub.shape[0])  # local checks
+                r_local = int(H_sub.shape[1])  # local data qubits
+                extra_meta = {
+                    "xy_qubit": xy_qubit,
+                    "xy_check": xy_check,
+                    "k": k_local,
+                    "r": r_local,
+                    "bbox_xywh": bbox_xywh,
+                    "kappa_stats": {
+                        "k": k_local,
+                        "r": r_local,
+                        "density": float(k_local / max(1, r_local)),
+                        "syndrome_weight": int(np.asarray(s_sub, dtype=np.uint8).sum()),
+                    },
+                    "side": self.side,
+                    "d": self.distance,
+                    "p": float(self.default_p or 0.01),
+                    "seed": 0,
+                    "add_jump_edges": False,
+                    "jump_k": 1,
+                }
+                subproblems.append(
+                    {
+                        "H_sub": H_sub,
+                        "s_sub": s_sub,
+                        "q_l2g": q_l2g,
+                        "c_l2g": c_l2g,
+                        "extra": extra_meta,
+                    }
+                )
 
         e = np.zeros(H.shape[1], dtype=np.uint8)
         sizes = [len(x["q_l2g"]) for x in subproblems]
