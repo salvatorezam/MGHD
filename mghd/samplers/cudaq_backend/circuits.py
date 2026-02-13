@@ -13,16 +13,15 @@ All circuits are constructed as CUDA-Q kernels with proper noise application.
 """
 
 from collections import defaultdict
+import importlib.util
 from typing import Any
 
 import numpy as np
 
-try:
-    import cudaq  # noqa: F401
-
-    CUDAQ_AVAILABLE = True
-except ImportError:
-    CUDAQ_AVAILABLE = False
+# Never import CUDA-Q at module import time; it can initialize CUDA runtime
+# before the training CLI selects devices, which breaks torch CUDA probing.
+CUDAQ_AVAILABLE = importlib.util.find_spec("cudaq") is not None
+if not CUDAQ_AVAILABLE:
     print("Warning: CUDA-Q not available. Using fallback implementation.")
 
 
@@ -65,16 +64,26 @@ class CudaQKernel:
 def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Build rotated planar surface code parity-check matrices for arbitrary distance d.
+    
+    IMPORTANT: This matches Stim's rotated_memory_z convention where:
+    - Hz (Z-type stabilizers) detect X errors and have boundaries on left/right
+    - Hx (X-type stabilizers) detect Z errors and have boundaries on top/bottom
 
     Data-qubit indexing: d×d grid, row-major order:
       For d=3: q00=0, q01=1, q02=2, q10=3, q11=4, q12=5, q20=6, q21=7, q22=8
       For d=5: q00=0, q01=1, ..., q04=4, q10=5, ..., q44=24
 
+    The rotated surface code has:
+    - Interior weight-4 plaquette stabilizers at (r+0.5, c+0.5) coordinates
+    - Boundary weight-2 stabilizers on edges
+    - For rotated_memory_z: Z stabilizers on rough boundaries (left/right)
+    - For rotated_memory_z: X stabilizers on smooth boundaries (top/bottom)
+
     Returns:
-      (Hz, Hx) as numpy arrays
-      Hz: (d*(d-1), d*d) - Z stabilizers
-      Hx: ((d-1)*d, d*d) - X stabilizers
-      Columns correspond to data-qubit order 0..(d²-1) in row-major order.
+      (Hz, Hx) as numpy arrays with CSS commutation property: Hx @ Hz.T = 0 (mod 2)
+      Hz: Z stabilizers (detect X errors) - matches Stim's first detectors
+      Hx: X stabilizers (detect Z errors)
+      Each matrix has (d²-1)/2 rows and d² columns.
     """
     try:
         from codes_q import create_rotated_surface_codes  # optional external helper
@@ -84,36 +93,59 @@ def build_H_rotated_general(d: int) -> tuple[np.ndarray, np.ndarray]:
         Hz = css.hz.astype(int)
         return Hz, Hx
     except ImportError:
-        # Fallback: create rotated surface code matrices manually
+        # Build proper rotated surface code matching Stim's rotated_memory_z
         n_data = d * d
-        n_z_checks = d * (d - 1)  # Z stabilizers
-        n_x_checks = (d - 1) * d  # X stabilizers
+        hz_rows: list[np.ndarray] = []
+        hx_rows: list[np.ndarray] = []
 
-        # Initialize matrices
-        Hz = np.zeros((n_z_checks, n_data), dtype=int)
-        Hx = np.zeros((n_x_checks, n_data), dtype=int)
+        def q_index(r: int, c: int) -> int:
+            return r * d + c
 
-        # Build Z stabilizers (horizontal edges in rotated lattice)
-        z_check_idx = 0
-        for row in range(d):
-            for col in range(d - 1):
-                # Z check connects qubits (row, col) and (row, col+1)
-                q1 = row * d + col
-                q2 = row * d + col + 1
-                Hz[z_check_idx, q1] = 1
-                Hz[z_check_idx, q2] = 1
-                z_check_idx += 1
+        # Interior plaquettes: weight-4 stabilizers at (r+0.5, c+0.5)
+        # Stim convention: checkerboard with (r + c) even => Z stabilizer
+        for r in range(d - 1):
+            for c in range(d - 1):
+                qubits = [q_index(r, c), q_index(r + 1, c),
+                          q_index(r, c + 1), q_index(r + 1, c + 1)]
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[qubits] = 1
+                # Stim's rotated_memory_z: (r + c) even => Z stabilizer (detect X)
+                if (r + c) % 2 == 0:
+                    hz_rows.append(row)
+                else:
+                    hx_rows.append(row)
 
-        # Build X stabilizers (vertical edges in rotated lattice)
-        x_check_idx = 0
-        for row in range(d - 1):
-            for col in range(d):
-                # X check connects qubits (row, col) and (row+1, col)
-                q1 = row * d + col
-                q2 = (row + 1) * d + col
-                Hx[x_check_idx, q1] = 1
-                Hx[x_check_idx, q2] = 1
-                x_check_idx += 1
+        # Boundary stabilizers: weight-2
+        # Left boundary (rough): Z stabilizers for rotated_memory_z
+        for r in range(d - 1):
+            if (r + (-1)) % 2 == 0:  # matches interior checkerboard parity
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(r, 0), q_index(r + 1, 0)]] = 1
+                hz_rows.append(row)
+
+        # Right boundary (rough): Z stabilizers
+        for r in range(d - 1):
+            if (r + (d - 1)) % 2 == 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(r, d - 1), q_index(r + 1, d - 1)]] = 1
+                hz_rows.append(row)
+
+        # Top boundary (smooth): X stabilizers
+        for c in range(d - 1):
+            if ((-1) + c) % 2 != 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(0, c), q_index(0, c + 1)]] = 1
+                hx_rows.append(row)
+
+        # Bottom boundary (smooth): X stabilizers
+        for c in range(d - 1):
+            if ((d - 1) + c) % 2 != 0:
+                row = np.zeros(n_data, dtype=np.uint8)
+                row[[q_index(d - 1, c), q_index(d - 1, c + 1)]] = 1
+                hx_rows.append(row)
+
+        Hz = np.vstack(hz_rows) if hz_rows else np.zeros((0, n_data), dtype=np.uint8)
+        Hx = np.vstack(hx_rows) if hx_rows else np.zeros((0, n_data), dtype=np.uint8)
 
         return Hz, Hx
 
@@ -494,68 +526,70 @@ def make_surface_layout_d3_include_edge(edge: tuple[int, int] = (10, 11)) -> dic
     return bad_layout
 
 
-def make_surface_layout_general(d: int) -> dict[str, Any]:
-    """
-    Create a general surface code layout for arbitrary distance d.
+def _make_surface_layout_lattice(d: int) -> dict[str, Any]:
+    """Build a device-agnostic rotated-surface layout on a virtual lattice."""
+    # Derive check structure from the same parity-check matrices used by the
+    # decoder/training pipeline so syndrome dimensions always stay consistent.
+    hz, hx = build_H_rotated_general(d)
+    n_data = int(d * d)
+    n_z_checks = int(hz.shape[0])
+    n_x_checks = int(hx.shape[0])
 
-    Args:
-        d: Code distance
-
-    Returns:
-        Layout dictionary with qubit assignments and gate schedules
-    """
-    if d == 3:
-        return make_surface_layout_d3_avoid_bad_edges()
-
-    n_data = d * d
-    n_z_checks = d * (d - 1)
-    n_x_checks = (d - 1) * d
-
-    # Data qubits: 0 to d²-1 (row-major order)
     data_qubits = list(range(n_data))
-
-    # Ancilla qubits: start after data qubits
     ancilla_z = list(range(n_data, n_data + n_z_checks))
     ancilla_x = list(range(n_data + n_z_checks, n_data + n_z_checks + n_x_checks))
 
-    # Build CZ layers for syndrome extraction
-    # Layer 1: Z stabilizers (horizontal connections)
-    cz_layer_1 = []
-    z_anc_idx = 0
-    for row in range(d):
-        for col in range(d - 1):
-            anc = ancilla_z[z_anc_idx]
-            q1 = row * d + col
-            q2 = row * d + col + 1
-            cz_layer_1.extend([(anc, q1), (anc, q2)])
-            z_anc_idx += 1
+    max_w = 1
+    if hz.size:
+        max_w = max(max_w, int(np.max(np.sum(hz, axis=1))))
+    if hx.size:
+        max_w = max(max_w, int(np.max(np.sum(hx, axis=1))))
+    n_layers = max(1, max_w)
+    cz_layers: list[list[tuple[int, int]]] = [[] for _ in range(n_layers)]
 
-    # Layer 2: X stabilizers (vertical connections)
-    cz_layer_2 = []
-    x_anc_idx = 0
-    for row in range(d - 1):
-        for col in range(d):
-            anc = ancilla_x[x_anc_idx]
-            q1 = row * d + col
-            q2 = (row + 1) * d + col
-            cz_layer_2.extend([(anc, q1), (anc, q2)])
-            x_anc_idx += 1
+    # Z-check ancillas
+    for ci in range(n_z_checks):
+        anc = ancilla_z[ci]
+        q_ids = np.flatnonzero(hz[ci]).astype(int).tolist()
+        for li, q in enumerate(q_ids):
+            cz_layers[li % n_layers].append((anc, int(q)))
 
-    # PRX layers for ancilla reset/measurement
-    prx_layer_z = [(anc, "z") for anc in ancilla_z]  # Z basis for Z stabilizers
-    prx_layer_x = [(anc, "x") for anc in ancilla_x]  # X basis for X stabilizers
+    # X-check ancillas
+    for ci in range(n_x_checks):
+        anc = ancilla_x[ci]
+        q_ids = np.flatnonzero(hx[ci]).astype(int).tolist()
+        for li, q in enumerate(q_ids):
+            cz_layers[li % n_layers].append((anc, int(q)))
+
+    # PRX layers for ancilla prep/measurement
+    prx_layer_z = [(anc, "z") for anc in ancilla_z]
+    prx_layer_x = [(anc, "x") for anc in ancilla_x]
 
     return {
         "data": data_qubits,
         "ancilla_z": ancilla_z,
         "ancilla_x": ancilla_x,
-        "cz_layers": [cz_layer_1, cz_layer_2],
+        "cz_layers": cz_layers,
         "prx_layers": [prx_layer_z, prx_layer_x],
         "total_qubits": n_data + n_z_checks + n_x_checks,
         "distance": d,
         "code_type": "rotated_surface",
         "syndrome_schedule": "alternating",  # Z then X measurements
     }
+
+
+def make_surface_layout_general(d: int, hardware_aware_d3: bool = True) -> dict[str, Any]:
+    """
+    Create a surface code layout for arbitrary distance d.
+
+    Parameters
+    - d: code distance
+    - hardware_aware_d3: when True, keeps the legacy d=3 Garnet-biased layout.
+      When False, uses the virtual lattice layout for d=3 as well.
+    """
+    if d == 3 and hardware_aware_d3:
+        return make_surface_layout_d3_avoid_bad_edges()
+    return _make_surface_layout_lattice(d)
 
 
 def make_surface_layout_d3_avoid_bad_edges() -> dict[str, Any]:
@@ -699,11 +733,8 @@ def build_round_surface(layout: dict[str, Any], round_idx: int) -> CudaQKernel:
         if prx_ops:
             kernel.add_layer(prx_ops, "PRX_PREP")
 
-    # Add CZ layers (typically 2 layers for surface codes)
+    # Add CZ layers (device-agnostic layouts may require >2 sub-layers)
     for layer_idx, cz_layer in enumerate(cz_layers):
-        if layer_idx >= 2:  # Limit to 2 CZ layers per round
-            break
-
         # Filter CZ operations relevant to current stabilizer type
         relevant_czs = []
         for q1, q2 in cz_layer:

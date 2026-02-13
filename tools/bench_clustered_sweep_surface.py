@@ -15,7 +15,7 @@ def sample_round(d: int, p: float, seed: int, profile_path: str | None = None) -
 
     In production, prefer mghd.qpu.adapters.garnet_adapter.sample_round.
     """
-    from mghd.qpu.adapters.garnet_adapter import sample_round as _sr
+    from mghd.qpu.adapters.surface_sampler import sample_round as _sr
 
     return _sr(d=d, p=p, seed=seed, profile_path=profile_path)
 

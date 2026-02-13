@@ -26,6 +26,7 @@ def test_train_inprocess_online_synth(tmp_path, monkeypatch):
     ns.erasure_frac = 0.0
     ns.teacher_mix = "lsd=1.0,mwpf=0.0,mwpm=0.0"
     ns.online_rl = False
+    ns.distance_curriculum = None
     ns.profile = "S"
     ns.ema = 0.999
     ns.lr = 1e-4

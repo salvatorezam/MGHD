@@ -11,18 +11,36 @@ it raises an error and training should stop rather than falling back.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+import importlib.util
 from typing import Any, Optional, Tuple
 
 import numpy as np
 
-try:  # Optional dependency; we import lazily in the constructor.
-    import cudaq_qec as _qec  # type: ignore
+_qec = None  # type: ignore
+_CUDAQ_QEC_IMPORT_ERROR: Exception | None = None
+_HAVE_CUDAQ_QEC = importlib.util.find_spec("cudaq_qec") is not None
 
-    _HAVE_CUDAQ_QEC = True
-except Exception as _exc:  # pragma: no cover - exercised when library missing
-    _qec = None  # type: ignore
-    _HAVE_CUDAQ_QEC = False
-    _CUDAQ_QEC_IMPORT_ERROR: Exception | None = _exc
+
+def _load_cudaq_qec():
+    """Import cudaq_qec lazily to avoid CUDA side effects at module import."""
+    global _qec, _HAVE_CUDAQ_QEC, _CUDAQ_QEC_IMPORT_ERROR
+    if _qec is not None:
+        return _qec
+    if not _HAVE_CUDAQ_QEC:
+        err = _CUDAQ_QEC_IMPORT_ERROR or ModuleNotFoundError("cudaq_qec not installed")
+        raise RuntimeError(
+            "cudaq_qec not available; install cudaq-qec to enable NvQldpcTeacher"
+        ) from err
+    try:
+        _qec = importlib.import_module("cudaq_qec")  # type: ignore
+        return _qec
+    except Exception as exc:  # pragma: no cover - exercised when runtime init fails
+        _CUDAQ_QEC_IMPORT_ERROR = exc
+        _HAVE_CUDAQ_QEC = False
+        raise RuntimeError(
+            "cudaq_qec import failed during NvQldpcTeacher initialization"
+        ) from exc
 
 
 @dataclass
@@ -49,10 +67,7 @@ class NvQldpcTeacher:
     """
 
     def __init__(self, Hx: np.ndarray, Hz: np.ndarray, cfg: NvQldpcConfig | None = None, **extra_kwargs: Any) -> None:
-        if not _HAVE_CUDAQ_QEC:
-            raise RuntimeError(
-                "cudaq_qec not available; install cudaq-qec to enable NvQldpcTeacher"
-            ) from _CUDAQ_QEC_IMPORT_ERROR
+        self._qec = _load_cudaq_qec()
 
         self.Hx = np.asarray(Hx, dtype=np.uint8)
         self.Hz = np.asarray(Hz, dtype=np.uint8)
@@ -88,7 +103,7 @@ class NvQldpcTeacher:
         kwargs.update(self.extra_kwargs)
 
         # qec.get_decoder(name, pcm, **kwargs) -> Decoder
-        return _qec.get_decoder("nv-qldpc-decoder", H, **kwargs)  # type: ignore[arg-type]
+        return self._qec.get_decoder("nv-qldpc-decoder", H, **kwargs)  # type: ignore[arg-type]
 
     def _ensure_decoders(self) -> None:
         if self._dec_x is None:

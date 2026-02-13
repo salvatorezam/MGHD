@@ -102,6 +102,20 @@ def cudaq_sample_surface_wrapper(
     *,
     phys_p: float | None = None,
     noise_scale: float | None = None,
+    noise_model: str | None = None,
+    lambda_scale: float | None = None,
+    noise_ramp: str | None = None,
+    p_data: float | None = None,
+    p_meas: float | None = None,
+    p_1q: float | None = None,
+    p_2q: float | None = None,
+    p_idle: float | None = None,
+    p_meas0: float | None = None,
+    p_meas1: float | None = None,
+    p_hook: float | None = None,
+    p_xtalk: float | None = None,
+    p_erase: float | None = None,
+    p_long_range: float | None = None,
 ) -> np.ndarray:
     """Sample one CUDA-Q surface-code round with circuit-level noise.
 
@@ -124,7 +138,9 @@ def cudaq_sample_surface_wrapper(
     if layout is None:
         from mghd.samplers.cudaq_backend.circuits import make_surface_layout_general
 
-        layout = make_surface_layout_general(d)
+        noise_model_kind = str(os.getenv("MGHD_NOISE_MODEL", "generic_cl")).strip().lower()
+        hardware_aware_d3 = noise_model_kind in {"garnet", "hardware", "profile"}
+        layout = make_surface_layout_general(d, hardware_aware_d3=hardware_aware_d3)
     if rng is None:
         rng = np.random.default_rng()
     from mghd.samplers.cudaq_backend.syndrome_gen import sample_surface_cudaq
@@ -159,6 +175,20 @@ def cudaq_sample_surface_wrapper(
             phys_p=phys_p,
             noise_scale=noise_scale,
             profile_json=profile_json,
+            noise_model=noise_model,
+            lambda_scale=lambda_scale,
+            noise_ramp=noise_ramp,
+            p_data=p_data,
+            p_meas=p_meas,
+            p_1q=p_1q,
+            p_2q=p_2q,
+            p_idle=p_idle,
+            p_meas0=p_meas0,
+            p_meas1=p_meas1,
+            p_hook=p_hook,
+            p_xtalk=p_xtalk,
+            p_erase=p_erase,
+            p_long_range=p_long_range,
         )
     expected_x = len(layout.get("ancilla_x", []))
     expected_z = len(layout.get("ancilla_z", []))
@@ -287,7 +317,12 @@ class CudaQSampler:
         if self.mode not in {"foundation", "student"}:
             self.mode = "foundation"
         self.rounds = int(self.profile_kwargs.get("rounds", 3))
-        self.inject_erasure_frac = float(self.profile_kwargs.pop("inject_erasure_frac", 0.0))
+        inject_erase = self.profile_kwargs.pop("inject_erasure_frac", None)
+        if inject_erase is None:
+            inject_erase = self.profile_kwargs.get("p_erase", None)
+        if inject_erase is None:
+            inject_erase = os.getenv("MGHD_P_ERASE", "0.0")
+        self.inject_erasure_frac = float(inject_erase)
         self.emit_obs = bool(self.profile_kwargs.pop("emit_obs", True))
         # Lazy import of user's modules (keeps repo portable)
         self._gpu_noise = self._maybe_import("cudaq_backend.garnet_noise", "make_garnet_noise")
@@ -402,10 +437,26 @@ class CudaQSampler:
     def _surface_kwargs(self) -> dict[str, Any]:
         """Extract sampler tuning fields for surface-code backend."""
         extra: dict[str, Any] = {}
-        if "phys_p" in self.profile_kwargs:
-            extra["phys_p"] = self.profile_kwargs["phys_p"]
-        if "noise_scale" in self.profile_kwargs:
-            extra["noise_scale"] = self.profile_kwargs["noise_scale"]
+        for key in (
+            "phys_p",
+            "noise_scale",
+            "noise_model",
+            "lambda_scale",
+            "noise_ramp",
+            "p_data",
+            "p_meas",
+            "p_1q",
+            "p_2q",
+            "p_idle",
+            "p_meas0",
+            "p_meas1",
+            "p_hook",
+            "p_xtalk",
+            "p_erase",
+            "p_long_range",
+        ):
+            if key in self.profile_kwargs:
+                extra[key] = self.profile_kwargs[key]
         return extra
 
     def _sample_surface(

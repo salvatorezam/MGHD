@@ -55,11 +55,19 @@ class MWPMatchingContext:
             return self._decode_fallback(H_sub, synd_bits, side)
 
     def _decode_fallback(self, H_sub: np.ndarray, synd_bits: np.ndarray, side: str):
-        """Fallback decoder when pymatching is not available"""
-        n_qubits = H_sub.shape[1]
+        """Fallback when PyMatching is unavailable or fails.
 
-        # Return maximum weight correction as a conservative fallback
-        correction = np.ones(n_qubits, dtype=np.uint8)
-        weight = n_qubits
+        We must still return a parity-valid correction. Using an all-ones vector
+        is catastrophically wrong and masks bugs. Instead, project onto the
+        syndrome coset via the existing GF(2) ML projector.
+        """
+        from mghd.decoders.lsd.clustered import ml_parity_project
+        import scipy.sparse as sp
 
-        return correction, weight
+        H = sp.csr_matrix((H_sub % 2).astype(np.uint8))
+        s = (np.asarray(synd_bits, dtype=np.uint8) & 1).ravel()
+        # Any uniform p<0.5 yields the same min-weight objective up to scale.
+        p_uniform = np.full(H.shape[1], 0.1, dtype=np.float64)
+        correction = ml_parity_project(H, s, p_uniform)
+        correction_uint8 = correction.astype(np.uint8)
+        return correction_uint8, int(correction_uint8.sum())

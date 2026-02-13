@@ -4,7 +4,7 @@ import numpy as np
 from mghd.qpu.adapters.surface_sampler import sample_round
 
 
-def test_garnet_adapter_synthetic_shapes(monkeypatch):
+def test_surface_sampler_synthetic_shapes(monkeypatch):
     monkeypatch.setenv("MGHD_SYNTHETIC", "1")
     out = sample_round(d=3, p=0.01, seed=0)
     Hx = out["Hx"]

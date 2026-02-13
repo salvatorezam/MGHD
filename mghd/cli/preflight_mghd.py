@@ -172,13 +172,13 @@ def run(cmd: Iterable[str], log_path: Path) -> subprocess.CompletedProcess[str]:
 
 
 LER_PATTERN = re.compile(
-    r"LER(?:_(?P<kind>dem|mix))?\s*[:=]\s*(?P<value>[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)"
+    r"LER(?:_(?P<kind>mix))?\s*[:=]\s*(?P<value>[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)"
 )
 
 
 def parse_ler(stdout: str) -> dict[str, float | None]:
-    """Extract LER_dem and LER_mix (if present) from teacher_eval output."""
-    results: dict[str, float | None] = {"dem": None, "mix": None}
+    """Extract LER_mix (if present) from teacher_eval output."""
+    results: dict[str, float | None] = {"mix": None}
     for match in LER_PATTERN.finditer(stdout):
         kind = match.group("kind") or "mix"
         try:
@@ -206,7 +206,6 @@ def summarize(rows: Iterable[StepResult]) -> None:
         ler = row.details.get("ler")
         if isinstance(ler, dict):
             ler_parts = [
-                f"LER_dem={ler['dem']:.4f}" if ler.get("dem") is not None else None,
                 f"LER_mix={ler['mix']:.4f}" if ler.get("mix") is not None else None,
             ]
             ler_text = ", ".join(filter(None, ler_parts))
@@ -223,10 +222,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--distances", default="5")
     parser.add_argument("--shots-per-batch", type=int, default=64)
     parser.add_argument("--batches", type=int, default=50)
-    parser.add_argument("--dem-rounds", type=int, default=5)
+    parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--qpu-profile", default="mghd/qpu/profiles/iqm_garnet_example.json")
     parser.add_argument("--context-source", default="qiskit")
-    parser.add_argument("--max-ler-dem", type=float, default=0.10)
     parser.add_argument("--max-ler-mix", type=float, default=0.10)
     parser.add_argument(
         "--pytest",
@@ -283,8 +281,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         write_skip_log(artifact_root / "pytest.txt", "pytest skipped by --no-pytest flag")
         summary_rows.append(StepResult("pytest", "skip", {"note": "skipped"}))
 
-    # 3) Stim + DEM correlated matching
-    section("Stim + DEM A/B")
+    # 3) Stim teacher A/B
+    section("Stim Teacher A/B")
     stim_cmd = [
         sys.executable,
         "-m",
@@ -295,32 +293,27 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.distances,
         "--sampler",
         "stim",
-        "--dem-enable",
-        "--dem-correlated",
-        "--dem-rounds",
-        str(args.dem_rounds),
+        "--rounds",
+        str(args.rounds),
         "--shots-per-batch",
         str(args.shots_per_batch),
         "--batches",
         str(args.batches),
     ]
-    stim_result = run(stim_cmd, artifact_root / "stim_dem.txt")
+    stim_result = run(stim_cmd, artifact_root / "stim.txt")
     stim_ler = parse_ler(stim_result.stdout)
     stim_ok = stim_result.returncode == 0
     notes: list[str] = []
-    if stim_ler["dem"] is not None and stim_ler["dem"] > args.max_ler_dem:
-        stim_ok = False
-        notes.append(f"LER_dem {stim_ler['dem']:.4f} > {args.max_ler_dem:.4f}")
     if stim_ler["mix"] is not None and stim_ler["mix"] > args.max_ler_mix:
         stim_ok = False
         notes.append(f"LER_mix {stim_ler['mix']:.4f} > {args.max_ler_mix:.4f}")
-    if stim_ler["dem"] is None and stim_ler["mix"] is None:
+    if stim_ler["mix"] is None:
         notes.append("LER metrics not found")
     stim_status = "pass" if stim_ok else "fail"
     stim_detail = {"returncode": stim_result.returncode, "ler": stim_ler}
     if notes:
         stim_detail["note"] = "; ".join(notes)
-    summary_rows.append(StepResult("stim_dem", stim_status, stim_detail))
+    summary_rows.append(StepResult("stim", stim_status, stim_detail))
 
     # 4) CUDA-Q smoke
     cudaq_log = artifact_root / "cudaq.txt"
@@ -384,7 +377,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if row.status != "pass":
             overall_ok = False
             break
-    if not any(row.name == "stim_dem" and row.status == "pass" for row in summary_rows):
+    if not any(row.name == "stim" and row.status == "pass" for row in summary_rows):
         overall_ok = False
 
     return 0 if overall_ok else 1

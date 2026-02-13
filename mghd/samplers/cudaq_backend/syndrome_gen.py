@@ -9,6 +9,7 @@ The implementation follows the IQM Garnet noise model with proper idle noise,
 gate depolarizing noise, and measurement assignment errors.
 """
 
+import os
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,58 @@ from .circuits import (
 from .garnet_noise import GarnetFoundationPriors, GarnetNoiseModel, GarnetStudentCalibration
 
 
+class GenericCircuitNoiseModel:
+    """Device-agnostic circuit-level noise model for scalable distance sweeps.
+
+    Uses per-operation base probabilities that are globally scaled by the same
+    complementary transform used in the Garnet model:
+      p' = 1 - (1 - p)**scale
+    """
+
+    def __init__(
+        self,
+        *,
+        p_1q: float = 0.0015,
+        p_2q: float = 0.01,
+        p_idle: float = 0.0008,
+        p_meas0: float = 0.02,
+        p_meas1: float = 0.02,
+        p_hook: float = 0.0,
+        p_crosstalk: float = 0.0,
+        idle_ref_ns: float = 20.0,
+        scale: float = 1.0,
+    ) -> None:
+        self.p_1q = float(np.clip(p_1q, 0.0, 1.0))
+        self.p_2q = float(np.clip(p_2q, 0.0, 1.0))
+        self.p_idle = float(np.clip(p_idle, 0.0, 1.0))
+        self.p_meas0 = float(np.clip(p_meas0, 0.0, 1.0))
+        self.p_meas1 = float(np.clip(p_meas1, 0.0, 1.0))
+        self.hook_prob = float(np.clip(p_hook, 0.0, 1.0))
+        self.crosstalk_prob = float(np.clip(p_crosstalk, 0.0, 1.0))
+        self.idle_ref_ns = max(1e-9, float(idle_ref_ns))
+        self.scale = max(0.0, float(scale))
+
+    def _scaled(self, p: float) -> float:
+        p_clip = float(np.clip(p, 0.0, 1.0))
+        return float(1.0 - (1.0 - p_clip) ** self.scale)
+
+    def depol_1q_p(self, _q: int) -> float:
+        return self._scaled(self.p_1q)
+
+    def depol_2q_p(self, _edge: tuple[int, int]) -> float:
+        return self._scaled(self.p_2q)
+
+    def idle_params(self, _q: int, dt_ns: float) -> tuple[float, float]:
+        # Scale idle noise with layer duration, split into amp+dephase terms.
+        steps = max(0.0, float(dt_ns) / self.idle_ref_ns)
+        p_idle_dur = float(1.0 - (1.0 - self.p_idle) ** steps)
+        p_idle_scaled = self._scaled(p_idle_dur)
+        return 0.5 * p_idle_scaled, 0.5 * p_idle_scaled
+
+    def meas_asym_errors(self, _q: int) -> tuple[float, float]:
+        return self._scaled(self.p_meas0), self._scaled(self.p_meas1)
+
+
 class CudaQSimulator:
     """
     CUDA-Q quantum simulator for circuit-level noise simulation.
@@ -31,7 +84,7 @@ class CudaQSimulator:
     measurement assignment errors.
     """
 
-    def __init__(self, noise_model: GarnetNoiseModel, batch_size: int, rng: np.random.Generator):
+    def __init__(self, noise_model: Any, batch_size: int, rng: np.random.Generator):
         """
         Initialize simulator with noise model and batch configuration.
 
@@ -170,6 +223,25 @@ class CudaQSimulator:
                 elif target_pauli == 3:  # Z
                     self.pauli_z_errors[traj_idx, target] ^= 1
 
+        # Optional hook-error term (correlated pair flips on CZ participants).
+        hook_p = float(getattr(self.noise_model, "hook_prob", 0.0) or 0.0)
+        if hook_p > 0.0:
+            hook_events = self.rng.random(self.batch_size) < hook_p
+            if np.any(hook_events):
+                idx = np.where(hook_events)[0]
+                # 0 => ZZ pair, 1 => XX pair
+                kind = self.rng.integers(0, 2, size=idx.size)
+                zz_idx = idx[kind == 0]
+                xx_idx = idx[kind == 1]
+                if zz_idx.size:
+                    self.pauli_z_errors[zz_idx, control] ^= 1
+                    self.pauli_z_errors[zz_idx, target] ^= 1
+                if xx_idx.size:
+                    self.pauli_x_errors[xx_idx, control] ^= 1
+                    self.pauli_x_errors[xx_idx, target] ^= 1
+                    self.qubit_states[xx_idx, control] ^= 1
+                    self.qubit_states[xx_idx, target] ^= 1
+
     def measure_qubit(self, qubit: int) -> np.ndarray:
         """
         Measure qubit in Z-basis with assignment errors.
@@ -254,6 +326,17 @@ def simulate_circuit_with_noise(kernel, simulator: CudaQSimulator) -> dict[str, 
                 qubit = qubits[0]
                 results = simulator.measure_qubit(qubit)
                 measurement_results[f"layer_{layer_idx}_qubit_{qubit}"] = results
+
+        # Optional spectator crosstalk term applied per active layer.
+        crosstalk_p = float(getattr(simulator.noise_model, "crosstalk_prob", 0.0) or 0.0)
+        if crosstalk_p > 0.0 and active_qubits:
+            spectators = list(all_qubits - active_qubits)
+            if spectators:
+                events = simulator.rng.random((simulator.batch_size, len(spectators))) < crosstalk_p
+                for idx, q in enumerate(spectators):
+                    hit = events[:, idx]
+                    if np.any(hit):
+                        simulator.pauli_z_errors[hit, q] ^= 1
 
     # Get final error states
     x_errors, z_errors = simulator.get_final_errors()
@@ -499,6 +582,20 @@ def sample_surface_cudaq(
     phys_p: float = None,
     noise_scale: float = None,
     profile_json: str | None = None,
+    noise_model: str | None = None,
+    lambda_scale: float | None = None,
+    noise_ramp: str | None = None,
+    p_data: float | None = None,
+    p_meas: float | None = None,
+    p_1q: float | None = None,
+    p_2q: float | None = None,
+    p_idle: float | None = None,
+    p_meas0: float | None = None,
+    p_meas1: float | None = None,
+    p_hook: float | None = None,
+    p_xtalk: float | None = None,
+    p_erase: float | None = None,
+    p_long_range: float | None = None,
 ) -> np.ndarray:
     """
     Sample surface code syndromes using CUDA-Q with circuit-level noise.
@@ -514,19 +611,6 @@ def sample_surface_cudaq(
     Returns:
         Packed syndrome + error array matching the legacy training format
     """
-    # Initialize noise model based on mode
-    if profile_json:
-        params = _params_from_qpu_profile_json(profile_json)
-    else:
-        if mode == "foundation":
-            priors = GarnetFoundationPriors()
-            params = priors.sample_pseudo_device(rng, n_qubits=20)
-        elif mode == "student":
-            calibration = GarnetStudentCalibration(n_qubits=20)
-            params = calibration.to_dict()
-        else:
-            raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
-
     # Determine noise scaling from requested phys_p or explicit noise_scale
     scale = 1.0
     if noise_scale is not None:
@@ -539,11 +623,127 @@ def sample_surface_cudaq(
         # Use a heuristic baseline p_ref for d=3, e.g., 0.03 (mid acceptance grid).
         p_ref = 0.03
         try:
-            scale = max(0.1, min(5.0, float(phys_p) / p_ref))
+            # Keep a tiny floor for numerical stability, but do not quantize
+            # low-p regimes into a single scale bucket.
+            scale = max(1e-3, min(5.0, float(phys_p) / p_ref))
         except Exception:
             scale = 1.0
 
-    noise_model = GarnetNoiseModel(params, scale=scale)
+    # Preferred backend: native CUDA-Q shot trajectories with Kraus-channel
+    # noise model. This is the clean circuit-level path for sampler='cudaq'.
+    backend_kind = str(os.getenv("MGHD_CUDAQ_BACKEND", "trajectory_kraus")).strip().lower()
+    if backend_kind in {"trajectory_kraus", "trajectory", "kraus"}:
+        try:
+            from .trajectory_kraus import sample_surface_trajectory_kraus
+
+            def _env_float(name: str) -> float | None:
+                val = os.getenv(name, None)
+                if val is None or str(val).strip() == "":
+                    return None
+                try:
+                    return float(val)
+                except Exception:
+                    return None
+
+            traj_seed = int(rng.integers(0, np.iinfo(np.int32).max))
+            overrides = {
+                "noise_model": noise_model if noise_model is not None else os.getenv("MGHD_NOISE_MODEL", None),
+                "noise_ramp": noise_ramp if noise_ramp is not None else os.getenv("MGHD_NOISE_RAMP", None),
+                "lambda_scale": (
+                    float(lambda_scale)
+                    if lambda_scale is not None
+                    else _env_float("MGHD_LAMBDA_SCALE")
+                ),
+                "p_data": p_data if p_data is not None else _env_float("MGHD_P_DATA"),
+                "p_meas": p_meas if p_meas is not None else _env_float("MGHD_P_MEAS"),
+                "p_1q": p_1q if p_1q is not None else _env_float("MGHD_P_1Q"),
+                "p_2q": p_2q if p_2q is not None else _env_float("MGHD_P_2Q"),
+                "p_idle": p_idle if p_idle is not None else _env_float("MGHD_P_IDLE"),
+                "p_meas0": p_meas0 if p_meas0 is not None else _env_float("MGHD_P_MEAS0"),
+                "p_meas1": p_meas1 if p_meas1 is not None else _env_float("MGHD_P_MEAS1"),
+                "p_hook": p_hook if p_hook is not None else _env_float("MGHD_P_HOOK"),
+                "p_xtalk": p_xtalk if p_xtalk is not None else _env_float("MGHD_P_XTALK"),
+                "p_erase": p_erase if p_erase is not None else _env_float("MGHD_P_ERASE"),
+                "p_long_range": (
+                    p_long_range if p_long_range is not None else _env_float("MGHD_P_LONG_RANGE")
+                ),
+            }
+            overrides = {k: v for k, v in overrides.items() if v is not None}
+            traj = sample_surface_trajectory_kraus(
+                layout=layout,
+                batch_size=batch_size,
+                rounds=max(T, 2),
+                phys_p=phys_p,
+                noise_scale=(noise_scale if noise_scale is not None else lambda_scale),
+                seed=traj_seed,
+                noise_overrides=overrides,
+            )
+            syn_x = np.asarray(traj["syn_x"], dtype=np.uint8)
+            syn_z = np.asarray(traj["syn_z"], dtype=np.uint8)
+            data_readout = np.asarray(traj["data_readout"], dtype=np.uint8)
+
+            # Keep legacy packed contract used by sampler wrappers:
+            # [synX | 2*synZ | (x_err + 2*z_err)].
+            # For native trajectories, we expose final Z-basis data readout as
+            # an X-error proxy and keep Z-error proxy at zero.
+            synd_block = np.concatenate([syn_x, (syn_z << 1)], axis=1).astype(np.uint8)
+            err_x = (data_readout & 1).astype(np.uint8)
+            err_z = np.zeros_like(err_x, dtype=np.uint8)
+            err_block = (err_x + 2 * err_z).astype(np.uint8)
+            packed = np.concatenate([synd_block, err_block], axis=1).astype(np.uint8)
+            return packed
+        except Exception as exc:
+            strict_backend = os.getenv("MGHD_CUDAQ_BACKEND_STRICT", "0") == "1"
+            if strict_backend:
+                raise RuntimeError(
+                    "MGHD_CUDAQ_BACKEND=trajectory_kraus failed and strict mode is enabled."
+                ) from exc
+            print(
+                "Warning: native CUDA-Q Kraus trajectory backend failed; "
+                f"falling back to legacy simulator path ({exc})."
+            )
+
+    # Resolve noise model family:
+    # - explicit MGHD_NOISE_MODEL env if set
+    # - default to Garnet when a hardware profile is provided
+    # - otherwise default to the scalable generic circuit-level model
+    noise_model_kind = str(os.getenv("MGHD_NOISE_MODEL", "")).strip().lower()
+    if not noise_model_kind:
+        noise_model_kind = "garnet" if profile_json else "generic_cl"
+
+    if noise_model_kind in {"generic", "generic_cl", "generic-circuit"}:
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, default))
+            except Exception:
+                return float(default)
+
+        noise_model = GenericCircuitNoiseModel(
+            p_1q=_env_float("MGHD_GENERIC_P1Q", 0.0015),
+            p_2q=_env_float("MGHD_GENERIC_P2Q", 0.01),
+            p_idle=_env_float("MGHD_GENERIC_PIDLE", 0.0008),
+            p_meas0=_env_float("MGHD_GENERIC_PMEAS0", 0.02),
+            p_meas1=_env_float("MGHD_GENERIC_PMEAS1", 0.02),
+            p_hook=_env_float("MGHD_GENERIC_PHOOK", 0.0),
+            p_crosstalk=_env_float("MGHD_GENERIC_PCROSSTALK", 0.0),
+            idle_ref_ns=_env_float("MGHD_GENERIC_IDLE_REF_NS", 20.0),
+            scale=scale,
+        )
+    else:
+        # Garnet hardware-aware profile path
+        if profile_json:
+            params = _params_from_qpu_profile_json(profile_json)
+        else:
+            if mode == "foundation":
+                priors = GarnetFoundationPriors()
+                params = priors.sample_pseudo_device(rng, n_qubits=20)
+            elif mode == "student":
+                calibration = GarnetStudentCalibration(n_qubits=20)
+                params = calibration.to_dict()
+            else:
+                raise ValueError(f"Invalid mode: {mode}. Must be 'foundation' or 'student'")
+        noise_model = GarnetNoiseModel(params, scale=scale)
+
     simulator = CudaQSimulator(noise_model, batch_size, rng)
 
     # Optional rotated layout override for d=3

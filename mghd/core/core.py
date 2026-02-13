@@ -56,9 +56,15 @@ def to_dict(cfg: MGHDConfig) -> Dict[str, Any]:
 def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
     """Return rotated surface code parity-check matrix for odd distance d.
 
-    This constructs a simple rotated surface code adjacency where each check
-    touches up to 5 data qubits (center + 4-neighbors) depending on lattice
-    bounds. It matches the previous helper in mghd.codes.pcm_real.
+    Constructs the proper rotated planar surface code where stabilizers are
+    centered on plaquettes (at half-integer lattice coordinates), not on data qubits.
+
+    Interior stabilizers have weight 4, boundary stabilizers have weight 2.
+    The stabilizer type alternates in a checkerboard pattern on the dual lattice.
+
+    For X-memory configuration:
+    - X stabilizers (detect Z errors): on rough boundaries (left/right) + interior
+    - Z stabilizers (detect X errors): on smooth boundaries (top/bottom) + interior
     """
     if d % 2 == 0 or d < 1:
         raise ValueError("rotated_surface_pcm requires odd d >= 1")
@@ -68,6 +74,8 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
         raise ValueError("side must be 'X' or 'Z'")
 
     n_qubits = d * d
+    # For rotated surface code: (d-1)^2/2 interior + boundary stabilizers
+    # Total stabilizers = d^2 - 1 (split evenly between X and Z)
     n_checks = (d * d - 1) // 2
 
     rows: List[int] = []
@@ -77,33 +85,57 @@ def rotated_surface_pcm(d: int, side: str) -> sp.csr_matrix:
     def q_index(r: int, c: int) -> int:
         return r * d + c
 
-    center = d // 2
-
-    for r in range(d):
-        for c in range(d):
+    # Interior plaquettes: weight-4 stabilizers
+    for r in range(d - 1):
+        for c in range(d - 1):
             parity = (r + c) % 2
-            include = False
-            if side == "Z":
-                include = parity == 1
-            else:  # side == 'X'
-                include = (parity == 0) and not (r == center and c == center)
-            if not include:
-                continue
+            # X stabilizers at even parity, Z at odd
+            is_x_type = parity == 0
+            if (side == "X" and is_x_type) or (side == "Z" and not is_x_type):
+                qubits = [
+                    q_index(r, c),
+                    q_index(r + 1, c),
+                    q_index(r, c + 1),
+                    q_index(r + 1, c + 1),
+                ]
+                for q in qubits:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
 
-            qubits = {q_index(r, c)}
-            if r - 1 >= 0:
-                qubits.add(q_index(r - 1, c))
-            if r + 1 < d:
-                qubits.add(q_index(r + 1, c))
-            if c - 1 >= 0:
-                qubits.add(q_index(r, c - 1))
-            if c + 1 < d:
-                qubits.add(q_index(r, c + 1))
-
-            for q in sorted(qubits):
-                rows.append(row_idx)
-                cols.append(q)
-            row_idx += 1
+    # Boundary stabilizers: weight-2
+    if side == "Z":
+        # Z stabilizers on smooth boundaries (top and bottom)
+        # Top: where parity at virtual row -1 would be odd
+        for c in range(d - 1):
+            if ((-1) + c) % 2 != 0:
+                for q in [q_index(0, c), q_index(0, c + 1)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
+        # Bottom
+        for c in range(d - 1):
+            if ((d - 1) + c) % 2 != 0:
+                for q in [q_index(d - 1, c), q_index(d - 1, c + 1)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
+    else:  # side == "X"
+        # X stabilizers on rough boundaries (left and right)
+        # Left: where parity at virtual col -1 would be even
+        for r in range(d - 1):
+            if (r + (-1)) % 2 == 0:
+                for q in [q_index(r, 0), q_index(r + 1, 0)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
+        # Right
+        for r in range(d - 1):
+            if (r + (d - 1)) % 2 == 0:
+                for q in [q_index(r, d - 1), q_index(r + 1, d - 1)]:
+                    rows.append(row_idx)
+                    cols.append(q)
+                row_idx += 1
 
     if row_idx != n_checks:
         raise AssertionError(f"Constructed {row_idx} checks, expected {n_checks}")
@@ -151,10 +183,14 @@ class PackedCrop:
     seq_mask: torch.Tensor
     g_token: torch.Tensor
     y_bits: torch.Tensor
+    s_sub: torch.Tensor  # (S_max,) padded syndrome bits for checks (row order of H_sub)
     meta: CropMeta
     H_sub: np.ndarray | None = None
     idx_data_local: np.ndarray | None = None
     idx_check_local: np.ndarray | None = None
+
+
+SYND_FEAT_IDX = 8  # after xy(2), type(1), degree(1), k/r/bw/bh(4) => 8 dims
 
 
 def _degree_from_Hsub(H_sub: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -253,7 +289,7 @@ def pack_cluster(
     E_max: Optional[int],
     S_max: Optional[int],
     bucket_spec: Optional[Sequence[Tuple[int, int, int]]] = None,
-    add_jump_edges: bool = True,
+    add_jump_edges: bool = False,
     jump_k: int = 2,
     g_extra: Optional[np.ndarray] = None,
     erase_local: Optional[np.ndarray] = None,
@@ -279,7 +315,38 @@ def pack_cluster(
     xy01 = np.vstack([xy_q01, xy_c01]).astype(np.float32)
 
     _, _, bw, bh = bbox_xywh
+    x0, y0, bw, bh = bbox_xywh
     g_list: List[float] = [float(k), float(r), float(bw), float(bh)]
+    # Always expose global regime metadata so the model can separate distance/noise regimes.
+    p_safe = float(max(float(p), 1e-12))
+    g_list.extend([float(d), p_safe, float(math.log10(p_safe))])
+    # Boundary-awareness features (critical for distance scaling on surface codes).
+    # Local bbox-normalized coordinates alone are translationally ambiguous; add
+    # global crop position and boundary proximity so d=3/d=5 regimes are separable.
+    lattice_span = float(max(1, 2 * max(int(d) - 1, 1)))
+    x_min_g = 0.0
+    x_max_g = float(max(0, 2 * (int(d) - 1)))
+    y_min_g = float(-(int(d) - 1))
+    y_max_g = float(int(d) - 1)
+
+    x1 = float(x0 + max(int(bw) - 1, 0))
+    y1 = float(y0 + max(int(bh) - 1, 0))
+    cx = 0.5 * (float(x0) + x1)
+    cy = 0.5 * (float(y0) + y1)
+
+    cx01 = float(np.clip((cx - x_min_g) / max(1.0, x_max_g - x_min_g), 0.0, 1.0))
+    cy01 = float(np.clip((cy - y_min_g) / max(1.0, y_max_g - y_min_g), 0.0, 1.0))
+    bw01 = float(np.clip(float(max(int(bw), 1)) / (lattice_span + 1.0), 0.0, 1.0))
+    bh01 = float(np.clip(float(max(int(bh), 1)) / (lattice_span + 1.0), 0.0, 1.0))
+
+    dist_left = max(0.0, float(x0) - x_min_g)
+    dist_right = max(0.0, x_max_g - x1)
+    dist_bottom = max(0.0, float(y0) - y_min_g)
+    dist_top = max(0.0, y_max_g - y1)
+    min_bdry01 = float(
+        np.clip(min(dist_left, dist_right, dist_bottom, dist_top) / max(1.0, lattice_span), 0.0, 1.0)
+    )
+    g_list.extend([cx01, cy01, bw01, bh01, min_bdry01])
     for key in ("size", "radius", "ecc", "bdensity"):
         if key in kappa_stats:
             g_list.append(float(kappa_stats[key]))
@@ -304,6 +371,8 @@ def pack_cluster(
         er = None
 
     # Base per-node features (8 dims): xy(2), type(1), degree(1), k/r/bw/bh(4)
+    # Append syndrome as feature index 8 (on check nodes only). If erasure is
+    # enabled, it becomes the final feature dim.
     parts = [
         xy01,
         node_type[:, None].astype(np.float32),
@@ -313,6 +382,14 @@ def pack_cluster(
         np.full((nQ + nC, 1), float(bw), dtype=np.float32),
         np.full((nQ + nC, 1), float(bh), dtype=np.float32),
     ]
+    synd = np.asarray(synd_Z_then_X_bits, dtype=np.uint8).ravel() & 1
+    if synd.size < nC:
+        synd = np.pad(synd, (0, nC - synd.size), mode="constant")
+    elif synd.size > nC:
+        synd = synd[:nC]
+    synd_col = np.zeros((nQ + nC, 1), dtype=np.float32)
+    synd_col[nQ:, 0] = synd.astype(np.float32)
+    parts.append(synd_col)
     # Optional per-node erasure flag (only when provided): adds +1 feature dim
     if er is not None:
         er_col = np.concatenate([er.astype(np.float32), np.zeros(nC, dtype=np.float32)])[:, None]
@@ -348,7 +425,9 @@ def pack_cluster(
             edge_attr = np.concatenate([edge_attr, j_attr], axis=0)
 
     check_order = hilbert_order_within_bbox(xy_check, bbox_xywh)
-    seq_idx = check_order.astype(np.int64)
+    # Sequence encoder runs over check nodes (Hilbert order), which are offset by nQ
+    # because nodes are stored as [data..., checks...].
+    seq_idx = (nQ + check_order).astype(np.int64)
 
     N = nQ + nC
     E_tot = edge_index.shape[1]
@@ -385,6 +464,9 @@ def pack_cluster(
     y_bits_t = torch.full((N_max,), -1, dtype=torch.int8)
     y_bits_t[:nQ] = torch.from_numpy(y_bits_local.astype(np.int8))
 
+    s_sub_t = torch.zeros((S_max,), dtype=torch.int8)
+    s_sub_t[:S] = torch.from_numpy(synd.astype(np.int8))
+
     meta = CropMeta(
         k=k,
         r=r,
@@ -410,6 +492,7 @@ def pack_cluster(
         seq_mask=seq_mask,
         g_token=g_token,
         y_bits=y_bits_t,
+        s_sub=s_sub_t,
         meta=meta,
         H_sub=H_sub.astype(np.uint8),
         idx_data_local=np.arange(nQ, dtype=np.int32),
@@ -423,11 +506,13 @@ def pack_cluster(
 
 
 class GraphDecoderCore(nn.Module):
-    """Iterative message-passing core used by MGHDv2's graph head.
+    """Lightweight bidirectional message passing core used by MGHDv2.
 
-    Runs a small MLP for edge messages and a GRU to update node states for a
-    fixed number of iterations; exposes a 2‑logit per‑node head at each step
-    (the caller typically takes the last step).
+    Design goals:
+    - Keep the graph block simple and hardware-friendly (no deep edge MLP stack).
+    - Preserve explicit iterative message passing.
+    - Ensure syndrome information can flow checks↔data in one iteration by
+      symmetrizing edge directions internally.
     """
 
     def __init__(
@@ -449,21 +534,24 @@ class GraphDecoderCore(nn.Module):
         self.n_edge_features = n_edge_features
         self.n_node_outputs = n_node_outputs
 
-        self.final_digits = nn.Linear(self.n_node_features, self.n_node_outputs)
-        self.msg_net = nn.Sequential(
-            nn.Linear(2 * n_node_features + n_edge_features, msg_net_size),
-            nn.ReLU(),
-            nn.Dropout(msg_net_dropout_p),
-            nn.Linear(msg_net_size, msg_net_size),
-            nn.ReLU(),
-            nn.Dropout(msg_net_dropout_p),
-            nn.Linear(msg_net_size, msg_net_size),
-            nn.ReLU(),
-            nn.Dropout(msg_net_dropout_p),
-            nn.Linear(msg_net_size, n_edge_features),
+        # Keep the legacy attribute name `msg_net` for compatibility with tests
+        # and old instrumentation, but use a single linear projection only.
+        self.msg_net = nn.Linear(
+            2 * self.n_node_features + self.n_edge_features,
+            self.n_edge_features,
+            bias=False,
         )
-        self.gru = nn.GRU(input_size=n_edge_features + n_node_inputs, hidden_size=n_node_features)
-        self.gru_drop = nn.Dropout(gru_dropout_p)
+        self.msg_drop = nn.Dropout(msg_net_dropout_p)
+        self.node_in_proj = (
+            nn.Identity()
+            if self.n_node_inputs == self.n_node_features
+            else nn.Linear(self.n_node_inputs, self.n_node_features, bias=False)
+        )
+        self.edge_to_state = nn.Linear(self.n_edge_features, self.n_node_features, bias=False)
+        self.state_to_state = nn.Linear(self.n_node_features, self.n_node_features, bias=False)
+        self.state_norm = nn.LayerNorm(self.n_node_features)
+        self.state_drop = nn.Dropout(gru_dropout_p)
+        self.final_digits = nn.Linear(self.n_node_features, self.n_node_outputs)
 
     def forward(
         self,
@@ -482,10 +570,11 @@ class GraphDecoderCore(nn.Module):
         - [T, N, 2] logits (T iterations)
         """
         device = node_inputs.device
-        node_states = torch.zeros(node_inputs.shape[0], self.n_node_features, device=device)
+        node_states = self.node_in_proj(node_inputs)
+        n_nodes = node_inputs.shape[0]
         outputs_tensor = torch.zeros(
             self.n_iters,
-            node_inputs.shape[0],
+            n_nodes,
             self.n_node_outputs,
             device=device,
         )
@@ -500,21 +589,26 @@ class GraphDecoderCore(nn.Module):
                 )
             else:
                 edge_feat = edge_attr.to(node_inputs.device, dtype=node_inputs.dtype)
-            msg_in = torch.cat((node_states[src_ids], node_states[dst_ids], edge_feat), dim=1)
-            messages = self.msg_net(msg_in)
-            agg_msg = torch.zeros(
-                node_inputs.shape[0], self.n_edge_features, device=device, dtype=messages.dtype
-            )
-            agg_msg.index_add_(dim=0, index=dst_ids, source=messages)
-            gru_inputs = torch.cat((agg_msg, node_inputs), dim=1)
 
-            _, node_states = self.gru(
-                gru_inputs.view(1, node_inputs.shape[0], -1),
-                node_states.view(1, node_inputs.shape[0], -1),
+            # Symmetrize Tanner/jump edges so checks and data exchange messages.
+            msg_in_fwd = torch.cat((node_states[src_ids], node_states[dst_ids], edge_feat), dim=1)
+            msg_in_rev = torch.cat((node_states[dst_ids], node_states[src_ids], edge_feat), dim=1)
+            msg_fwd = self.msg_drop(self.msg_net(msg_in_fwd))
+            msg_rev = self.msg_drop(self.msg_net(msg_in_rev))
+            agg_msg = torch.zeros((n_nodes, self.n_edge_features), device=device, dtype=msg_fwd.dtype)
+            agg_msg.index_add_(dim=0, index=dst_ids, source=msg_fwd)
+            agg_msg.index_add_(dim=0, index=src_ids, source=msg_rev)
+
+            # Degree-normalized aggregation keeps scale stable across distances.
+            deg = torch.bincount(dst_ids, minlength=n_nodes) + torch.bincount(
+                src_ids, minlength=n_nodes
             )
-            node_states = node_states.squeeze(0)
+            deg = deg.to(node_inputs.dtype).clamp_min_(1.0)
+            agg_msg = agg_msg / deg.unsqueeze(1)
+
+            delta = self.edge_to_state(agg_msg) + self.state_to_state(node_states)
+            node_states = self.state_norm(node_states + self.state_drop(delta))
             outputs_tensor[i] = self.final_digits(node_states)
-            node_states = self.gru_drop(node_states)
 
         return outputs_tensor
 
@@ -634,6 +728,49 @@ class SequenceEncoder(nn.Module):
         """
         if seq_idx.numel() == 0 or seq_mask.sum() == 0:
             return x
+
+        # Batched path: x=[B,N,C], seq_idx=[B,S], seq_mask=[B,S]
+        if x.dim() == 3 and seq_idx.dim() == 2 and seq_mask.dim() == 2:
+            B, N, C = x.shape
+            idx = seq_idx.long().clamp(min=0, max=max(0, N - 1))
+            mask = seq_mask.bool()
+
+            x_chk = x.gather(1, idx.unsqueeze(-1).expand(-1, -1, C))
+            try:
+                y_chk = self.core(x_chk)
+            except Exception:
+                y_chk = x_chk
+            y_chk = self.out_norm(y_chk)
+
+            # Ensure dtype alignment for index_copy in mixed precision
+            if y_chk.dtype != x.dtype:
+                y_chk = y_chk.to(x.dtype)
+                x_chk = x_chk.to(x.dtype)
+
+            x_scatter = x.clone()
+            x_flat = x_scatter.view(B * N, C)
+            idx_flat = idx + (torch.arange(B, device=x.device).unsqueeze(1) * N)
+            idx_flat_valid = idx_flat[mask]
+            vals = (x_chk + y_chk)[mask]
+            x_flat.index_copy_(0, idx_flat_valid, vals)
+            return x_flat.view(B, N, C)
+
+        if x.dim() == 3:
+            if seq_idx.dim() != 1 or seq_mask.dim() != 1:
+                raise ValueError(
+                    "For batched x_nodes, expected seq_idx/seq_mask to have shape [B,S] "
+                    f"(got seq_idx {tuple(seq_idx.shape)}, seq_mask {tuple(seq_mask.shape)})."
+                )
+            # Backwards-compatible path: treat batched nodes as a single disjoint
+            # union indexed by flattened node IDs.
+            B, N, C = x.shape
+            x = x.view(B * N, C)
+            node_type = node_type.view(B * N)
+        elif seq_idx.dim() != 1 or seq_mask.dim() != 1:
+            raise ValueError(
+                "Expected seq_idx/seq_mask to be 1D for unbatched x_nodes "
+                f"(got seq_idx {tuple(seq_idx.shape)}, seq_mask {tuple(seq_mask.shape)})."
+            )
         valid = seq_mask.nonzero(as_tuple=False).squeeze(-1)
         idx = seq_idx[valid].long()
         x_chk = x.index_select(0, idx)
@@ -649,6 +786,8 @@ class SequenceEncoder(nn.Module):
             x_chk = x_chk.to(x.dtype)
         x_scatter = x.clone()
         x_scatter.index_copy_(0, idx, x_chk + y_chk)
+        if "B" in locals():
+            return x_scatter.view(B, N, C)
         return x_scatter
 
 
@@ -660,16 +799,18 @@ class GraphDecoderAdapter(nn.Module):
         hidden_dim: int,
         edge_feat_dim: int,
         n_iters: int,
+        n_node_outputs: int = 2,
         *,
         msg_net_size: Optional[int] = None,
         msg_net_dropout_p: float = 0.0,
         gru_dropout_p: float = 0.0,
     ):
         super().__init__()
+        self.n_node_outputs = int(n_node_outputs)
         self.core = GraphDecoder(
             n_iters=n_iters,
             n_node_inputs=hidden_dim,
-            n_node_outputs=2,
+            n_node_outputs=self.n_node_outputs,
             n_edge_features=edge_feat_dim,
             msg_net_size=max(96, hidden_dim) if msg_net_size is None else int(msg_net_size),
             msg_net_dropout_p=float(msg_net_dropout_p),
@@ -713,14 +854,20 @@ class GraphDecoderAdapter(nn.Module):
 class MGHDv2(nn.Module):
     """Distance-agnostic MGHD v2 with Mamba, channel attention, and graph message passing."""
 
+    _PROFILE_PRESETS: Dict[str, Dict[str, int]] = {
+        "S": {"d_model": 192, "d_state": 80, "n_iters": 8},
+        "M": {"d_model": 256, "d_state": 96, "n_iters": 10},
+        "L": {"d_model": 320, "d_state": 128, "n_iters": 12},
+    }
+
     def __init__(
         self,
         profile: str = "S",
         *,
-        d_model: int = 192,
-        d_state: int = 80,
-        n_iters: int = 8,
-        node_feat_dim: int = 8,
+        d_model: Optional[int] = None,
+        d_state: Optional[int] = None,
+        n_iters: Optional[int] = None,
+        node_feat_dim: int = 9,
         edge_feat_dim: int = 3,
         g_dim: Optional[int] = None,
         se_reduction: int = 4,
@@ -729,8 +876,22 @@ class MGHDv2(nn.Module):
         gnn_gru_dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        profile_key = str(profile).upper().strip()
+        if profile_key not in self._PROFILE_PRESETS:
+            profile_key = "S"
+        preset = self._PROFILE_PRESETS[profile_key]
+        d_model = int(preset["d_model"] if d_model is None else d_model)
+        d_state = int(preset["d_state"] if d_state is None else d_state)
+        n_iters = int(preset["n_iters"] if n_iters is None else n_iters)
+
         if g_dim is None:
-            g_dim = max(8, node_feat_dim)
+            # pack_cluster mandatory prefix:
+            # [k, r, bw, bh, d, p, log10(p), cx01, cy01, bw01, bh01, min_bdry01]
+            g_dim = 12
+        self.profile = profile_key
+        self.d_model = d_model
+        self.d_state = d_state
+        self.n_iters = n_iters
         self.seq_encoder = SequenceEncoder(d_model=d_model, d_state=d_state)
         self.se = ChannelSE(channels=d_model, reduction=int(se_reduction))
         self.gnn = GraphDecoderAdapter(
@@ -743,42 +904,20 @@ class MGHDv2(nn.Module):
         )
         self.node_in = nn.Linear(node_feat_dim, d_model)
         self.edge_in = nn.Linear(edge_feat_dim, d_model)
-        self.g_proj: Optional[nn.Linear] = None
+        self.g_proj: nn.Module = nn.Linear(int(g_dim), self.node_in.out_features)
+        # FiLM-style global conditioning:
+        # - g_proj provides additive shift
+        # - g_scale_proj provides bounded multiplicative scale around 1.0
+        self.g_scale_proj: nn.Module = nn.Linear(int(g_dim), self.node_in.out_features)
+        nn.init.zeros_(self.g_scale_proj.weight)
+        nn.init.zeros_(self.g_scale_proj.bias)
 
     def forward(self, packed: PackedCrop) -> Tuple[torch.Tensor, torch.Tensor]:
         x = packed.x_nodes.float()
         eidx = packed.edge_index.long()
         eatt = packed.edge_attr.float()
         emask = packed.edge_mask.bool()
-        gtok = packed.g_token.float()
-
-        if x.dim() == 3:
-            batch_size, nodes_pad, feat_dim = x.shape
-            x = x.view(batch_size * nodes_pad, feat_dim)
-            nmask = packed.node_mask.view(batch_size * nodes_pad).bool()
-            node_type = packed.node_type.view(batch_size * nodes_pad).long()
-        else:
-            batch_size = 1
-            nodes_pad = x.shape[0]
-            nmask = packed.node_mask.bool()
-            node_type = packed.node_type.long()
-
-        if gtok.dim() == 2:
-            g_dim = gtok.size(-1)
-            if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.ensure_g_proj(g_dim, gtok.device)
-            g_bias = self.g_proj(gtok)
-            g_bias = (
-                g_bias.unsqueeze(1)
-                .expand(batch_size, nodes_pad, -1)
-                .reshape(batch_size * nodes_pad, -1)
-            )
-        else:
-            g_dim = gtok.numel()
-            if self.g_proj is None or self.g_proj.in_features != g_dim:
-                self.ensure_g_proj(g_dim, gtok.device)
-            g_bias = self.g_proj(gtok.view(-1)).unsqueeze(0)
-            g_bias = g_bias.expand(x.shape[0], -1)
+        gtok = self._prepare_g_token(packed.g_token.float())
 
         # Guard against feature-dim mismatches (e.g., erasure channel optional)
         if self.node_in.in_features != x.shape[-1]:
@@ -786,12 +925,82 @@ class MGHDv2(nn.Module):
         if self.edge_in.in_features != eatt.shape[-1]:
             self.ensure_edge_in(int(eatt.shape[-1]), eatt.device)
 
-        x = self.node_in(x) + g_bias
+        if x.dim() == 3:
+            batch_size, nodes_pad, _ = x.shape
+            nmask = packed.node_mask.bool()
+            node_type = packed.node_type.long()
+
+            x = self.node_in(x)
+            if gtok.dim() == 2:
+                g_bias = self.g_proj(gtok).unsqueeze(1).expand(batch_size, nodes_pad, -1)
+                g_scale = self.g_scale_proj(gtok).unsqueeze(1).expand(batch_size, nodes_pad, -1)
+            else:
+                g_vec = gtok.view(-1)
+                g_bias = self.g_proj(g_vec).view(1, 1, -1).expand(batch_size, nodes_pad, -1)
+                g_scale = self.g_scale_proj(g_vec).view(1, 1, -1).expand(batch_size, nodes_pad, -1)
+
+            # Keep modulation bounded for stable training across p/d sweeps.
+            x = x * (1.0 + 0.5 * torch.tanh(g_scale)) + g_bias
+            x = self.seq_encoder(
+                x,
+                packed.seq_idx.long(),
+                packed.seq_mask.bool(),
+                node_type=node_type,
+            )
+            x = self.se(x)
+
+            x_flat = x.view(batch_size * nodes_pad, -1)
+            nmask_flat = nmask.view(batch_size * nodes_pad)
+            e = self.edge_in(eatt)
+            logits = self.gnn(x_flat, eidx, e, nmask_flat, emask)
+            return logits, nmask_flat
+
+        nodes_pad = x.shape[0]
+        nmask = packed.node_mask.bool()
+        node_type = packed.node_type.long()
+
+        x = self.node_in(x)
+        if gtok.dim() == 2:
+            g_bias = self.g_proj(gtok).unsqueeze(1).expand(1, nodes_pad, -1).reshape(nodes_pad, -1)
+            g_scale = (
+                self.g_scale_proj(gtok).unsqueeze(1).expand(1, nodes_pad, -1).reshape(nodes_pad, -1)
+            )
+        else:
+            g_vec = gtok.view(-1)
+            g_bias = self.g_proj(g_vec).unsqueeze(0).expand(nodes_pad, -1)
+            g_scale = self.g_scale_proj(g_vec).unsqueeze(0).expand(nodes_pad, -1)
+
+        x = x * (1.0 + 0.5 * torch.tanh(g_scale)) + g_bias
         e = self.edge_in(eatt)
-        x = self.seq_encoder(x, packed.seq_idx.long(), packed.seq_mask.bool(), node_type=node_type)
+        x = self.seq_encoder(
+            x,
+            packed.seq_idx.long(),
+            packed.seq_mask.bool(),
+            node_type=node_type,
+        )
         x = self.se(x.unsqueeze(0)).squeeze(0)
         logits = self.gnn(x, eidx, e, nmask, emask)
         return logits, nmask
+
+    def _prepare_g_token(self, gtok: torch.Tensor) -> torch.Tensor:
+        """Pad/truncate global token to the projection width without rebuilding layers."""
+        if self.g_proj is None:
+            return gtok
+        if hasattr(self.g_proj, "has_uninitialized_params") and self.g_proj.has_uninitialized_params():  # type: ignore[attr-defined]
+            return gtok
+        in_features = getattr(self.g_proj, "in_features", None)
+        if in_features is None:
+            return gtok
+        want = int(in_features)
+        have = int(gtok.shape[-1]) if gtok.ndim >= 1 else 0
+        if have == want:
+            return gtok
+        if have > want:
+            return gtok[..., :want]
+        pad_shape = list(gtok.shape)
+        pad_shape[-1] = want - have
+        pad = torch.zeros(pad_shape, dtype=gtok.dtype, device=gtok.device)
+        return torch.cat([gtok, pad], dim=-1)
 
     def allocate_static_batch(
         self,
@@ -815,8 +1024,8 @@ class MGHDv2(nn.Module):
             edge_index=zeros((2, batch_size * edges_pad), torch.long),
             edge_attr=zeros((batch_size * edges_pad, edge_feat_dim), torch.float32),
             edge_mask=zeros((batch_size * edges_pad,), torch.bool),
-            seq_idx=zeros((batch_size * seq_pad,), torch.long),
-            seq_mask=zeros((batch_size * seq_pad,), torch.bool),
+            seq_idx=zeros((batch_size, seq_pad), torch.long),
+            seq_mask=zeros((batch_size, seq_pad), torch.bool),
             g_token=zeros((batch_size, g_dim), torch.float32),
             batch_size=batch_size,
             nodes_pad=nodes_pad,
@@ -881,11 +1090,37 @@ class MGHDv2(nn.Module):
     def set_message_iters(self, n_iters: Optional[int]) -> None:
         self.gnn.set_iteration_override(n_iters)
 
+    def _align_g_proj(self, g_dim: int, device: torch.device) -> None:
+        """Initialize g-token projection when missing; avoid runtime module replacement."""
+        if self.g_proj is None:
+            self.ensure_g_proj(g_dim, device)
+            return
+        has_lazy = hasattr(self.g_proj, "has_uninitialized_params")
+        if has_lazy and self.g_proj.has_uninitialized_params():  # type: ignore[attr-defined]
+            return
+        return
+
     def ensure_g_proj(self, g_dim: int, device: torch.device) -> None:
-        if self.g_proj is None or self.g_proj.in_features != g_dim:
+        in_features = getattr(self.g_proj, "in_features", None) if self.g_proj is not None else None
+        if self.g_proj is None or in_features is None or int(in_features) != int(g_dim):
             layer = nn.Linear(g_dim, self.node_in.out_features)
             layer.to(device)
             self.g_proj = layer
+        scale_in = (
+            getattr(self.g_scale_proj, "in_features", None)
+            if getattr(self, "g_scale_proj", None) is not None
+            else None
+        )
+        if (
+            getattr(self, "g_scale_proj", None) is None
+            or scale_in is None
+            or int(scale_in) != int(g_dim)
+        ):
+            scale = nn.Linear(g_dim, self.node_in.out_features)
+            nn.init.zeros_(scale.weight)
+            nn.init.zeros_(scale.bias)
+            scale.to(device)
+            self.g_scale_proj = scale
 
     def ensure_node_in(self, in_features: int, device: torch.device) -> None:
         if self.node_in.in_features != in_features:
@@ -922,6 +1157,7 @@ TensorFields: Tuple[str, ...] = (
     "seq_mask",
     "g_token",
     "y_bits",
+    "s_sub",
 )
 
 
@@ -946,10 +1182,21 @@ def _ensure_array(array: np.ndarray | sp.csr_matrix) -> np.ndarray:
 class MGHDDecoderPublic:
     """Thin wrapper that keeps only the MGHD v2 inference surface."""
 
-    def __init__(self, ckpt_path: str, device: str = "cpu", *, profile: str = "S", node_feat_dim: int = 8) -> None:
+    def __init__(
+        self, ckpt_path: str, device: str = "cpu", *, profile: str = "S", node_feat_dim: int = 9
+    ) -> None:
         self.device = torch.device(device)
         state_dict = _load_state_dict(ckpt_path)
         self.model = MGHDv2(profile=profile, node_feat_dim=node_feat_dim)
+        # Restore lazily-created projection layers before state_dict load so
+        # checkpointed tensors are not silently dropped.
+        if "node_in.weight" in state_dict and torch.is_tensor(state_dict["node_in.weight"]):
+            self.model.ensure_node_in(int(state_dict["node_in.weight"].shape[1]), self.device)
+        if "edge_in.weight" in state_dict and torch.is_tensor(state_dict["edge_in.weight"]):
+            self.model.ensure_edge_in(int(state_dict["edge_in.weight"].shape[1]), self.device)
+        if "g_proj.weight" in state_dict and torch.is_tensor(state_dict["g_proj.weight"]):
+            self.model.ensure_g_proj(int(state_dict["g_proj.weight"].shape[1]), self.device)
+
         self.model.load_state_dict(state_dict, strict=False)
         self.model.to(self.device).eval()
 
@@ -1068,17 +1315,46 @@ class MGHDDecoderPublic:
         n_checks, n_qubits = H_dense.shape
         edges = int(H_dense.sum())
         kappa_stats = dict(meta.get("kappa_stats", {}))
-        if "size" not in kappa_stats:
-            kappa_stats["size"] = float(n_checks + n_qubits)
+
+        xy_qubit = np.asarray(meta["xy_qubit"], dtype=np.int32)
+        xy_check = np.asarray(meta.get("xy_check", np.zeros((0, 2), dtype=np.int32)))
+
+        bbox = meta.get("bbox_xywh", None)
+        if bbox is None:
+            bbox = meta.get("bbox", None)
+        if bbox is None:
+            all_xy = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
+            if all_xy.size:
+                mins = all_xy.min(axis=0)
+                maxs = all_xy.max(axis=0)
+                bbox = (
+                    int(mins[0]),
+                    int(mins[1]),
+                    int(maxs[0] - mins[0] + 1),
+                    int(maxs[1] - mins[1] + 1),
+                )
+            else:
+                bbox = (0, 0, 1, 1)
+        bbox_xywh = tuple(int(v) for v in bbox)
+
+        add_jump_edges = bool(meta.get("add_jump_edges", True))
+        jump_k = int(meta.get("jump_k", 2))
+        g_extra = meta.get("g_extra", None)
+        if g_extra is not None:
+            g_extra = np.asarray(g_extra, dtype=np.float32).ravel()
+        # jump-edge construction can include diagonal/self links after powering
+        # adjacency, so reserve up to n_qubits^2 extra directed edges.
+        est_jump_edges = (n_qubits * n_qubits) if add_jump_edges else 0
+        edge_cap = max(edges + est_jump_edges, 1)
 
         pack = pack_cluster(
             H_sub=H_dense,
-            xy_qubit=np.asarray(meta["xy_qubit"], dtype=np.int32),
-            xy_check=np.asarray(meta.get("xy_check", np.zeros((0, 2), dtype=np.int32))),
+            xy_qubit=xy_qubit,
+            xy_check=xy_check,
             synd_Z_then_X_bits=s_sub,
             k=int(meta.get("k", n_qubits)),
             r=int(meta.get("r", 0)),
-            bbox_xywh=tuple(int(v) for v in meta.get("bbox", (0, 0, 1, 1))),
+            bbox_xywh=bbox_xywh,
             kappa_stats=kappa_stats,
             y_bits_local=np.zeros(n_qubits, dtype=np.uint8),
             side=str(meta.get("side", "Z")),
@@ -1086,10 +1362,12 @@ class MGHDDecoderPublic:
             p=float(meta.get("p", 0.0)),
             seed=0,
             N_max=n_qubits + n_checks,
-            E_max=max(edges, 1),
+            E_max=edge_cap,
             S_max=max(n_checks, 1),
             bucket_spec=bucket_spec,
-            add_jump_edges=False,
+            add_jump_edges=add_jump_edges,
+            jump_k=jump_k,
+            g_extra=g_extra,
         )
         return pack
 
