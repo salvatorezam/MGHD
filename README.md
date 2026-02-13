@@ -9,8 +9,6 @@ MGHD combines Mamba sequence models with Graph Neural Networks to create a power
 * **Benchmarks:** Full logical error rate plots and latency results will be released publicly upon arXiv submission.
 * **Reproducibility:** Pre-trained weights and inference scripts are currently internal-only.
 
-*Please check back in January 2026 for the stable release.*
-
 ---
 
 ## Overview
