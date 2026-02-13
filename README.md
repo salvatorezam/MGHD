@@ -2,8 +2,7 @@
 
 MGHD combines Mamba sequence models with Graph Neural Networks to create a powerful, universal decoder for quantum error correction on surface code (to be extended across multiple code families).
 
-**⚠️ Pre-Release Status**
-This repository contains the **active development branch** for the MGHD architecture described in the upcoming manuscript *(Kulkarni et al., arXiv target: Jan 2026)*.
+**⚠️ Pre-Release Status**.
 
 **Current Status:**
 * **Codebase:** Pre-alpha (Code optimizations in progress).
