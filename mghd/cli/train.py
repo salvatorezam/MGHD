@@ -1,20 +1,17 @@
-"""MGHD trainer: offline (crops) and online (CUDA‑Q) modes.
+"""MGHD trainer: online (on-the-fly) surface‑code training.
 
-Defines a small offline dataset loader for crop shards and an online training
-loop that samples syndromes on the fly, routes teacher supervision, and packs
-subgraphs into MGHDv2 input tensors. Detector bits are handled in canonical
-Z→X order throughout (matching Stim/DEM). CUDA is initialized only inside
-``main``.
+Defines an online training loop that samples syndromes on the fly, routes
+teacher supervision, and packs subgraphs into MGHDv2 input tensors.  Detector
+bits are handled in canonical Z→X order throughout (matching Stim/DEM).
+CUDA is initialized only inside ``main``.
 """
 
 # NOTE: Initialize CUDA only in main(). This file defines dataset, model, loop.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
-import random
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -29,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler
+from torch.utils.data import DataLoader, IterableDataset
 
 from mghd.codes.qpu_profile import load_qpu_profile
 from mghd.core.core import MGHDv2, PackedCrop, pack_cluster
@@ -49,116 +46,6 @@ from mghd.tad import weighting as tad_weighting
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-_TEACHER_POOL: ThreadPoolExecutor | None = None
-
-
-class CropShardDataset(Dataset):
-    """Index all ``.npz`` shards under ``root`` and expose packed crops."""
-
-    def __init__(self, root: str, curriculum: str = "stage1", max_shards: int | None = None):
-        self.files = sorted(glob.glob(os.path.join(root, "**/*.npz"), recursive=True))
-        if max_shards is not None:
-            self.files = self.files[:max_shards]
-        # Load all items from all shards
-        self.items = []
-        for f in self.files:
-            arr = np.load(f, allow_pickle=True)
-            packed_array = arr["packed"]
-            # Handle both single item and array of items
-            if packed_array.shape == ():
-                # Single item stored as scalar
-                self.items.append((f, packed_array.item()))
-            else:
-                # Array of items
-                for it in packed_array:
-                    self.items.append((f, it))
-        print(f"Loaded {len(self.items)} crop items from {len(self.files)} shards")
-
-    def __len__(self):
-        """Return number of packed items across all shards."""
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        """Load one PackedCrop (as torch tensors) and attach teacher metadata."""
-        _, item = self.items[idx]
-
-        def to_tensor(x, dtype=None):
-            if isinstance(x, torch.Tensor):
-                return torch.as_tensor(x, dtype=dtype)
-            return torch.as_tensor(x, dtype=dtype)
-
-        seq_idx_t = to_tensor(item["seq_idx"], torch.long)
-        s_sub_raw = item.get("s_sub", None)
-        if s_sub_raw is None:
-            s_sub_t = torch.zeros_like(seq_idx_t, dtype=torch.int8)
-        else:
-            s_sub_t = to_tensor(s_sub_raw, torch.int8)
-
-        packed = PackedCrop(
-            x_nodes=to_tensor(item["x_nodes"], torch.float32),
-            node_mask=to_tensor(item["node_mask"], torch.bool),
-            node_type=to_tensor(item["node_type"], torch.int8),
-            edge_index=to_tensor(item["edge_index"], torch.long),
-            edge_attr=to_tensor(item["edge_attr"], torch.float32),
-            edge_mask=to_tensor(item["edge_mask"], torch.bool),
-            seq_idx=seq_idx_t,
-            seq_mask=to_tensor(item["seq_mask"], torch.bool),
-            g_token=to_tensor(item["g_token"], torch.float32),
-            y_bits=to_tensor(item["y_bits"], torch.int8),
-            s_sub=s_sub_t,
-            meta=item["meta"],
-            H_sub=item.get("H_sub", None),
-            idx_data_local=item.get("idx_data_local", None),
-            idx_check_local=item.get("idx_check_local", None),
-        )
-        # attach teacher meta for weighting/logging
-        packed.teacher = item.get("teacher", "mwpf")
-        packed.teacher_weight = int(item.get("teacher_weight", 0))
-        packed.teacher_valid = bool(item.get("teacher_valid", True))
-        packed.teacher_matched_local_ml = bool(item.get("teacher_matched_local_ml", False))
-        return packed
-
-
-def make_bucket_sampler(ds: CropShardDataset, *, stage="stage1", seed=0):
-    """
-    Bucket by (r, kappa=size) and coarse p to ensure hard cases are seen.
-    """
-    rng = random.Random(seed)
-    buckets = defaultdict(list)
-    for i, (_, item) in enumerate(ds.items):
-        meta = item["meta"]
-        r = int(meta.get("r", 0))
-        kappa = int(meta.get("kappa", meta.get("k", 0)))
-        # coarse p bin
-        p = float(meta.get("p", 0.005))
-        pbin = 0 if p < 0.003 else (1 if p < 0.01 else 2)
-        buckets[(min(r, 8), min(kappa, 32), pbin)].append(i)
-    order = []
-    # Interleave buckets to avoid collapse
-    keys = sorted(buckets.keys())
-    heads = dict.fromkeys(keys, 0)
-    while True:
-        progressed = False
-        for k in keys:
-            lst = buckets[k]
-            h = heads[k]
-            if h < len(lst):
-                order.append(lst[h])
-                heads[k] = h + 1
-                progressed = True
-        if not progressed:
-            break
-    rng.shuffle(order)
-
-    class _S(Sampler):
-        def __iter__(self):
-            return iter(order)
-
-        def __len__(self):
-            return len(order)
-
-    return _S()
 
 
 def collate_packed(batch):
@@ -525,54 +412,6 @@ def train_inprocess(ns) -> str:
         help="Canonical long-range burst probability for circuit_augmented.",
     )
     parser.add_argument(
-        "--generic-p1q",
-        type=float,
-        default=0.0015,
-        help="Base 1Q depolarizing probability for generic_cl noise.",
-    )
-    parser.add_argument(
-        "--generic-p2q",
-        type=float,
-        default=0.01,
-        help="Base 2Q depolarizing probability for generic_cl noise.",
-    )
-    parser.add_argument(
-        "--generic-pidle",
-        type=float,
-        default=0.0008,
-        help="Base idle error probability per idle_ref_ns for generic_cl noise.",
-    )
-    parser.add_argument(
-        "--generic-pmeas0",
-        type=float,
-        default=0.02,
-        help="Base readout assignment error P(meas=1|state=0) for generic_cl noise.",
-    )
-    parser.add_argument(
-        "--generic-pmeas1",
-        type=float,
-        default=0.02,
-        help="Base readout assignment error P(meas=0|state=1) for generic_cl noise.",
-    )
-    parser.add_argument(
-        "--generic-phook",
-        type=float,
-        default=0.0,
-        help="Optional correlated hook-error probability per CZ for generic_cl noise.",
-    )
-    parser.add_argument(
-        "--generic-pcrosstalk",
-        type=float,
-        default=0.0,
-        help="Optional spectator crosstalk probability per active layer for generic_cl noise.",
-    )
-    parser.add_argument(
-        "--generic-idle-ref-ns",
-        type=float,
-        default=20.0,
-        help="Reference layer duration for generic idle scaling.",
-    )
-    parser.add_argument(
         "--phenomenological",
         action="store_true",
         help="Shortcut for requesting the fast synthetic sampler (sets sampler=synthetic)",
@@ -695,11 +534,6 @@ def train_inprocess(ns) -> str:
             "(useful when per-epoch logging is sparse)."
         ),
     )
-    # Optional post-run teacher comparison report (writes teacher_eval.txt)
-    parser.add_argument("--post-eval", action="store_true")
-    parser.add_argument("--post-eval-sampler", type=str, default="stim")
-    parser.add_argument("--post-eval-shots-per-batch", type=int, default=16)
-    parser.add_argument("--post-eval-batches", type=int, default=2)
     parser.add_argument(
         "--teacher-workers",
         type=int,
@@ -1194,13 +1028,8 @@ def train_inprocess(ns) -> str:
                 f"progress_seconds={args.progress_seconds}"
             )
     if not use_online:
-        ds = CropShardDataset(args.data_root)
-        sampler = make_bucket_sampler(ds, stage="stage1", seed=args.seed)
-        loader = DataLoader(
-            ds,
-            batch_size=args.batch,
-            sampler=sampler,
-            collate_fn=lambda batch: batch,
+        raise RuntimeError(
+            "Offline (crop-shard) training has been removed. Use --online mode."
         )
 
     save_dir = Path(args.save)
@@ -1583,11 +1412,10 @@ def train_inprocess(ns) -> str:
         distance_loss_sum: dict[int, float] = defaultdict(float)
         distance_item_count: dict[int, int] = defaultdict(int)
         if use_online:
-            # Select p for this epoch (curriculum if provided)
+            # Per-sample p mixing: pass the full p_list so each shot samples its own p.
+            # Falls back to single fixed p if no curriculum.
             if p_list:
-                step = max(1, int(getattr(args, "epochs_per_p", 1)))
-                idx = min((epoch - 1) // step, len(p_list) - 1)
-                p_epoch = float(p_list[idx])
+                p_epoch = p_list  # list signals per-sample mixing
             else:
                 p_epoch = float(getattr(args, "p", 0.005))
 
@@ -1825,7 +1653,7 @@ def train_inprocess(ns) -> str:
                             "secs": float(time.time() - t0),
                         }
                         if p_epoch is not None:
-                            prog["p"] = float(p_epoch)
+                            prog["p"] = "mixed" if isinstance(p_epoch, list) else float(p_epoch)
                         print(json.dumps(prog, separators=(",", ":")), flush=True)
                     heartbeat_s = float(getattr(args, "progress_seconds", 0.0))
                     now = time.time()
@@ -1847,147 +1675,14 @@ def train_inprocess(ns) -> str:
                                 str(k): int(v) for k, v in sorted(distance_item_count.items())
                             }
                         if p_epoch is not None:
-                            hb["p"] = float(p_epoch)
+                            hb["p"] = "mixed" if isinstance(p_epoch, list) else float(p_epoch)
                         print(json.dumps(hb, separators=(",", ":")), flush=True)
                         last_heartbeat = now
-        else:
-            steps_done = 0
-            steps_total = len(loader) if hasattr(loader, "__len__") else 0
-            prog_stride = (
-                max(1, steps_total // int(getattr(args, "progress_prints", 1)))
-                if steps_total and int(getattr(args, "progress_prints", 1)) > 1
-                else 0
+
+        if not use_online:
+            raise RuntimeError(
+                "Offline (crop-shard) training has been removed. Use --online mode."
             )
-            global _TEACHER_POOL
-            if _TEACHER_POOL is None:
-                workers = max(1, int(getattr(args, "teacher_workers", 4)))
-                _TEACHER_POOL = ThreadPoolExecutor(max_workers=workers)
-
-            def _teacher_prefetch(packed: PackedCrop) -> dict:
-                return {
-                    "valid": bool(getattr(packed, "teacher_valid", True)),
-                    "matched_local_ml": bool(getattr(packed, "teacher_matched_local_ml", False)),
-                }
-
-            futures: list = []
-            teacher_outs: list = []
-            for batch in loader:
-                if not batch:
-                    continue
-                futures.clear()
-                moved = []
-                for packed in batch:
-                    futures.append(_TEACHER_POOL.submit(_teacher_prefetch, packed))
-                    _validate_packed_contract(packed, expected_node_dim, expected_edge_dim)
-                    moved.append(move_to(packed, device))
-                teacher_outs = [f.result() for f in futures]
-                if args.noise_injection > 0.0:
-                    std = float(args.noise_injection)
-                    for packed in moved:
-                        packed.x_nodes = packed.x_nodes + torch.randn_like(packed.x_nodes) * std
-
-                batch_loss = torch.zeros((), device=device)
-                for packed, teach in zip(moved, teacher_outs):
-                    with _autocast():
-                        logits, node_mask = model(packed=packed)
-                        logits = logits.squeeze(0)
-                        node_mask = node_mask.squeeze(0)
-
-                        hard = (0.5 if teach.get("valid", True) else 1.5) + (
-                            0.5 if teach.get("matched_local_ml", False) else 1.0
-                        )
-                        sample_weight = torch.tensor(hard, dtype=torch.float32, device=device)
-
-                        if bool(getattr(args, "use_focal", False)):
-                            loss_bce = focal_binary_head_loss(
-                                logits,
-                                node_mask,
-                                packed.node_type,
-                                packed.y_bits,
-                                alpha=float(getattr(args, "focal_alpha", 0.25)),
-                                gamma=float(getattr(args, "focal_gamma", 2.0)),
-                                sample_weight=sample_weight,
-                            )
-                        else:
-                            loss_bce = bce_binary_head_loss(
-                                logits,
-                                node_mask,
-                                packed.node_type,
-                                packed.y_bits,
-                                sample_weight=sample_weight,
-                                label_smoothing=args.label_smoothing,
-                            )
-
-                        loss_par = args.parity_lambda * parity_auxiliary_loss(
-                            logits,
-                            node_mask,
-                            packed.node_type,
-                            H_sub=packed.H_sub,
-                            s_sub=packed.s_sub,
-                        )
-
-                        loss_proj = torch.tensor(0.0, device=device)
-                        if args.projection_aware:
-                            data_mask = (packed.node_type == 0) & node_mask
-                            proj_bits = projection_aware_logits_to_bits(
-                                logits,
-                                projector_kwargs={
-                                    "H_sub": packed.H_sub,
-                                    "side": getattr(packed.meta, "side", "Z"),
-                                    "s_sub": packed.s_sub,
-                                },
-                                data_mask=data_mask,
-                            )
-                            with torch.no_grad():
-                                mask_data = data_mask.detach().cpu().numpy()
-                                target_full = (
-                                    packed.y_bits.detach().cpu().numpy().clip(0, 1).astype(np.uint8)
-                                )
-                                target_data = target_full[mask_data]
-
-                            proj_target = torch.from_numpy(target_data).to(device)
-                            proj_pred = torch.from_numpy(proj_bits.astype(np.int64)).to(device)
-
-                            raw_bits = (
-                                torch.sigmoid(logits[:, 1] - logits[:, 0])[data_mask] > 0.5
-                            ).long()
-                            loss_proj = 0.5 * F.l1_loss(
-                                proj_pred.float(), proj_target.float()
-                            ) + 0.2 * F.l1_loss(proj_pred.float(), raw_bits.float())
-
-                        sample_loss = loss_bce + loss_par + 0.5 * loss_proj
-                        batch_loss = batch_loss + sample_loss
-
-                batch_size = len(moved)
-                batch_loss = batch_loss / batch_size
-                _backward_and_step(batch_loss)
-
-                total_loss += batch_loss.detach().item() * batch_size
-                n_items += batch_size
-                steps_done += 1
-                if prog_stride and (steps_done % prog_stride == 0):
-                    prog = {
-                        "epoch": epoch,
-                        "step": int(steps_done),
-                        "steps": int(steps_total),
-                        "avg": float(total_loss / max(n_items, 1)),
-                        "secs": float(time.time() - t0),
-                    }
-                    print(json.dumps(prog, separators=(",", ":")), flush=True)
-                heartbeat_s = float(getattr(args, "progress_seconds", 0.0))
-                now = time.time()
-                if rank == 0 and heartbeat_s > 0.0 and (now - last_heartbeat) >= heartbeat_s:
-                    hb = {
-                        "heartbeat": True,
-                        "epoch": int(epoch),
-                        "step": int(steps_done),
-                        "steps": int(steps_total),
-                        "avg": float(total_loss / max(n_items, 1)),
-                        "secs": float(now - t0),
-                        "items": int(n_items),
-                    }
-                    print(json.dumps(hb, separators=(",", ":")), flush=True)
-                    last_heartbeat = now
 
         sched.step()
         dt = time.time() - t0
@@ -2019,12 +1714,23 @@ def train_inprocess(ns) -> str:
         prev_epoch_loss = avg
 
         if rank == 0:
+            _ckpt_config = {
+                "profile": str(getattr(args, "profile", "S")),
+                "d_model": int(getattr(args, "d_model", 192)),
+                "d_state": int(getattr(args, "d_state", 80)),
+                "n_iters": int(getattr(args, "n_iters", 8)),
+                "node_feat_dim": int(getattr(args, "node_feat_dim", 9)),
+                "edge_feat_dim": int(getattr(args, "edge_feat_dim", 3)),
+                "g_token_dim": int(getattr(args, "g_token_dim", 12)),
+                "component_scope": str(getattr(args, "component_scope", "active")),
+            }
             torch.save(
                 {
                     "model": model.module.state_dict() if is_distributed else model.state_dict(),
                     "optimizer": opt.state_dict(),
                     "epoch": epoch,
                     "loss": avg,
+                    "model_config": _ckpt_config,
                 },
                 save_dir / "last.pt",
             )
@@ -2038,13 +1744,14 @@ def train_inprocess(ns) -> str:
                         "optimizer": opt.state_dict(),
                         "epoch": epoch,
                         "loss": avg,
+                        "model_config": _ckpt_config,
                     },
                     save_dir / "best.pt",
                 )
 
             log_obj = {"epoch": epoch, "loss": avg, "secs": dt}
             if use_online:
-                log_obj["p"] = float(p_epoch if "p_epoch" in locals() else getattr(args, "p", 0.0))
+                log_obj["p"] = "mixed" if isinstance(p_epoch, list) else float(p_epoch if "p_epoch" in locals() else getattr(args, "p", 0.0))
             if epoch_distance_loss:
                 log_obj["distance_loss"] = epoch_distance_loss
             if epoch_distance_counts:
@@ -2093,38 +1800,6 @@ def train_inprocess(ns) -> str:
         except Exception:
             pass
 
-    # Optional teacher comparison report
-    if hasattr(args, "post_eval") and bool(getattr(args, "post_eval", False)) and rank == 0:
-        try:
-            import subprocess, sys as _sys, os as _os
-
-            shots = int(getattr(args, "post_eval_shots_per_batch", 16))
-            batches = int(getattr(args, "post_eval_batches", 2))
-            sampler = str(getattr(args, "post_eval_sampler", "stim"))
-            cmd = [
-                _sys.executable,
-                "-m",
-                "mghd.tools.teacher_eval",
-                "--families",
-                str(args.family),
-                "--distances",
-                str(args.distance),
-                "--sampler",
-                sampler,
-                "--shots-per-batch",
-                str(shots),
-                "--batches",
-                str(batches),
-            ]
-            env = _os.environ.copy()
-            env.setdefault("PYTHONPATH", _os.getcwd())
-            cp = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            (save_dir / "teacher_eval.txt").write_text(
-                cp.stdout + ("\n--- STDERR ---\n" + cp.stderr if cp.stderr else "")
-            )
-        except Exception:
-            pass
-
     if is_distributed:
         dist.destroy_process_group()
 
@@ -2145,66 +1820,6 @@ def move_to(p: PackedCrop, device):
     p.y_bits = p.y_bits.to(device)
     p.s_sub = p.s_sub.to(device)
     return p
-
-
-def sanity_train(
-    crop_root: str,
-    epochs: int = 2,
-    batch_size: int = 2,
-    lr: float = 1e-4,
-    hparams: str | None = None,
-):
-    """Quick sanity training over a small offline crop dir (for tests/demos)."""
-    import os
-    import tempfile
-    from types import SimpleNamespace
-
-    ns = SimpleNamespace()
-    ns.data_root = crop_root  # Changed from crop_root to data_root to match arg parser
-    ns.epochs = epochs
-    ns.batch = batch_size  # Changed from batch_size to batch to match arg parser
-    ns.lr = lr
-    ns.wd = 1e-5  # Changed from weight_decay to wd
-    ns.profile = "S"  # Default profile
-    ns.ema = 0.999
-    ns.parity_lambda = 0.03
-    ns.projection_aware = 1
-    ns.seed = 42
-    ns.label_smoothing = 0.1
-    ns.use_focal = False
-    ns.focal_alpha = 0.25
-    ns.focal_gamma = 2.0
-    ns.noise_injection = 0.0
-    ns.grad_clip = 1.0
-    ns.node_feat_dim = 9
-    ns.edge_feat_dim = 3
-    ns.g_token_dim = 12
-    ns.hparams = hparams
-
-    # Create temporary directory for save path
-    temp_dir = tempfile.mkdtemp()
-    ns.save = os.path.join(temp_dir, "sanity_test")
-
-    print(f"Running sanity training with {epochs} epochs, batch_size={batch_size}, lr={lr}")
-    print(f"Temporary save path: {ns.save}")
-
-    try:
-        result_path = train_inprocess(ns)
-        print(f"Training completed, result: {result_path}")
-
-        # Return the trained model for inspection
-        from mghd.core.core import MGHDv2
-
-        model = MGHDv2(profile=ns.profile)
-        if torch.cuda.is_available():
-            model = model.cuda()
-        return model
-    finally:
-        # Clean up temp directory
-        import shutil
-
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
 
 
 # Global cache for workers to avoid rebuilding teachers every epoch/iteration
@@ -2229,7 +1844,13 @@ class OnlineSurfaceDataset(IterableDataset):
         rank=0,
     ):
         self.args = args
-        self.p_epoch = p_epoch
+        # p_epoch can be a list (per-sample mixing) or a float (fixed p)
+        if isinstance(p_epoch, list):
+            self.p_list = p_epoch
+            self.p_epoch = p_epoch[0]  # fallback scalar for compat
+        else:
+            self.p_list = None
+            self.p_epoch = p_epoch
         self.epoch = epoch
         # shots_total refers to the per-rank budget; workers will partition this in __iter__
         self.shots_to_do = shots_total
@@ -2303,7 +1924,7 @@ class OnlineSurfaceDataset(IterableDataset):
                 mwpm_matcher_x=mwpm_matcher_x,
             )
 
-            for (sample, shot_seed, erase_local), predecoded in zip(bucket, teacher_predecoded):
+            for (sample, shot_seed, erase_local, p_shot), predecoded in zip(bucket, teacher_predecoded):
                 yield from self._process_sample(
                     sample,
                     shot_seed,
@@ -2315,6 +1936,7 @@ class OnlineSurfaceDataset(IterableDataset):
                     erase_local,
                     nvqldpc_teacher=nvqldpc_teacher,
                     predecoded=predecoded,
+                    p_shot=p_shot,
                 )
             pending_by_d[distance] = []
 
@@ -2339,9 +1961,15 @@ class OnlineSurfaceDataset(IterableDataset):
             # Per-shot seed
             shot_seed = int(rng.integers(0, 2**31 - 1))
 
+            # Per-sample p mixing: draw p from curriculum list each shot
+            if self.p_list is not None:
+                p_shot = float(rng.choice(self.p_list))
+            else:
+                p_shot = float(self.p_epoch)
+
             sample = sample_round(
                 d=d,
-                p=self.p_epoch,
+                p=p_shot,
                 seed=shot_seed,
                 profile_path=self.args.qpu_profile if self.args.qpu_profile else None,
             )
@@ -2385,7 +2013,7 @@ class OnlineSurfaceDataset(IterableDataset):
                     additional_synX = (Hx @ erasure_err_z) % 2
                     sample["synX"] = (sample["synX"] ^ additional_synX).astype(np.uint8)
 
-            pending_by_d[d].append((sample, shot_seed, erase_local))
+            pending_by_d[d].append((sample, shot_seed, erase_local, p_shot))
             if len(pending_by_d[d]) >= decode_bs:
                 yield from _flush_distance(d)
 
@@ -2603,7 +2231,10 @@ class OnlineSurfaceDataset(IterableDataset):
         erase_local=None,
         nvqldpc_teacher=None,
         predecoded=None,
+        p_shot=None,
     ):
+        if p_shot is None:
+            p_shot = self.p_epoch
         # Logic extracted from the main loop
         if predecoded is not None:
             fault_ids_global = predecoded.get("fault_ids_global", None)
@@ -2783,7 +2414,7 @@ class OnlineSurfaceDataset(IterableDataset):
                         # Raw sampled ex/ez are not unique for a fixed syndrome.
                         # Use a deterministic channel-ML representative so the
                         # supervision target is stable across equivalent errors.
-                        p_prior = float(np.clip(self.p_epoch, 1e-6, 1.0 - 1e-6))
+                        p_prior = float(np.clip(p_shot, 1e-6, 1.0 - 1e-6))
                         prior = np.full(H_sub.shape[1], p_prior, dtype=np.float64)
                         try:
                             bits_local = cc.ml_parity_project(
@@ -2886,7 +2517,7 @@ class OnlineSurfaceDataset(IterableDataset):
                     y_bits_local=chosen_bits,
                     side=side,
                     d=d,
-                    p=self.p_epoch,
+                    p=p_shot,
                     seed=seed,
                     N_max=self.args.N_max if hasattr(self.args, "N_max") else 512,
                     E_max=self.args.E_max if hasattr(self.args, "E_max") else 4096,

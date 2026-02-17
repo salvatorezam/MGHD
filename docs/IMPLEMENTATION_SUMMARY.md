@@ -1,5 +1,51 @@
 MGHD/HyperBlossom — Progress Log
 
+2026-08-30 — Phase 0: Training pipeline fix + cleanup
+
+Root cause analysis identified catastrophic under-training (only ~16 gradient
+steps total across all prior runs due to batch=65536 > shots/epoch) and several
+train/eval contract mismatches.  Changes below prepare a correct training run.
+
+- **Per-sample p mixing** (`mghd/cli/train.py`): Each shot now draws its own
+  `p_shot` from the `--p-curriculum` list instead of using a single per-epoch p.
+  Prevents catastrophic forgetting and improves gradient diversity.  The sampled
+  `p_shot` is threaded through `_flush_distance` → `_process_sample` →
+  `pack_cluster` so the g_token encodes the true per-sample noise rate.
+
+- **Jump-edge default alignment** (`mghd/core/core.py`): Changed
+  `_build_pack(add_jump_edges)` default from `True` to `False` and `jump_k`
+  from `2` to `1`.  Training never used jump edges; inference now matches.
+
+- **Mamba fallback warning** (`mghd/core/core.py`): When `mamba_ssm` is not
+  importable, the SequenceEncoder falls back to `nn.Identity()`.  This is now
+  accompanied by an explicit `warnings.warn(...)` so silent degradation is
+  caught.  (Verified: `mamba_ssm==2.2.5` is installed; Mamba is active.)
+
+- **Checkpoint metadata** (`mghd/cli/train.py`): Both `last.pt` and `best.pt`
+  now include a `model_config` dict (`profile`, `d_model`, `d_state`, `n_iters`,
+  `node_feat_dim`, `edge_feat_dim`, `g_token_dim`, `component_scope`).
+
+- **train.py slimmed** (2933 → 2546 lines):
+  - Removed offline crop-shard training path (`CropShardDataset`,
+    `make_bucket_sampler`, offline `else:` training loop branch, offline
+    DataLoader init).  Online-only training is the supported path.
+  - Removed `sanity_train()` dead-code function.
+  - Removed `--post-eval` / post-training subprocess block.
+  - Removed 8 `--generic-*` noise argparse parameters (defaults remain in
+    `getattr` fallbacks for backward compat).
+  - Removed unused `_TEACHER_POOL` global and stale imports (`glob`, `random`,
+    `Dataset`, `Sampler`).
+
+- **Stale files deleted**: 9 shell scripts (`start_tmux_*.sh`,
+  `generate_bb_crops.sh`, `run_bb_gross_heron.sh`, `resume_script.sh`,
+  `run_d15_surface.sh`, `run_final_d15.sh`, `run_execution_plan_v3.sh`,
+  `run_surface_lsd_curriculum.sh`, `run_validation_d3_5.sh`), `scratchpad/`
+  directory.
+
+Next: launch training with `--component-scope active`, `--shots-per-epoch
+2000000`, `--p-curriculum 0.01,...,0.15`, `--teacher-mix oracle=1.0`, 200
+epochs on 2×H100.
+
 2026-02-11
 
 - SHA b4cb418 (milestone pre-commit state) — Resolved the long-running "bad/overlapping MGHD curves" regression by fixing a train/eval contract mismatch and proving metric integrity. Root cause was **component scope drift**: training runs used full-side subproblems in key experiments while evaluation always decoded active components, which changed the decode regime enough to distort distance-scaling and crossover behavior. Implemented explicit scope control end-to-end:

@@ -710,6 +710,12 @@ class SequenceEncoder(nn.Module):
                 break
         if self.core is None:
             # Fallback: identity encoder (no sequence modeling) for CPU-only CI.
+            import warnings
+            warnings.warn(
+                "Mamba SSM unavailable — SequenceEncoder using Identity fallback. "
+                "Install mamba-ssm for production training.",
+                stacklevel=2,
+            )
             self.core = nn.Identity()
         self.out_norm = nn.LayerNorm(d_model)
 
@@ -1337,8 +1343,8 @@ class MGHDDecoderPublic:
                 bbox = (0, 0, 1, 1)
         bbox_xywh = tuple(int(v) for v in bbox)
 
-        add_jump_edges = bool(meta.get("add_jump_edges", True))
-        jump_k = int(meta.get("jump_k", 2))
+        add_jump_edges = bool(meta.get("add_jump_edges", False))
+        jump_k = int(meta.get("jump_k", 1))
         g_extra = meta.get("g_extra", None)
         if g_extra is not None:
             g_extra = np.asarray(g_extra, dtype=np.float32).ravel()
