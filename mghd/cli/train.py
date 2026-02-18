@@ -78,7 +78,8 @@ def collate_packed(batch):
     # Meta: use first one, but we might need per-sample meta for projection
     meta = batch[0].meta
     # We attach the list of metas to the batch meta for reference
-    meta.batch_metas = [c.meta for c in batch]
+    if meta is not None:
+        meta.batch_metas = [c.meta for c in batch]
 
     return PackedCrop(
         x_nodes=x_nodes,
@@ -466,11 +467,12 @@ def train_inprocess(ns) -> str:
     parser.add_argument(
         "--edge-prune-thresh",
         type=float,
-        default=1e-3,
+        default=1e-6,
         help=(
             "Probability threshold for edge pruning in DEM graph. "
             "Edges with merged probability below this value are dropped. "
-            "Lower = more edges (larger graphs), higher = fewer edges (faster)."
+            "Lower = more edges (larger graphs), higher = fewer edges (faster). "
+            "Default 1e-6 preserves all relevant edges at low physical p."
         ),
     )
     parser.add_argument(
@@ -1669,9 +1671,11 @@ def evaluate_dem_ler(
                 probs = torch.softmax(logits, dim=-1)[:, 1]
                 pred_bits = (probs > 0.5).cpu().numpy().astype(np.uint8)
 
-                # Extract edge-node predictions (type-0, first nQ slots)
-                nQ = pack.meta.r
-                pred_edge = pred_bits[:nQ]
+                # Extract edge-node predictions using node_type mask (robust)
+                nt = pack.node_type.squeeze(0).cpu().numpy()
+                nm = pack.node_mask.squeeze(0).cpu().numpy().astype(bool)
+                edge_mask = (nt == 0) & nm
+                pred_edge = pred_bits[edge_mask]
 
                 # Pad to full edge space if needed
                 if pred_edge.shape[0] < n_edges:
@@ -1984,6 +1988,29 @@ class OnlineSurfaceDataset(IterableDataset):
             # Active decomposition on the detector adjacency graph
             fired = np.where(det_bits > 0)[0]
             if len(fired) == 0:
+                # Zero-syndrome: emit a small "null" crop so the model
+                # learns to predict all-zeros when no detectors fire.
+                # Use a small subgraph (first few detectors/edges) to
+                # keep the crop lightweight.
+                n_null_det = min(4, info["n_det"])
+                n_null_edge = min(4, info["n_edges"])
+                null_dets = np.arange(n_null_det, dtype=np.intp)
+                null_edges = np.arange(n_null_edge, dtype=np.intp)
+                pack = pack_dem_cluster(
+                    H_edge=info["H_edge"],
+                    det_coords=info["det_coords"],
+                    edge_coords=info["edge_coords"],
+                    det_bits=det_bits,
+                    y_bits_edge=y_bits,  # all zeros (MWPM agrees)
+                    edge_indices=null_edges,
+                    det_indices=null_dets,
+                    d=dist, rounds=n_rounds, p=p_shot,
+                    N_max=self.args.N_max,
+                    E_max=self.args.E_max,
+                    S_max=self.args.S_max,
+                )
+                if pack is not None:
+                    yield pack
                 continue
 
             det_adj = info["det_adj"]
