@@ -474,6 +474,24 @@ def train_inprocess(ns) -> str:
         ),
     )
     parser.add_argument(
+        "--val-every",
+        type=int,
+        default=0,
+        help="Run LER validation every N epochs (0 = disabled).",
+    )
+    parser.add_argument(
+        "--val-shots",
+        type=int,
+        default=256,
+        help="Number of Stim shots per (d,p) point during validation.",
+    )
+    parser.add_argument(
+        "--val-p",
+        type=str,
+        default=None,
+        help="Comma-separated p values for validation (default: use training p values).",
+    )
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -1154,6 +1172,48 @@ def train_inprocess(ns) -> str:
             for k in sorted(distance_item_count.keys())
             if distance_item_count[k] > 0
         }
+        # ── Periodic LER validation ──────────────────────────────────
+        val_every = int(getattr(args, "val_every", 0))
+        val_ler_results = None
+        if val_every > 0 and epoch % val_every == 0 and rank == 0:
+            val_shots = int(getattr(args, "val_shots", 256))
+            val_p_str = getattr(args, "val_p", None)
+            if val_p_str:
+                val_p_vals = [float(x) for x in str(val_p_str).split(",") if x.strip()]
+            elif p_list:
+                val_p_vals = [p_list[0], p_list[-1]] if len(p_list) > 1 else p_list[:1]
+            else:
+                val_p_vals = [float(getattr(args, "p", 0.005))]
+
+            val_dists = [int(args.distance)]
+            dc = str(getattr(args, "distance_curriculum", "") or "")
+            if dc:
+                dc_parsed = [int(x) for x in dc.split(",") if x.strip()]
+                if dc_parsed:
+                    val_dists = [dc_parsed[0]]
+                    if len(dc_parsed) > 1 and dc_parsed[-1] != dc_parsed[0]:
+                        val_dists.append(dc_parsed[-1])
+
+            eval_model = model.module if is_distributed else model
+            val_ler_results = evaluate_dem_ler(
+                eval_model, args, val_dists, val_p_vals, val_shots, device,
+            )
+            for vr in val_ler_results:
+                val_log = {
+                    "val_epoch": epoch,
+                    "d": vr["d"], "p": vr["p"],
+                    "ler": vr["ler"],
+                    "ler_ci": f"{vr['ler_lo']:.4f}-{vr['ler_hi']:.4f}",
+                    "teacher_ler": vr["teacher_ler"],
+                    "n_shots": vr["n_shots"],
+                }
+                print(json.dumps(val_log, separators=(",", ":")), flush=True)
+                try:
+                    with (save_dir / "train_log.jsonl").open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(val_log, separators=(",", ":")) + "\n")
+                except Exception:
+                    pass
+
         history.append(
             {
                 "epoch": epoch,
@@ -1162,6 +1222,7 @@ def train_inprocess(ns) -> str:
                 "secs": dt,
                 "distance_loss": epoch_distance_loss if epoch_distance_loss else None,
                 "distance_counts": epoch_distance_counts if epoch_distance_counts else None,
+                "val_ler": val_ler_results,
             }
         )
 
@@ -1505,6 +1566,143 @@ def _teacher_labels_from_matching(
         if eidx is not None:
             y_bits[eidx] = 1
     return y_bits
+
+
+def compute_observable_correction(
+    L_obs: np.ndarray,
+    predicted_edges: np.ndarray,
+) -> np.ndarray:
+    """Compute predicted observable flips from edge-node predictions.
+
+    Parameters
+    ----------
+    L_obs : (n_obs, n_edges) uint8 — observable-to-edge mapping
+    predicted_edges : (n_edges,) uint8 — predicted edge-node flips (0 or 1)
+
+    Returns
+    -------
+    pred_obs : (n_obs,) uint8 — predicted observable correction
+    """
+    return ((L_obs @ predicted_edges) % 2).astype(np.uint8)
+
+
+@torch.no_grad()
+def evaluate_dem_ler(
+    model: nn.Module,
+    args,
+    distances: list[int],
+    p_values: list[float],
+    shots: int,
+    device: torch.device,
+) -> list[dict]:
+    """Evaluate circuit-level LER by sampling Stim shots and decoding with model.
+
+    For each (d, p), samples ``shots`` detection events, runs the model forward
+    on each shot's full DEM graph, thresholds edge-node predictions, and
+    computes the observable correction via L_obs.  Compares to true observable
+    flips to compute LER with Wilson CIs.
+
+    Returns a list of result dicts with keys:
+        d, p, ler, ler_lo, ler_hi, n_shots, teacher_ler
+    """
+    from mghd.utils.metrics import _wilson_interval
+
+    model.eval()
+    results = []
+    noise_model = str(getattr(args, "noise_model", "SI1000"))
+    edge_prune = float(getattr(args, "edge_prune_thresh", 1e-3))
+
+    for d in distances:
+        for p_val in p_values:
+            n_rounds = int(getattr(args, "rounds", 0)) or d
+            info = _build_dem_info(d, n_rounds, p_val, noise_model, edge_prune)
+
+            L_obs = info["L_obs"]
+            n_obs = info["n_obs"]
+            n_edges = info["n_edges"]
+
+            mghd_errors = 0
+            teacher_errors = 0
+            n_valid = 0
+
+            for _ in range(shots):
+                det_bits_all, obs_all = info["sampler"].sample(
+                    shots=1, separate_observables=True
+                )
+                det_bits = det_bits_all[0].astype(np.uint8)
+                true_obs = obs_all[0].astype(np.uint8)
+
+                # Teacher prediction (PyMatching)
+                teacher_edges = _teacher_labels_from_matching(
+                    det_bits, info["matching"],
+                    info["det_pair_to_edge"], n_edges,
+                )
+                teacher_obs = compute_observable_correction(L_obs, teacher_edges)
+
+                # MGHD prediction: pack full graph, run model, threshold
+                pack = pack_dem_cluster(
+                    H_edge=info["H_edge"],
+                    det_coords=info["det_coords"],
+                    edge_coords=info["edge_coords"],
+                    det_bits=det_bits,
+                    y_bits_edge=np.zeros(n_edges, dtype=np.uint8),
+                    d=d, rounds=n_rounds, p=p_val,
+                    N_max=args.N_max, E_max=args.E_max, S_max=args.S_max,
+                )
+
+                if pack is None:
+                    continue
+
+                pack = move_to(pack, device)
+                # Add batch dimension
+                pack.x_nodes = pack.x_nodes.unsqueeze(0)
+                pack.node_mask = pack.node_mask.unsqueeze(0)
+                pack.node_type = pack.node_type.unsqueeze(0)
+                pack.g_token = pack.g_token.unsqueeze(0)
+                pack.y_bits = pack.y_bits.unsqueeze(0)
+                pack.s_sub = pack.s_sub.unsqueeze(0)
+                pack.seq_idx = pack.seq_idx.unsqueeze(0)
+                pack.seq_mask = pack.seq_mask.unsqueeze(0)
+
+                logits, node_mask = model(packed=pack)
+                # logits: (N_max, 2) — take softmax class-1 probability
+                probs = torch.softmax(logits, dim=-1)[:, 1]
+                pred_bits = (probs > 0.5).cpu().numpy().astype(np.uint8)
+
+                # Extract edge-node predictions (type-0, first nQ slots)
+                nQ = pack.meta.r
+                pred_edge = pred_bits[:nQ]
+
+                # Pad to full edge space if needed
+                if pred_edge.shape[0] < n_edges:
+                    pred_full = np.zeros(n_edges, dtype=np.uint8)
+                    pred_full[:pred_edge.shape[0]] = pred_edge
+                    pred_edge = pred_full
+
+                mghd_obs = compute_observable_correction(L_obs, pred_edge[:n_edges])
+
+                if np.any(mghd_obs != true_obs):
+                    mghd_errors += 1
+                if np.any(teacher_obs != true_obs):
+                    teacher_errors += 1
+                n_valid += 1
+
+            if n_valid > 0:
+                ler = mghd_errors / n_valid
+                lo, hi = _wilson_interval(mghd_errors, n_valid)
+                teacher_ler = teacher_errors / n_valid
+            else:
+                ler, lo, hi, teacher_ler = 0.0, 0.0, 0.0, 0.0
+
+            results.append({
+                "d": d, "p": p_val,
+                "ler": ler, "ler_lo": lo, "ler_hi": hi,
+                "n_shots": n_valid,
+                "teacher_ler": teacher_ler,
+            })
+
+    model.train()
+    return results
 
 
 def pack_dem_cluster(
