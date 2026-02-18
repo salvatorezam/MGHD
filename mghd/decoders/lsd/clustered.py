@@ -691,10 +691,14 @@ class MGHDPrimaryClustered:
     # ------------------------------------------------------------------ #
 
     def _decode_mwpm(self, s: np.ndarray) -> Dict[str, Any]:
-        """Run model on the full code, use per-qubit priors as pymatching weights.
+        """Hybrid decode: per-component model priors → global MWPM matching.
 
-        This avoids per-component decomposition entirely; the model provides
-        learned priors and MWPM handles global matching + boundary effects.
+        1. Decompose syndrome into active components (same as training).
+        2. Tier-0: solve tiny clusters exactly with channel ML.
+        3. Model: get per-qubit priors for remaining clusters (in-distribution).
+        4. Assemble per-qubit weights: model priors for active qubits,
+           channel prior ``p`` for inactive qubits.
+        5. Run global MWPM with those weights for correct boundary handling.
         """
         if not _PYMATCHING_OK:
             raise RuntimeError("pymatching is required for projection_mode='mwpm'")
@@ -713,68 +717,90 @@ class MGHDPrimaryClustered:
                 "tier0_clusters": 0,
             }
 
-        # Build a single full-code subproblem
-        q_l2g = np.arange(n_q, dtype=np.int64)
-        c_l2g = np.arange(H.shape[0], dtype=np.int64)
-        xy_qubit = self.coords_qubit[q_l2g]
-        xy_check = self.coords_check[c_l2g]
-        all_coords = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
-        mins = all_coords.min(axis=0) if all_coords.size else np.zeros(2, dtype=np.float32)
-        maxs = all_coords.max(axis=0) if all_coords.size else np.zeros(2, dtype=np.float32)
-        bbox_xywh = (
-            int(mins[0]), int(mins[1]),
-            int(maxs[0] - mins[0] + 1), int(maxs[1] - mins[1] + 1),
-        )
-        k_local = int(H.shape[0])
-        r_local = int(H.shape[1])
-        extra_meta = {
-            "xy_qubit": xy_qubit,
-            "xy_check": xy_check,
-            "k": k_local,
-            "r": r_local,
-            "bbox_xywh": bbox_xywh,
-            "kappa_stats": {
+        # ── Step 1: decompose into active components ──
+        check_comps, qubit_comps = active_components(H, s, halo=self.halo)
+
+        subproblems: List[Dict[str, Any]] = []
+        for checks, qubits in zip(check_comps, qubit_comps):
+            H_sub, s_sub, q_l2g, c_l2g = extract_subproblem(H, s, checks, qubits)
+            xy_qubit = self.coords_qubit[q_l2g]
+            xy_check = self.coords_check[c_l2g]
+            all_coords = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
+            mins = all_coords.min(axis=0) if all_coords.size else np.zeros(2, dtype=np.float32)
+            maxs = all_coords.max(axis=0) if all_coords.size else np.zeros(2, dtype=np.float32)
+            k_local = int(H_sub.shape[0])
+            r_local = int(H_sub.shape[1])
+            extra_meta = {
+                "xy_qubit": xy_qubit, "xy_check": xy_check,
                 "k": k_local, "r": r_local,
-                "density": float(k_local / max(1, r_local)),
-                "syndrome_weight": int(s.sum()),
-                "scope": "full",
-            },
-            "side": self.side,
-            "d": self.distance,
-            "p": float(self.default_p or self.p_channel or 0.01),
-            "seed": 0,
-            "add_jump_edges": False,
-            "jump_k": 1,
-        }
+                "bbox_xywh": (int(mins[0]), int(mins[1]),
+                              int(maxs[0] - mins[0] + 1), int(maxs[1] - mins[1] + 1)),
+                "kappa_stats": {"k": k_local, "r": r_local,
+                                "density": float(k_local / max(1, r_local)),
+                                "syndrome_weight": int(np.asarray(s_sub, dtype=np.uint8).sum())},
+                "side": self.side, "d": self.distance,
+                "p": float(self.default_p or self.p_channel or 0.01),
+                "seed": 0, "add_jump_edges": False, "jump_k": 1,
+            }
+            subproblems.append({
+                "H_sub": H_sub, "s_sub": s_sub,
+                "q_l2g": q_l2g, "c_l2g": c_l2g, "extra": extra_meta,
+            })
 
-        # Run model on the full code
-        self._sync_cuda()
-        t0 = self._time.perf_counter()
-        probs_list, _ = self.mghd.priors_from_subgraphs_batched(
-            [(H, s, q_l2g, c_l2g, extra_meta)],
-            temp=self.temp,
-            bucket=self.side,
-            bucket_spec=self.bucket_spec,
-            microbatch=self.microbatch,
-            flush_ms=self.flush_ms,
-            use_graphs=False,
-        )
-        self._sync_cuda()
-        t_mghd = (self._time.perf_counter() - t0) * 1e6
+        # ── Step 2: initialise per-qubit priors from channel rate ──
+        p_ch = float(self.default_p or self.p_channel or 0.01)
+        priors = np.full(n_q, p_ch, dtype=np.float64)
+        tier0_solved = 0
+        model_items: List[Tuple] = []
+        model_q_l2g: List[np.ndarray] = []
 
-        priors = np.asarray(probs_list[0], dtype=np.float64)
-        assert priors.shape == (n_q,), f"Expected ({n_q},), got {priors.shape}"
+        for entry in subproblems:
+            # Try tier-0 exact solve first
+            if self.tier0_enable:
+                try:
+                    e_exact = solve_small_cluster_channel_ml(
+                        entry["H_sub"], entry["s_sub"],
+                        p_channel=p_ch,
+                        k_max=self.tier0_k_max, r_cap=self.tier0_r_max,
+                    )
+                except (ValueError, AssertionError):
+                    e_exact = None
+                if e_exact is not None:
+                    # Tier-0 clusters keep channel prior — let global MWPM
+                    # handle boundary/coset decisions freely.
+                    tier0_solved += 1
+                    continue
+            # Queue for model inference
+            model_items.append((
+                entry["H_sub"], entry["s_sub"],
+                entry["q_l2g"], entry["c_l2g"], entry["extra"],
+            ))
+            model_q_l2g.append(entry["q_l2g"])
 
-        # Build MWPM matcher with model priors as edge weights
+        # ── Step 3: model inference on remaining clusters ──
+        t_mghd = 0.0
+        if model_items:
+            self._sync_cuda()
+            t0 = self._time.perf_counter()
+            probs_list, _ = self.mghd.priors_from_subgraphs_batched(
+                model_items,
+                temp=self.temp, bucket=self.side,
+                bucket_spec=self.bucket_spec,
+                microbatch=self.microbatch, flush_ms=self.flush_ms,
+                use_graphs=False,
+            )
+            self._sync_cuda()
+            t_mghd = (self._time.perf_counter() - t0) * 1e6
+            for p_local, q_g in zip(probs_list, model_q_l2g):
+                priors[q_g] = np.asarray(p_local, dtype=np.float64)
+
+        # ── Step 4: global MWPM with assembled weights ──
         t1 = self._time.perf_counter()
         eps = 1e-8
         priors_clipped = np.clip(priors, eps, 1.0 - eps)
-        weights = np.log((1.0 - priors_clipped) / priors_clipped)  # log-likelihood ratio
+        weights = np.log((1.0 - priors_clipped) / priors_clipped)
 
-        matcher = _pm.Matching(
-            H.toarray().astype(np.uint8), weights=weights
-        )
-
+        matcher = _pm.Matching(H.toarray().astype(np.uint8), weights=weights)
         e = matcher.decode(s)
         t_proj = (self._time.perf_counter() - t1) * 1e6
 
@@ -783,8 +809,8 @@ class MGHDPrimaryClustered:
             "sizes_hist": {},
             "mghd_invoked": t_mghd,
             "proj_us": t_proj,
-            "mghd_clusters": 1,
-            "tier0_clusters": 0,
+            "mghd_clusters": len(model_items),
+            "tier0_clusters": tier0_solved,
         }
 
     def decode(self, s: np.ndarray, perf_only: bool = False) -> Dict[str, Any]:
