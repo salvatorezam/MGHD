@@ -1,8 +1,8 @@
-"""MGHD trainer: online (on-the-fly) surface‑code training.
+"""MGHD trainer: online surface-code training with Stim DEM-based sampling.
 
-Defines an online training loop that samples syndromes on the fly, routes
-teacher supervision, and packs subgraphs into MGHDv2 input tensors.  Detector
-bits are handled in canonical Z→X order throughout (matching Stim/DEM).
+Generates circuit-level syndrome data via Stim detector error models,
+routes teacher supervision (PyMatching from DEM), and packs 3D subgraphs
+into MGHDv2 input tensors for training.
 CUDA is initialized only inside ``main``.
 """
 
@@ -28,20 +28,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, IterableDataset
 
-from mghd.codes.qpu_profile import load_qpu_profile
-from mghd.core.core import MGHDv2, PackedCrop, pack_cluster
-from mghd.decoders.lsd import clustered as cc  # uses projector functions
-from mghd.decoders.lsd_teacher import LSDTeacher
-from mghd.decoders.mwpf_teacher import MWPFTeacher
-from mghd.decoders.mwpm_ctx import MWPMatchingContext
-from mghd.decoders.nvqldpc_teacher import NvQldpcTeacher
-from mghd.qpu.adapters.surface_sampler import sample_round, split_components_for_side
-from mghd.samplers.cudaq_backend.noise_config import (
-    axis_from_noise_spec,
-    resolve_canonical_noise_spec,
-)
-from mghd.tad import context as tad_context
-from mghd.tad import weighting as tad_weighting
+from mghd.core.core import MGHDv2, PackedCrop, CropMeta, pack_cluster
+from mghd.decoders.lsd import clustered as cc
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -308,7 +296,7 @@ def train_inprocess(ns) -> str:
     args = ns
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", type=str, required=False)
-    parser.add_argument("--online", action="store_true", help="Enable on-the-fly CUDA-Q sampling")
+    parser.add_argument("--online", action="store_true", help="Enable on-the-fly Stim DEM sampling")
     parser.add_argument("--family", type=str, default="surface")
     parser.add_argument("--distance", type=int, default=3)
     parser.add_argument(
@@ -326,154 +314,37 @@ def train_inprocess(ns) -> str:
         default=1,
         help="Epochs to spend on each p value in --p-curriculum",
     )
-    parser.add_argument("--qpu-profile", type=str, default=None)
-    parser.add_argument(
-        "--context-source", type=str, default="none", choices=["none", "qiskit", "cirq", "cudaq"]
-    )
     parser.add_argument("--shots-per-epoch", type=int, default=256)
     parser.add_argument(
         "--sampler",
         type=str,
-        default="cudaq",
-        choices=["cudaq", "stim", "synthetic"],
+        default="stim",
+        choices=["stim", "synthetic"],
         help=(
             "Sampler backend for online mode: "
-            "'cudaq' uses the CUDA-Q adapter (or falls back), "
-            "'synthetic' uses a fast code-capacity sampler (data-only Pauli on data qubits), "
-            "'stim' is circuit-level detector sampling and is NOT compatible with MGHDv2's per-qubit "
-            "supervision pipeline (use a DEM/fault-space or observable-training path instead)."
+            "'stim' uses DEM-based circuit-level sampling (default), "
+            "'synthetic' uses fast code-capacity IID noise for testing."
         ),
     )
     parser.add_argument(
         "--noise-model",
         type=str,
-        default="auto",
-        choices=[
-            "auto",
-            "garnet",
-            "generic_cl",
-            "code_capacity",
-            "phenomenological",
-            "circuit_standard",
-            "circuit_augmented",
-        ],
-        help=(
-            "Noise model family for sampler=cudaq. "
-            "'auto' selects circuit_standard when no profile is set."
-        ),
+        default="SI1000",
+        help="Stim noise model name passed to stim.Circuit.generated() (e.g., SI1000, uniform).",
     )
     parser.add_argument(
-        "--lambda-scale",
-        type=float,
-        default=None,
-        help="Canonical lambda scaling factor for circuit_* noise models.",
+        "--rounds",
+        type=int,
+        default=0,
+        help="Number of syndrome extraction rounds (0 = use distance d).",
     )
     parser.add_argument(
-        "--noise-ramp",
-        type=str,
-        default="ramp0",
-        choices=["ramp0", "ramp1", "ramp2", "ramp3"],
-        help="Curriculum profile for augmented channels in circuit noise.",
-    )
-    parser.add_argument("--p-data", type=float, default=None, help="Canonical data-error rate.")
-    parser.add_argument(
-        "--p-meas",
-        type=float,
-        default=None,
-        help="Canonical measurement-error rate (phenomenological/circuit).",
-    )
-    parser.add_argument("--p-1q", type=float, default=None, help="Canonical 1Q gate error rate.")
-    parser.add_argument("--p-2q", type=float, default=None, help="Canonical 2Q gate error rate.")
-    parser.add_argument("--p-idle", type=float, default=None, help="Canonical idle error rate.")
-    parser.add_argument("--p-meas0", type=float, default=None, help="Canonical readout 0->1 error.")
-    parser.add_argument("--p-meas1", type=float, default=None, help="Canonical readout 1->0 error.")
-    parser.add_argument(
-        "--p-hook",
-        type=float,
-        default=None,
-        help="Canonical hook-error probability for circuit_augmented.",
-    )
-    parser.add_argument(
-        "--p-xtalk",
-        type=float,
-        default=None,
-        help="Canonical spectator crosstalk probability for circuit_augmented.",
-    )
-    parser.add_argument(
-        "--p-erase",
-        type=float,
-        default=None,
-        help="Canonical erasure probability for circuit_augmented.",
-    )
-    parser.add_argument(
-        "--p-long-range",
-        type=float,
-        default=None,
-        help="Canonical long-range burst probability for circuit_augmented.",
-    )
-    parser.add_argument(
-        "--phenomenological",
-        action="store_true",
-        help="Shortcut for requesting the fast synthetic sampler (sets sampler=synthetic)",
-    )
-    parser.add_argument(
-        "--erasure-frac",
+        "--after-clifford-depolarization",
         type=float,
         default=0.0,
-        help="Optional erasure injection fraction for online sampling",
+        help="Depolarization rate after Clifford gates for Stim circuit generation.",
     )
-    parser.add_argument("--teacher-mix", type=str, default="lsd=0.7,mwpm=0.3,mwpf=0.0")
-    parser.add_argument(
-        "--teacher-selection",
-        type=str,
-        default="stochastic",
-        choices=["stochastic", "min_weight", "consensus"],
-        help=(
-            "How to combine enabled teacher labels per crop: "
-            "'stochastic' samples by teacher-mix weights, "
-            "'min_weight' picks the lowest-weight correction, "
-            "'consensus' uses weighted bit-vote projected back to parity."
-        ),
-    )
-    parser.add_argument(
-        "--oracle-label-mode",
-        type=str,
-        default="channel_ml",
-        choices=["raw", "channel_ml"],
-        help=(
-            "How oracle labels are formed when oracle supervision is enabled. "
-            "'raw' uses sampled ex/ez bits directly; "
-            "'channel_ml' projects each crop syndrome to a deterministic "
-            "channel-ML parity-valid representative (recommended)."
-        ),
-    )
-    parser.add_argument(
-        "--teacher-contract-report",
-        type=str,
-        default=None,
-        help=(
-            "Optional path to teacher contract JSON from scripts/audit_teacher_contracts.py. "
-            "When provided, non-eligible teachers are auto-disabled."
-        ),
-    )
-    parser.add_argument(
-        "--teacher-contract-strict",
-        action="store_true",
-        help="If set with --teacher-contract-report, fail when a requested teacher is not eligible.",
-    )
-    parser.add_argument(
-        "--allow-unvalidated-nvqldpc",
-        action="store_true",
-        help=(
-            "Allow nvqldpc in --teacher-mix without a teacher contract report. "
-            "Disabled by default to avoid unsafe supervision."
-        ),
-    )
-    parser.add_argument(
-        "--online-rl",
-        action="store_true",
-        help="Enable LinTS scaling of TAD overrides in online mode",
-    )
+    parser.add_argument("--teacher-mix", type=str, default="pymatching=1.0")
     parser.add_argument("--profile", type=str, default="S")
     parser.add_argument("--ema", type=float, default=0.999)
     parser.add_argument("--lr", type=float, default=5.952925899948483e-05)
@@ -545,7 +416,8 @@ def train_inprocess(ns) -> str:
         type=int,
         default=16,
         help="Shots per distance bucket to decode together in online teacher path",
-        parser.add_argument(
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=4,
@@ -592,6 +464,16 @@ def train_inprocess(ns) -> str:
         ),
     )
     parser.add_argument(
+        "--edge-prune-thresh",
+        type=float,
+        default=1e-3,
+        help=(
+            "Probability threshold for edge pruning in DEM graph. "
+            "Edges with merged probability below this value are dropped. "
+            "Lower = more edges (larger graphs), higher = fewer edges (faster)."
+        ),
+    )
+    parser.add_argument(
         "--early-stop-patience",
         type=int,
         default=0,
@@ -630,147 +512,29 @@ def train_inprocess(ns) -> str:
         dist.init_process_group(backend="nccl", init_method="env://")
         print(f"Initialized DDP: rank {rank}/{world_size}, local_rank {local_rank}")
 
-    # Handle sampler selection and environment variable
-    sampler_choice = str(getattr(args, "sampler", "cudaq"))
-    if getattr(args, "phenomenological", False):
-        sampler_choice = "synthetic"
-        args.sampler = "synthetic"
-
-    generic_env_keys = (
-        "MGHD_GENERIC_P1Q",
-        "MGHD_GENERIC_P2Q",
-        "MGHD_GENERIC_PIDLE",
-        "MGHD_GENERIC_PMEAS0",
-        "MGHD_GENERIC_PMEAS1",
-        "MGHD_GENERIC_PHOOK",
-        "MGHD_GENERIC_PCROSSTALK",
-        "MGHD_GENERIC_IDLE_REF_NS",
-    )
-    canonical_env_keys = (
-        "MGHD_P_DATA",
-        "MGHD_P_MEAS",
-        "MGHD_P_1Q",
-        "MGHD_P_2Q",
-        "MGHD_P_IDLE",
-        "MGHD_P_MEAS0",
-        "MGHD_P_MEAS1",
-        "MGHD_P_HOOK",
-        "MGHD_P_XTALK",
-        "MGHD_P_ERASE",
-        "MGHD_P_LONG_RANGE",
-        "MGHD_LAMBDA_SCALE",
-        "MGHD_NOISE_RAMP",
-    )
-
-    def _clear_noise_env():
-        for key in (*generic_env_keys, *canonical_env_keys):
-            os.environ.pop(key, None)
-
-    # Set environment variables for sampling backend
-    # - "stim": Use Stim circuit-level noise (MGHD_SAMPLER=stim)
-    # - "synthetic": Use fast phenomenological noise (MGHD_SYNTHETIC=1)
-    # - "cudaq": Use CUDA-Q backend (default)
-    if sampler_choice == "stim":
-        os.environ["MGHD_SAMPLER"] = "stim"
-        os.environ.pop("MGHD_SYNTHETIC", None)
-        os.environ.pop("MGHD_NOISE_MODEL", None)
-        _clear_noise_env()
-    elif sampler_choice == "synthetic":
-        os.environ["MGHD_SYNTHETIC"] = "1"
-        os.environ.pop("MGHD_SAMPLER", None)
-        os.environ.pop("MGHD_NOISE_MODEL", None)
-        _clear_noise_env()
-    elif sampler_choice == "cudaq":
-        os.environ.pop("MGHD_SYNTHETIC", None)
-        os.environ.pop("MGHD_SAMPLER", None)
-        noise_model = str(getattr(args, "noise_model", "auto")).strip().lower()
-        if noise_model == "auto":
-            noise_model = "circuit_standard" if not getattr(args, "qpu_profile", None) else "garnet"
-        alias_map = {
-            "generic": "circuit_standard",
-            "generic_cl": "circuit_standard",
-            "generic-circuit": "circuit_standard",
-            "garnet": "circuit_standard",
-        }
-        noise_model = alias_map.get(noise_model, noise_model)
-
-        _clear_noise_env()
-
-        os.environ["MGHD_NOISE_MODEL"] = noise_model
-        os.environ["MGHD_NOISE_RAMP"] = str(getattr(args, "noise_ramp", "ramp0"))
-
-        p_data = getattr(args, "p_data", None)
-        p_meas = getattr(args, "p_meas", None)
-        if p_data is None:
-            p_data = float(getattr(args, "p", 0.0))
-        if p_meas is None:
-            p_meas = float(p_data)
-
-        os.environ["MGHD_P_DATA"] = str(float(p_data))
-        os.environ["MGHD_P_MEAS"] = str(float(p_meas))
-        os.environ["MGHD_P_1Q"] = str(
-            float(getattr(args, "p_1q", None) or getattr(args, "generic_p1q", 0.0015))
-        )
-        os.environ["MGHD_P_2Q"] = str(
-            float(getattr(args, "p_2q", None) or getattr(args, "generic_p2q", 0.01))
-        )
-        os.environ["MGHD_P_IDLE"] = str(
-            float(getattr(args, "p_idle", None) or getattr(args, "generic_pidle", 0.0008))
-        )
-        os.environ["MGHD_P_MEAS0"] = str(
-            float(getattr(args, "p_meas0", None) or getattr(args, "generic_pmeas0", 0.02))
-        )
-        os.environ["MGHD_P_MEAS1"] = str(
-            float(getattr(args, "p_meas1", None) or getattr(args, "generic_pmeas1", 0.02))
-        )
-        os.environ["MGHD_P_HOOK"] = str(
-            float(getattr(args, "p_hook", None) or getattr(args, "generic_phook", 0.0))
-        )
-        os.environ["MGHD_P_XTALK"] = str(
-            float(getattr(args, "p_xtalk", None) or getattr(args, "generic_pcrosstalk", 0.0))
-        )
-        os.environ["MGHD_P_ERASE"] = str(float(getattr(args, "p_erase", None) or 0.0))
-        os.environ["MGHD_P_LONG_RANGE"] = str(float(getattr(args, "p_long_range", None) or 0.0))
-
-        # Backward-compat mirrors for legacy generic_cl code paths.
-        os.environ["MGHD_GENERIC_P1Q"] = os.environ["MGHD_P_1Q"]
-        os.environ["MGHD_GENERIC_P2Q"] = os.environ["MGHD_P_2Q"]
-        os.environ["MGHD_GENERIC_PIDLE"] = os.environ["MGHD_P_IDLE"]
-        os.environ["MGHD_GENERIC_PMEAS0"] = os.environ["MGHD_P_MEAS0"]
-        os.environ["MGHD_GENERIC_PMEAS1"] = os.environ["MGHD_P_MEAS1"]
-        os.environ["MGHD_GENERIC_PHOOK"] = os.environ["MGHD_P_HOOK"]
-        os.environ["MGHD_GENERIC_PCROSSTALK"] = os.environ["MGHD_P_XTALK"]
-        os.environ["MGHD_GENERIC_IDLE_REF_NS"] = str(float(getattr(args, "generic_idle_ref_ns", 20.0)))
-
-        if getattr(args, "lambda_scale", None) is not None:
-            os.environ["MGHD_LAMBDA_SCALE"] = str(float(getattr(args, "lambda_scale")))
-        else:
-            os.environ.pop("MGHD_LAMBDA_SCALE", None)
-        if rank == 0:
-            print(f"CUDA-Q noise model: {noise_model}")
-
-    if bool(getattr(args, "online", False)) and sampler_choice == "stim":
-        raise ValueError(
-            "Online training with `--sampler stim` is not supported for MGHDv2 per-qubit training. "
-            "Stim's circuit-level sampler produces space-time detector events; "
-            "the current MGHDv2 training loop expects parity-check syndromes (synZ/synX) "
-            "and per-qubit correction labels from MWPF/LSD/MWPM. "
-            "Use `--sampler synthetic` for code-capacity training, or switch to a circuit-level "
-            "DEM/fault-space or observable-based training pipeline."
-        )
+    # Handle sampler selection
+    sampler_choice = str(getattr(args, "sampler", "stim")).lower()
+    if rank == 0:
+        print(f"Sampler: {sampler_choice}")
 
     # Auto-scale pad limits for large distances if not provided
     if not hasattr(args, "N_max"):
         d_param = int(getattr(args, "distance", 3))
-        # Base 512 is good for d<=15. For d=31, we need ~2000.
-        # We use a safe scaling: N_max ~ 3*d^2, E_max ~ 12*d^2
-        args.N_max = max(512, int(3.0 * d_param**2))
-        args.E_max = max(4096, int(12.0 * d_param**2))
-        args.S_max = max(512, int(2.0 * d_param**2))
+        dc = str(getattr(args, "distance_curriculum", "") or "")
+        if dc:
+            dc_list = [int(x) for x in dc.split(",") if x.strip()]
+            if dc_list:
+                d_param = max(dc_list)
+        n_rounds = int(getattr(args, "rounds", 0)) or d_param
+        # Circuit-level: detectors = d*(d-1)/2 * n_rounds * 2 (Z+X), plus boundary
+        args.N_max = max(512, int(4.0 * d_param**2 * n_rounds))
+        args.E_max = max(4096, int(16.0 * d_param**2 * n_rounds))
+        args.S_max = max(512, int(4.0 * d_param**2 * n_rounds))
         if rank == 0:
-            print(f"Auto-scaled pad limits for d={d_param}: N_max={args.N_max}, E_max={args.E_max}")
+            print(f"Auto-scaled pad limits for d={d_param}, rounds={n_rounds}: N_max={args.N_max}, E_max={args.E_max}")
 
     # Default structural hyperparameters (can be overridden via JSON/CLI namespace)
+    # NOTE: node_feat_dim=10 (added time coord), g_token_dim=14 (added n_rounds, noise_scale)
     defaults = {
         "d_model": 192,
         "d_state": 80,
@@ -778,9 +542,9 @@ def train_inprocess(ns) -> str:
         "msg_net_dropout_p": 0.0,
         "gru_dropout_p": 0.0,
         "se_reduction": 4,
-        "node_feat_dim": 9,
+        "node_feat_dim": 10,
         "edge_feat_dim": 3,
-        "g_token_dim": 12,
+        "g_token_dim": 14,
     }
     for attr, value in defaults.items():
         if not hasattr(args, attr):
@@ -1035,75 +799,13 @@ def train_inprocess(ns) -> str:
     save_dir.mkdir(parents=True, exist_ok=True)
     # Persist run metadata for reproducibility
     try:
-        def _resolve_noise_axis_for_point(p_value: float) -> tuple[str, float, dict]:
-            sampler_mode = str(getattr(args, "sampler", "cudaq")).lower()
-            if sampler_mode == "synthetic" or bool(getattr(args, "phenomenological", False)):
-                return (
-                    "p_data",
-                    float(p_value),
-                    {
-                        "noise_model_family": "code_capacity_iid",
-                        "p_data": float(p_value),
-                        "p_meas": 0.0,
-                        "noise_model_name": "code_capacity",
-                        "noise_model_version": "mghd_v4.0",
-                    },
-                )
-            if sampler_mode == "stim":
-                return (
-                    "p_data",
-                    float(p_value),
-                    {
-                        "noise_model_family": "stim_generated_surface_memory_zx",
-                        "p_data": float(p_value),
-                        "rounds": int(getattr(args, "distance", 0)),
-                        "noise_model_name": "stim_surface_memory",
-                        "noise_model_version": "stim_builtin",
-                    },
-                )
-            spec = resolve_canonical_noise_spec(
-                requested_phys_p=float(p_value),
-                noise_scale=getattr(args, "lambda_scale", None),
-                overrides={
-                    "noise_model": str(getattr(args, "noise_model", "circuit_standard")).lower(),
-                    "noise_ramp": str(getattr(args, "noise_ramp", "ramp0")).lower(),
-                    "lambda_scale": getattr(args, "lambda_scale", None),
-                    "p_data": getattr(args, "p_data", None),
-                    "p_meas": getattr(args, "p_meas", None),
-                    "p_1q": getattr(args, "p_1q", None) or getattr(args, "generic_p1q", None),
-                    "p_2q": getattr(args, "p_2q", None) or getattr(args, "generic_p2q", None),
-                    "p_idle": getattr(args, "p_idle", None) or getattr(args, "generic_pidle", None),
-                    "p_meas0": getattr(args, "p_meas0", None) or getattr(args, "generic_pmeas0", None),
-                    "p_meas1": getattr(args, "p_meas1", None) or getattr(args, "generic_pmeas1", None),
-                    "p_hook": getattr(args, "p_hook", None) or getattr(args, "generic_phook", None),
-                    "p_xtalk": getattr(args, "p_xtalk", None) or getattr(args, "generic_pcrosstalk", None),
-                    "p_erase": getattr(args, "p_erase", None),
-                    "p_long_range": getattr(args, "p_long_range", None),
-                },
-            )
-            axis_name, axis_value = axis_from_noise_spec(spec, float(p_value))
-            resolved = dict(spec.to_dict())
-            resolved["noise_model_family"] = resolved.get("noise_model_name")
-            return axis_name, float(axis_value), resolved
-
         base_p = float(getattr(args, "p", 0.0))
+        n_rounds = int(getattr(args, "rounds", 0)) or int(args.distance)
         p_curriculum_vals = (
             [float(x) for x in str(getattr(args, "p_curriculum", "")).split(",") if x.strip()]
             if getattr(args, "p_curriculum", None)
             else []
         )
-        axis_name, axis_value, resolved_point = _resolve_noise_axis_for_point(base_p)
-        curriculum_axis = []
-        for p_entry in p_curriculum_vals:
-            curr_axis_name, curr_axis_val, curr_resolved = _resolve_noise_axis_for_point(p_entry)
-            curriculum_axis.append(
-                {
-                    "p_requested": p_entry,
-                    "x_axis_name": curr_axis_name,
-                    "x_axis_value": curr_axis_val,
-                    "resolved_noise": curr_resolved,
-                }
-            )
         run_meta = {
             "family": args.family,
             "distance": int(args.distance),
@@ -1115,63 +817,24 @@ def train_inprocess(ns) -> str:
             "online": use_online,
             "p": base_p,
             "p_curriculum": p_curriculum_vals if p_curriculum_vals else None,
-            "x_axis_name": axis_name,
-            "x_axis_value": axis_value,
-            "resolved_noise": resolved_point,
-            "cluster_halo": int(getattr(args, "cluster_halo", 0)),
-            "curriculum_axis": curriculum_axis if curriculum_axis else None,
-            "epochs_per_p": int(getattr(args, "epochs_per_p", 1)),
-            "sampler": getattr(args, "sampler", None),
+            "noise_model": str(getattr(args, "noise_model", "SI1000")),
+            "rounds": n_rounds,
+            "sampler": sampler_choice,
             "teacher_mix": getattr(args, "teacher_mix", None),
-            "teacher_selection": getattr(args, "teacher_selection", "stochastic"),
-            "oracle_label_mode": getattr(args, "oracle_label_mode", "channel_ml"),
-            "teacher_output_classes": {
-                "lsd": "per_qubit",
-                "mwpm": "per_qubit",
-                "nvqldpc": "per_qubit",
-                "oracle": "per_qubit",
-                "mwpf": "fault_ids_proxy",
-            },
-            "noise_model": os.environ.get("MGHD_NOISE_MODEL", None),
-            "generic_noise": {
-                "p1q": os.environ.get("MGHD_GENERIC_P1Q", None),
-                "p2q": os.environ.get("MGHD_GENERIC_P2Q", None),
-                "pidle": os.environ.get("MGHD_GENERIC_PIDLE", None),
-                "pmeas0": os.environ.get("MGHD_GENERIC_PMEAS0", None),
-                "pmeas1": os.environ.get("MGHD_GENERIC_PMEAS1", None),
-                "phook": os.environ.get("MGHD_GENERIC_PHOOK", None),
-                "pcrosstalk": os.environ.get("MGHD_GENERIC_PCROSSTALK", None),
-                "idle_ref_ns": os.environ.get("MGHD_GENERIC_IDLE_REF_NS", None),
-            },
-            "noise_params_resolved": resolved_point,
-            "qpu_profile": getattr(args, "qpu_profile", None),
-            "context_source": getattr(args, "context_source", None),
-            "erasure_frac": float(getattr(args, "erasure_frac", 0.0)),
             "shots_per_epoch": int(getattr(args, "shots_per_epoch", 0)),
             "epochs": int(args.epochs),
             "batch": int(args.batch),
             "workers": int(getattr(args, "workers", 0)),
-            "teacher_decode_batch_size": int(getattr(args, "teacher_decode_batch_size", 1)),
             "profile": str(getattr(args, "profile", "S")),
-            "node_feat_dim": int(getattr(args, "node_feat_dim", 9)),
+            "node_feat_dim": int(getattr(args, "node_feat_dim", 10)),
             "edge_feat_dim": int(getattr(args, "edge_feat_dim", 3)),
-            "g_token_dim": int(getattr(args, "g_token_dim", 12)),
-            "projection_aware": int(getattr(args, "projection_aware", 0)),
-            "parity_lambda": float(getattr(args, "parity_lambda", 0.0)),
-            "label_smoothing": float(getattr(args, "label_smoothing", 0.0)),
-            "use_focal": bool(getattr(args, "use_focal", False)),
-            "focal_alpha": float(getattr(args, "focal_alpha", 0.25)),
-            "focal_gamma": float(getattr(args, "focal_gamma", 2.0)),
+            "g_token_dim": int(getattr(args, "g_token_dim", 14)),
             "lr": float(getattr(args, "lr", 0.0)),
             "wd": float(getattr(args, "wd", 0.0)),
             "amp": str(getattr(args, "amp", "off")),
             "seed": int(args.seed),
-            "online_fast": bool(getattr(args, "online_fast", False)),
-            "online_fast_keep_aux": bool(getattr(args, "online_fast_keep_aux", False)),
-            "progress_seconds": float(getattr(args, "progress_seconds", 0.0)),
         }
         (save_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2))
-        (save_dir / "noise_profile.json").write_text(json.dumps(resolved_point, indent=2))
     except Exception:
         pass
 
@@ -1205,90 +868,14 @@ def train_inprocess(ns) -> str:
             if best_epochs:
                 last_improve_epoch = max(best_epochs)
 
-    def _build_tad_for_code(code_obj):
-        """Build transpilation‑aware context and per‑qubit LLR overrides.
+    def _parse_teacher_mix(spec: str) -> dict[str, float]:
+        """Parse a comma-separated teacher weight spec into a dict.
 
-        Uses the provided QPU profile JSON (``--qpu-profile``) and the
-        requested ``--context-source`` to extract a schedule IR, construct
-        TAD weighting maps, and return:
-        - qpu_prof: loaded profile object
-        - ctx_vec: fixed global context vector for this epoch (or None)
-        - llr_overrides: per‑qubit log‑likelihood adjustments (or None)
+        Example: "pymatching=1.0" → {"pymatching": 1.0}
         """
-        qpu_prof = None
-        ctx_vec = None
-        llr_overrides = None
-        if args.qpu_profile and args.context_source != "none":
-            try:
-                qpu_prof = load_qpu_profile(args.qpu_profile)
-            except Exception:
-                qpu_prof = None
-        if qpu_prof is not None:
-            # Attempt schedule IR extraction via adapters if native circuit present
-            try:
-                native = None
-                for attr in (
-                    "native_circuit",
-                    "reference_circuit",
-                    "circuit",
-                    "qc",
-                    "quantum_circuit",
-                ):
-                    if hasattr(code_obj, attr):
-                        native = getattr(code_obj, attr)
-                        if native is not None:
-                            break
-                schedule_ir = []
-                if native is not None:
-                    import sys as _sys
-
-                    if args.context_source == "qiskit" and "qiskit" in _sys.modules:
-                        from mghd.qpu.adapters import qiskit_adapter
-
-                        schedule_ir = qiskit_adapter.to_schedule_ir(native)
-                    elif args.context_source == "cirq" and "cirq" in _sys.modules:
-                        from mghd.qpu.adapters import cirq_adapter  # type: ignore
-
-                        schedule_ir = cirq_adapter.to_schedule_ir(native)
-                    elif args.context_source == "cudaq" and "cudaq" in _sys.modules:
-                        from mghd.qpu.adapters import cudaq_adapter  # type: ignore
-
-                        schedule_ir = cudaq_adapter.to_schedule_ir(native)
-                n_qubits = getattr(code_obj, "n", None) or int(code_obj.Hx.shape[1])
-                maps = tad_weighting.schedule_to_weight_maps(schedule_ir, qpu_prof, n_qubits)
-                feats = tad_weighting.feature_vector(schedule_ir)
-                gate_vocab = {g: i for i, g in enumerate(sorted(feats.get("gate_hist", {}).keys()))}
-                ctx_vec = tad_context.context_vector(feats, gate_vocab)
-                # Build per-qubit LLR override
-                import numpy as _np
-
-                llr = _np.zeros(int(n_qubits), dtype=_np.float32)
-                for layer in (maps.get("w_qubit", {}) or {}).values():
-                    for q, w in layer.items():
-                        idx = int(q)
-                        if 0 <= idx < llr.size:
-                            llr[idx] += float(w)
-                llr_overrides = llr if llr.size else None
-            except Exception:
-                ctx_vec = None
-                llr_overrides = None
-        return qpu_prof, ctx_vec, llr_overrides
-
-    def _parse_teacher_mix(spec: str):
-        """Parse a comma‑separated teacher weight spec into a dict.
-
-        Example: "mwpf=1.0,mwpm=0.5,lsd=0.25" → {"mwpf":1.0,"mwpm":0.5,"lsd":0.25}
-        Missing teachers default to 0.0; if all are zero, defaults to MWPF=1.0.
-        """
-        weights = {
-            "mwpf": 0.0,
-            "mwpm": 0.0,
-            "lsd": 0.0,
-            "nvqldpc": 0.0,
-            "oracle": 0.0,
-        }
+        weights: dict[str, float] = {}
         if not spec:
-            weights["lsd"] = 1.0
+            weights["pymatching"] = 1.0
             return weights
         for chunk in spec.split(","):
             if "=" not in chunk:
@@ -1298,103 +885,10 @@ def train_inprocess(ns) -> str:
                 weights[name.strip().lower()] = float(value)
             except ValueError:
                 continue
-        for k in weights:
-            weights[k] = max(0.0, weights[k])
-        if sum(weights.values()) == 0.0:
-            weights["lsd"] = 1.0
+        if sum(weights.values()) <= 0.0:
+            weights["pymatching"] = 1.0
         return weights
 
-    def _apply_teacher_contract_policy(weights: dict[str, float]) -> dict[str, float]:
-        path = getattr(args, "teacher_contract_report", None)
-        strict = bool(getattr(args, "teacher_contract_strict", False))
-        allow_unvalidated_nvqldpc = bool(getattr(args, "allow_unvalidated_nvqldpc", False))
-        if (
-            not path
-            and float(weights.get("nvqldpc", 0.0)) > 0.0
-            and not allow_unvalidated_nvqldpc
-        ):
-            raise ValueError(
-                "nvqldpc supervision requested but no --teacher-contract-report was provided. "
-                "Provide a contract report from scripts/audit_teacher_contracts.py "
-                "or pass --allow-unvalidated-nvqldpc to override."
-            )
-        if not path:
-            return weights
-        try:
-            policy_payload = json.loads(Path(path).read_text())
-        except Exception as exc:
-            if (
-                float(weights.get("nvqldpc", 0.0)) > 0.0
-                and not allow_unvalidated_nvqldpc
-            ):
-                raise ValueError(
-                    f"Could not read teacher contract report '{path}' required for nvqldpc: {exc}"
-                ) from exc
-            if rank == 0:
-                print(f"Warning: could not read teacher contract report '{path}': {exc}")
-            return weights
-
-        details = (
-            (policy_payload.get("policy") or {}).get("details")
-            if isinstance(policy_payload, dict)
-            else None
-        )
-        if not isinstance(details, dict):
-            if (
-                float(weights.get("nvqldpc", 0.0)) > 0.0
-                and not allow_unvalidated_nvqldpc
-            ):
-                raise ValueError(
-                    f"Teacher contract report missing policy.details: {path}. "
-                    "Cannot validate nvqldpc supervision."
-                )
-            if rank == 0:
-                print(f"Warning: teacher contract report missing policy.details: {path}")
-            return weights
-
-        adjusted = dict(weights)
-        removed = []
-        for teacher_name, current_weight in list(adjusted.items()):
-            if current_weight <= 0.0:
-                continue
-            if teacher_name not in details:
-                if strict:
-                    raise ValueError(
-                        f"Teacher '{teacher_name}' has non-zero weight but is missing from "
-                        f"teacher contract report {path}."
-                    )
-                adjusted[teacher_name] = 0.0
-                removed.append((teacher_name, "missing_from_report"))
-                continue
-            info = details.get(teacher_name) or {}
-            eligible = bool(info.get("eligible_for_per_qubit_supervision", False))
-            if not eligible:
-                reason = (
-                    f"eligible={eligible}, available={info.get('available')}, "
-                    f"per_qubit_output={info.get('per_qubit_output')}, "
-                    f"parity_valid_rate={info.get('parity_valid_rate')}, "
-                    f"decode_exception_rate={info.get('decode_exception_rate')}"
-                )
-                if strict:
-                    raise ValueError(
-                        f"Teacher '{teacher_name}' is not eligible under contract policy: {reason}"
-                    )
-                adjusted[teacher_name] = 0.0
-                removed.append((teacher_name, reason))
-
-        if removed and rank == 0:
-            removed_str = ", ".join(f"{name} ({reason})" for name, reason in removed)
-            print(f"[teacher-contract] Disabled teachers: {removed_str}")
-
-        if sum(adjusted.values()) <= 0.0:
-            raise ValueError(
-                "All teachers disabled after applying teacher contract policy. "
-                "Adjust --teacher-mix or contract thresholds."
-            )
-        return adjusted
-
-    bandit = None
-    prev_epoch_loss = None
     # Optional curriculum over p for online mode
     p_list = None
     if use_online and getattr(args, "p_curriculum", None):
@@ -1419,47 +913,11 @@ def train_inprocess(ns) -> str:
                 p_epoch = float(getattr(args, "p", 0.005))
 
             # =====================================================================
-            # Per-qubit supervision path (cudaq/synthetic samplers)
+            # DEM-based circuit-level supervision (Stim + PyMatching teacher)
             # =====================================================================
-            # Teacher setup per epoch
-            family = args.family
-            # Build code object
-            from mghd.codes.registry import get_code
-
-            code = get_code(family, distance=args.distance)
-            # Initialize teachers once per epoch
             teacher_mix = _parse_teacher_mix(
-                getattr(args, "teacher_mix", "lsd=0.7,mwpm=0.3,mwpf=0.0")
+                getattr(args, "teacher_mix", "pymatching=1.0")
             )
-            teacher_mix = _apply_teacher_contract_policy(teacher_mix)
-            sampler_mode = str(getattr(args, "sampler", "cudaq")).strip().lower()
-            if teacher_mix.get("oracle", 0.0) > 0.0 and sampler_mode != "synthetic":
-                raise ValueError(
-                    "Oracle supervision is only valid with --sampler synthetic "
-                    "(true sampled per-qubit ex_glob/ez_glob). "
-                    "For --sampler cudaq (trajectory/circuit-level), use validated "
-                    "per-qubit teachers (e.g., nvqldpc, mwpm) instead of oracle labels."
-                )
-            label_teacher_weight = sum(
-                teacher_mix.get(k, 0.0) for k in ("mwpf", "mwpm", "lsd", "nvqldpc", "oracle")
-            )
-            if label_teacher_weight <= 0.0:
-                raise ValueError(
-                    "Invalid `--teacher-mix`: no label-producing teachers selected. "
-                    "This MGHDv2 training loop requires per-qubit labels from one of "
-                    "`mwpf`, `mwpm`, `lsd`, `nvqldpc`, or `oracle`."
-                )
-
-            # TAD context/overrides
-            qpu_prof, ctx_vec, llr_overrides = _build_tad_for_code(code)
-            # Initialize bandit once if requested and context available
-            if args.online_rl and ctx_vec is not None and bandit is None:
-                try:
-                    from mghd.tad.rl.lin_ts import LinTSBandit
-
-                    bandit = LinTSBandit(d=ctx_vec.size, prior_var=5.0, noise_var=0.5)
-                except Exception:
-                    bandit = None
 
             # Setup DataLoader for parallel generation
             workers = max(0, int(getattr(args, "workers", 0)))
@@ -1471,7 +929,7 @@ def train_inprocess(ns) -> str:
 
             # Pass per-rank shot budget; dataset will split this across workers to avoid duplication
             dataset = OnlineSurfaceDataset(
-                args, p_epoch, epoch, shots_target, teacher_mix, ctx_vec, llr_overrides, rank=rank
+                args, p_epoch, epoch, shots_target, teacher_mix, rank=rank
             )
 
             # In DDP mode, divide batch size across GPUs
@@ -1706,11 +1164,6 @@ def train_inprocess(ns) -> str:
                 "distance_counts": epoch_distance_counts if epoch_distance_counts else None,
             }
         )
-        # Bandit posterior update with simple reward: 1.0 if loss decreased, else 0.0
-        if bandit is not None and prev_epoch_loss is not None and ctx_vec is not None:
-            reward = 1.0 if avg < prev_epoch_loss else 0.0
-            bandit.update(ctx_vec, reward)
-        prev_epoch_loss = avg
 
         if rank == 0:
             _ckpt_config = {
@@ -1718,10 +1171,11 @@ def train_inprocess(ns) -> str:
                 "d_model": int(getattr(args, "d_model", 192)),
                 "d_state": int(getattr(args, "d_state", 80)),
                 "n_iters": int(getattr(args, "n_iters", 8)),
-                "node_feat_dim": int(getattr(args, "node_feat_dim", 9)),
+                "node_feat_dim": int(getattr(args, "node_feat_dim", 10)),
                 "edge_feat_dim": int(getattr(args, "edge_feat_dim", 3)),
-                "g_token_dim": int(getattr(args, "g_token_dim", 12)),
+                "g_token_dim": int(getattr(args, "g_token_dim", 14)),
                 "component_scope": str(getattr(args, "component_scope", "active")),
+                "noise_model": str(getattr(args, "noise_model", "SI1000")),
             }
             torch.save(
                 {
@@ -1821,44 +1275,432 @@ def move_to(p: PackedCrop, device):
     return p
 
 
-# Global cache for workers to avoid rebuilding teachers every epoch/iteration
-_WORKER_TEACHERS_CACHE = {}
+# ─── DEM-based Stim sampling infrastructure ───────────────────────────────────
+#
+# Graph structure: "merged-edge" bipartite graph.
+#
+#   type-1 nodes = detectors  (carry the syndrome)
+#   type-0 nodes = edges      (unique detector-pairs / boundary-det from the DEM)
+#
+# Each unique (detector_set, observable_set) in the DEM becomes one edge-node.
+# Probabilities of multiple DEM instructions that map to the same edge are
+# combined: p_merged = 1 - prod(1 - p_i).
+#
+# This keeps the graph orders of magnitude smaller than treating every decomposed
+# DEM fault as a separate node, and it maps cleanly onto MGHD's bipartite
+# (data, check) architecture.  The model predicts per-edge-node labels; the
+# observable correction is the XOR of observable_flags for predicted-active edges.
+#
+# Active-component decomposition works on the detector adjacency graph (small
+# and local), then we pull in the edge-nodes for each component.
+# ---------------------------------------------------------------------------
+
+# Global cache for workers to avoid rebuilding circuits/DEM/teachers every iteration
+_WORKER_DEM_CACHE: dict[tuple, dict] = {}
+
+
+def _build_stim_circuit(
+    distance: int,
+    rounds: int,
+    p: float,
+    noise_model: str = "SI1000",
+    after_clifford_depolarization: float = 0.0,
+) -> "stim.Circuit":
+    """Build a Stim circuit for rotated surface code memory experiment."""
+    import stim
+
+    kwargs: dict = {
+        "distance": distance,
+        "rounds": rounds,
+    }
+    # SI1000 uses a single 'p' parameter for all noise
+    if noise_model.upper() == "SI1000":
+        kwargs["after_clifford_depolarization"] = p
+        kwargs["after_reset_flip_probability"] = p
+        kwargs["before_measure_flip_probability"] = p
+        kwargs["before_round_data_depolarization"] = p
+    elif after_clifford_depolarization > 0:
+        kwargs["after_clifford_depolarization"] = after_clifford_depolarization
+    else:
+        kwargs["after_clifford_depolarization"] = p
+
+    return stim.Circuit.generated(
+        "surface_code:rotated_memory_z",
+        **kwargs,
+    )
+
+
+def _build_dem_info(
+    distance: int,
+    rounds: int,
+    p: float,
+    noise_model: str = "SI1000",
+    edge_prune_thresh: float = 1e-3,
+):
+    """Build DEM info with merged-edge graph representation.
+
+    Every unique (frozenset_of_detectors, frozenset_of_observables) becomes
+    one edge-node.  Multiple DEM instructions mapping to the same key are
+    combined by probability.  Edges with merged probability below
+    ``edge_prune_thresh`` are dropped to keep graphs manageable.
+
+    Returns dict with keys:
+        circuit, dem, sampler, matching,
+        H_edge    – np.ndarray (n_det, n_edges) uint8 incidence matrix,
+        L_obs     – np.ndarray (n_obs, n_edges) uint8 observable flags,
+        edge_probs – np.ndarray (n_edges,) merged probabilities,
+        det_coords – np.ndarray (n_det, 3)  detector (x, y, t),
+        edge_coords – np.ndarray (n_edges, 3) edge-node midpoint coords,
+        det_adj   – np.ndarray (n_det, n_det) uint8 detector adjacency,
+        n_det, n_edges, n_obs,
+        edge_key_to_idx – dict mapping (frozenset, frozenset) → edge index,
+        det_pair_to_edge – dict mapping frozenset({d0, d1}) → edge index
+                           (for teacher label mapping),
+    """
+    import stim
+    import pymatching
+
+    circuit = _build_stim_circuit(distance, rounds, p, noise_model)
+    dem = circuit.detector_error_model(decompose_errors=True)
+    sampler = circuit.compile_detector_sampler()
+    n_det = circuit.num_detectors
+    n_obs = circuit.num_observables
+
+    # ── Parse DEM and merge by unique (det_set, obs_set) ──────────────
+    from collections import defaultdict
+    edge_probs_raw: dict[tuple, list[float]] = defaultdict(list)
+    for instruction in dem.flattened():
+        if instruction.type == "error":
+            prob = instruction.args_copy()[0]
+            dets = frozenset(
+                t.val for t in instruction.targets_copy() if t.is_relative_detector_id()
+            )
+            obs = frozenset(
+                t.val for t in instruction.targets_copy() if t.is_logical_observable_id()
+            )
+            edge_probs_raw[(dets, obs)].append(prob)
+
+    # Build deterministic ordering of edge-nodes, pruning low-prob edges
+    all_keys_sorted = sorted(edge_probs_raw.keys(), key=lambda k: (sorted(k[0]), sorted(k[1])))
+    edge_keys: list[tuple] = []
+    edge_probs_list: list[float] = []
+    for key in all_keys_sorted:
+        survival = 1.0
+        for pi in edge_probs_raw[key]:
+            survival *= 1.0 - pi
+        merged_p = 1.0 - survival
+        if merged_p >= edge_prune_thresh:
+            edge_keys.append(key)
+            edge_probs_list.append(merged_p)
+
+    edge_key_to_idx = {k: i for i, k in enumerate(edge_keys)}
+    n_edges = len(edge_keys)
+    edge_probs = np.array(edge_probs_list, dtype=np.float64)
+
+    # Incidence matrix  H_edge[det, edge] = 1
+    H_edge = np.zeros((n_det, n_edges), dtype=np.uint8)
+    L_obs = np.zeros((n_obs, n_edges), dtype=np.uint8)
+    for i, (dets, obs) in enumerate(edge_keys):
+        for d_id in dets:
+            if d_id < n_det:
+                H_edge[d_id, i] = 1
+        for o_id in obs:
+            if o_id < n_obs:
+                L_obs[o_id, i] = 1
+
+    # Detector adjacency (for active-component decomposition)
+    det_adj = np.zeros((n_det, n_det), dtype=np.uint8)
+    det_pair_to_edge: dict[frozenset, int] = {}
+    for i, (dets, obs) in enumerate(edge_keys):
+        dets_list = sorted(dets)
+        if len(dets_list) == 2:
+            det_adj[dets_list[0], dets_list[1]] = 1
+            det_adj[dets_list[1], dets_list[0]] = 1
+            det_pair_to_edge[frozenset(dets_list)] = i
+        elif len(dets_list) == 1:
+            # boundary edge → store as {det, -1}
+            det_pair_to_edge[frozenset([dets_list[0], -1])] = i
+
+    # Detector coordinates
+    det_coord_dict = dem.get_detector_coordinates()
+    det_coords = np.zeros((n_det, 3), dtype=np.float32)
+    for det_id, coords in det_coord_dict.items():
+        if det_id < n_det:
+            for j, c in enumerate(coords[:3]):
+                det_coords[det_id, j] = float(c)
+
+    # Edge-node coordinates = midpoint of connected detectors
+    edge_coords = np.zeros((n_edges, 3), dtype=np.float32)
+    for i in range(n_edges):
+        connected = np.where(H_edge[:, i])[0]
+        if len(connected) > 0:
+            edge_coords[i] = det_coords[connected].mean(axis=0)
+
+    # PyMatching teacher from DEM
+    matching = pymatching.Matching.from_detector_error_model(dem)
+
+    return {
+        "circuit": circuit,
+        "dem": dem,
+        "sampler": sampler,
+        "matching": matching,
+        "H_edge": H_edge,
+        "L_obs": L_obs,
+        "edge_probs": edge_probs,
+        "det_coords": det_coords,
+        "edge_coords": edge_coords,
+        "det_adj": det_adj,
+        "n_det": n_det,
+        "n_edges": n_edges,
+        "n_obs": n_obs,
+        "edge_key_to_idx": edge_key_to_idx,
+        "det_pair_to_edge": det_pair_to_edge,
+    }
+
+
+def _get_dem_info(
+    distance: int,
+    rounds: int,
+    p: float,
+    noise_model: str = "SI1000",
+    edge_prune_thresh: float = 1e-3,
+):
+    """Get or create cached DEM info."""
+    global _WORKER_DEM_CACHE
+    key = (distance, rounds, p, noise_model, edge_prune_thresh)
+    if key not in _WORKER_DEM_CACHE:
+        _WORKER_DEM_CACHE[key] = _build_dem_info(
+            distance, rounds, p, noise_model, edge_prune_thresh
+        )
+    return _WORKER_DEM_CACHE[key]
+
+
+def _teacher_labels_from_matching(
+    det_bits: np.ndarray,
+    matching,
+    det_pair_to_edge: dict,
+    n_edges: int,
+) -> np.ndarray:
+    """Convert PyMatching decoded result to per-edge-node labels.
+
+    PyMatching's ``decode_to_matched_dets_array`` returns detector pairs.
+    We map each pair to the corresponding merged edge-node via
+    ``det_pair_to_edge``.
+    """
+    y_bits = np.zeros(n_edges, dtype=np.uint8)
+    try:
+        matched = matching.decode_to_matched_dets_array(det_bits)
+    except Exception:
+        return y_bits
+
+    for pair in matched:
+        d0, d1 = int(pair[0]), int(pair[1])
+        # boundary match: PyMatching uses large sentinel or -1
+        if d0 < 0 or d1 < 0:
+            real_det = d0 if d1 < 0 else d1
+            key = frozenset([real_det, -1])
+        else:
+            key = frozenset([d0, d1])
+        eidx = det_pair_to_edge.get(key)
+        if eidx is not None:
+            y_bits[eidx] = 1
+    return y_bits
+
+
+def pack_dem_cluster(
+    H_edge: np.ndarray,
+    det_coords: np.ndarray,
+    edge_coords: np.ndarray,
+    det_bits: np.ndarray,
+    y_bits_edge: np.ndarray,
+    *,
+    edge_indices: np.ndarray | None = None,
+    det_indices: np.ndarray | None = None,
+    d: int,
+    rounds: int,
+    p: float,
+    N_max: int,
+    E_max: int,
+    S_max: int,
+) -> PackedCrop | None:
+    """Pack a merged-edge DEM subgraph into a PackedCrop for MGHDv2.
+
+    Bipartite structure:
+        type-0 nodes = edge-nodes (unique DEM edges; we predict their flip)
+        type-1 nodes = detectors  (carry the syndrome)
+        graph edges  = H_sub incidence (detector ↔ edge-node)
+
+    Parameters
+    ----------
+    H_edge : (n_det, n_edges) incidence matrix (full or will be sliced)
+    det_coords, edge_coords : (n, 3) coordinates
+    det_bits : (n_det,) syndrome
+    y_bits_edge : (n_edges,) teacher labels (which edge-nodes are active)
+    edge_indices, det_indices : optional subsets for component extraction
+    d, rounds, p : metadata for conditioning
+    N_max, E_max, S_max : padding limits
+    """
+    # ── Extract subgraph ──────────────────────────────────────────────
+    if edge_indices is not None and det_indices is not None:
+        H_sub = H_edge[np.ix_(det_indices, edge_indices)].astype(np.uint8)
+        xy_edge = edge_coords[edge_indices]
+        xy_det = det_coords[det_indices]
+        synd = det_bits[det_indices].astype(np.uint8)
+        y_local = y_bits_edge[edge_indices].astype(np.uint8)
+    else:
+        H_sub = np.asarray(H_edge, dtype=np.uint8)
+        xy_edge = edge_coords
+        xy_det = det_coords
+        synd = det_bits.astype(np.uint8)
+        y_local = y_bits_edge.astype(np.uint8)
+
+    nC, nQ = H_sub.shape  # nC = detectors, nQ = edge-nodes
+    if nQ == 0 or nC == 0:
+        return None
+    N = nQ + nC
+    if N > N_max:
+        return None
+
+    # ── Node features (10-dim) ────────────────────────────────────────
+    deg_edge = H_sub.sum(axis=0).astype(np.float32)  # per edge-node
+    deg_det = H_sub.sum(axis=1).astype(np.float32)   # per detector
+
+    all_xyz = np.vstack([xy_edge, xy_det])
+    coord_min = all_xyz.min(axis=0)
+    coord_max = all_xyz.max(axis=0)
+    coord_span = np.maximum(coord_max - coord_min, 1.0)
+
+    xy_e_norm = (xy_edge - coord_min) / coord_span
+    xy_d_norm = (xy_det - coord_min) / coord_span
+
+    node_type = np.concatenate([np.zeros(nQ, dtype=np.int8),
+                                np.ones(nC, dtype=np.int8)])
+    degree = np.concatenate([deg_edge, deg_det])
+    xy_all = np.vstack([xy_e_norm, xy_d_norm]).astype(np.float32)
+
+    # (x, y, t, type, degree, k, r, d_norm, rounds_norm, syndrome) = 10
+    parts = [
+        xy_all,                                                     # 3
+        node_type[:, None].astype(np.float32),                     # 1
+        degree[:, None],                                            # 1
+        np.full((N, 1), float(nC), dtype=np.float32),              # k
+        np.full((N, 1), float(nQ), dtype=np.float32),              # r
+        np.full((N, 1), float(d) / 20.0, dtype=np.float32),        # d_norm
+        np.full((N, 1), float(rounds) / 20.0, dtype=np.float32),   # rounds_norm
+    ]
+    synd_clipped = synd[:nC] if synd.size >= nC else np.pad(synd, (0, nC - synd.size))
+    synd_col = np.zeros((N, 1), dtype=np.float32)
+    synd_col[nQ:, 0] = synd_clipped.astype(np.float32)
+    parts.append(synd_col)                                         # 1  total=10
+
+    base_nodes = np.concatenate(parts, axis=1)
+
+    # ── Graph edges from H_sub ────────────────────────────────────────
+    ci, qi = np.nonzero(H_sub)
+    src = qi.astype(np.int64)
+    dst = (nQ + ci).astype(np.int64)
+    edge_index = np.stack([src, dst], axis=0)
+    E_tot = edge_index.shape[1]
+    if E_tot > E_max:
+        return None
+
+    edge_attr = np.zeros((E_tot, 3), dtype=np.float32)
+    edge_attr[:, 0] = 1.0
+
+    # ── Mamba sequence: (t, hilbert_2d) ordering on detectors ─────────
+    from mghd.core.core import _quantize_xy01, _hilbert_index_2d
+    det_xy01 = xy_d_norm[:, :2]
+    qxy = _quantize_xy01(det_xy01, levels=64)
+    h2d = _hilbert_index_2d(qxy, levels=64)
+    t_q = (xy_d_norm[:, 2] * 1000).astype(np.int64)
+    sort_key = t_q * 100000 + h2d
+    check_order = np.argsort(sort_key, kind="stable")
+    seq_idx = (nQ + check_order).astype(np.int64)
+    S = nC
+    if S > S_max:
+        return None
+
+    # ── g_token (14-dim) ──────────────────────────────────────────────
+    p_safe = max(float(p), 1e-12)
+    g_list = [
+        float(nC), float(nQ), float(d), float(rounds),
+        p_safe, float(np.log10(p_safe)),
+        float(nC) / max(1.0, float(d ** 2)),
+        float(nQ) / max(1.0, float(d ** 2)),
+        float(coord_span[0]), float(coord_span[1]), float(coord_span[2]),
+        float(nC) / max(1.0, float(N)),
+        float(np.sum(synd_clipped)) / max(1.0, float(nC)),
+        0.0,
+    ]
+    g_token = torch.tensor(g_list[:14], dtype=torch.float32)
+
+    # ── Pad and tensorize ─────────────────────────────────────────────
+    x_nodes = torch.zeros((N_max, base_nodes.shape[1]), dtype=torch.float32)
+    node_mask = torch.zeros(N_max, dtype=torch.bool)
+    node_type_t = torch.zeros(N_max, dtype=torch.int8)
+    x_nodes[:N] = torch.from_numpy(base_nodes)
+    node_mask[:N] = True
+    node_type_t[:N] = torch.from_numpy(node_type)
+
+    ei_t = torch.zeros((2, E_max), dtype=torch.long)
+    ea_t = torch.zeros((E_max, 3), dtype=torch.float32)
+    em_t = torch.zeros(E_max, dtype=torch.bool)
+    ei_t[:, :E_tot] = torch.from_numpy(edge_index)
+    ea_t[:E_tot] = torch.from_numpy(edge_attr)
+    em_t[:E_tot] = True
+
+    si_t = torch.zeros(S_max, dtype=torch.long)
+    sm_t = torch.zeros(S_max, dtype=torch.bool)
+    si_t[:S] = torch.from_numpy(seq_idx)
+    sm_t[:S] = True
+
+    y_t = torch.full((N_max,), -1, dtype=torch.int8)
+    y_t[:nQ] = torch.from_numpy(y_local.astype(np.int8))
+
+    s_t = torch.zeros(S_max, dtype=torch.int8)
+    s_t[:S] = torch.from_numpy(synd_clipped.astype(np.int8))
+
+    bbox_xywh = (
+        int(coord_min[0]), int(coord_min[1]),
+        int(coord_span[0]) + 1, int(coord_span[1]) + 1,
+    )
+    meta = CropMeta(
+        k=nC, r=nQ, bbox_xywh=bbox_xywh, side="DEM",
+        d=d, p=p, kappa=N, seed=0,
+        bucket_id=-1, pad_nodes=N_max, pad_edges=E_max, pad_seq=S_max,
+    )
+
+    return PackedCrop(
+        x_nodes=x_nodes, node_mask=node_mask, node_type=node_type_t,
+        edge_index=ei_t, edge_attr=ea_t, edge_mask=em_t,
+        seq_idx=si_t, seq_mask=sm_t,
+        g_token=g_token, y_bits=y_t, s_sub=s_t,
+        meta=meta, H_sub=H_sub,
+    )
 
 
 class OnlineSurfaceDataset(IterableDataset):
-    """
-    Iterable dataset for online surface code simulation.
-    Generates crops on-the-fly using multiple workers.
+    """DEM-based iterable dataset for circuit-level surface code training.
+
+    Uses Stim to generate detection events, PyMatching as teacher, and packs
+    3-D (x, y, t) merged-edge bipartite subgraphs for MGHDv2.
     """
 
-    def __init__(
-        self,
-        args,
-        p_epoch,
-        epoch,
-        shots_total,
-        teacher_mix,
-        ctx_vec=None,
-        llr_overrides=None,
-        rank=0,
-    ):
+    def __init__(self, args, p_epoch, epoch, shots_total, teacher_mix, rank=0):
         self.args = args
-        # p_epoch can be a list (per-sample mixing) or a float (fixed p)
         if isinstance(p_epoch, list):
             self.p_list = p_epoch
-            self.p_epoch = p_epoch[0]  # fallback scalar for compat
+            self.p_epoch = p_epoch[0]
         else:
             self.p_list = None
             self.p_epoch = p_epoch
         self.epoch = epoch
-        # shots_total refers to the per-rank budget; workers will partition this in __iter__
         self.shots_to_do = shots_total
         self.teacher_mix = teacher_mix
-        self.ctx_vec = ctx_vec
-        self.llr_overrides = llr_overrides
         self.rank = rank
+        self.noise_model = str(getattr(args, "noise_model", "SI1000"))
 
-        # Parse distance curriculum
+        # Distance curriculum
         self.distances = [self.args.distance]
         if getattr(self.args, "distance_curriculum", None):
             try:
@@ -1866,669 +1708,132 @@ class OnlineSurfaceDataset(IterableDataset):
                 if parsed:
                     self.distances = sorted(set(parsed))
             except ValueError:
-                print(
-                    f"Warning: Invalid distance curriculum '{self.args.distance_curriculum}', using default {self.args.distance}"
-                )
+                pass
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
-            worker_id = 0
-            num_workers = 1
+            worker_id, num_workers = 0, 1
         else:
             worker_id = worker_info.id
             num_workers = max(1, worker_info.num_workers)
 
-        # Split the per-rank shot budget across workers to avoid duplicating work
         base = self.shots_to_do // num_workers
         remainder = self.shots_to_do % num_workers
-        shots_for_this_worker = base + (1 if worker_id < remainder else 0)
-        if shots_for_this_worker <= 0:
+        shots_for_worker = base + (1 if worker_id < remainder else 0)
+        if shots_for_worker <= 0:
             return
 
-        # Seed RNG for this worker
-        # Ensure distinct seeds across ranks and workers
         seed = self.args.seed + self.epoch * 10000 + self.rank * 100 + worker_id
         rng = np.random.default_rng(seed)
 
-        # Use global cache for teachers to persist across epochs in persistent workers
-        global _WORKER_TEACHERS_CACHE
-
-        decode_bs = max(1, int(getattr(self.args, "teacher_decode_batch_size", 1)))
-        pending_by_d = {int(dist): [] for dist in self.distances}
-
-        def _flush_distance(distance: int):
-            bucket = pending_by_d.get(int(distance), [])
-            if not bucket:
-                return
-
-            if distance not in _WORKER_TEACHERS_CACHE:
-                _WORKER_TEACHERS_CACHE[distance] = self._init_teachers_for_d(distance)
-            (
-                mwpf_teacher,
-                mwpm_ctx,
-                lsd_teacher,
-                nvqldpc_teacher,
-                mwpm_matcher_z,
-                mwpm_matcher_x,
-            ) = _WORKER_TEACHERS_CACHE[distance]
-
-            samples = [row[0] for row in bucket]
-            teacher_predecoded = self._decode_teacher_batch(
-                samples=samples,
-                mwpf_teacher=mwpf_teacher,
-                lsd_teacher=lsd_teacher,
-                nvqldpc_teacher=nvqldpc_teacher,
-                mwpm_matcher_z=mwpm_matcher_z,
-                mwpm_matcher_x=mwpm_matcher_x,
-            )
-
-            for (sample, shot_seed, erase_local, p_shot), predecoded in zip(bucket, teacher_predecoded):
-                yield from self._process_sample(
-                    sample,
-                    shot_seed,
-                    mwpf_teacher,
-                    mwpm_ctx,
-                    lsd_teacher,
-                    rng,
-                    distance,
-                    erase_local,
-                    nvqldpc_teacher=nvqldpc_teacher,
-                    predecoded=predecoded,
-                    p_shot=p_shot,
-                )
-            pending_by_d[distance] = []
-
-        # Build a balanced per-worker distance schedule for this epoch.
-        # This avoids random distance skew within an epoch and gives cleaner
-        # multi-distance supervision statistics.
+        # Build balanced distance schedule
         distance_schedule: list[int] = []
         if len(self.distances) == 1:
-            distance_schedule = [int(self.distances[0])] * int(shots_for_this_worker)
+            distance_schedule = [int(self.distances[0])] * shots_for_worker
         else:
-            repeats, remainder = divmod(int(shots_for_this_worker), len(self.distances))
-            for dist in self.distances:
-                distance_schedule.extend([int(dist)] * int(repeats))
-            if remainder > 0:
-                tail = [int(x) for x in self.distances]
+            reps, rem = divmod(shots_for_worker, len(self.distances))
+            for dv in self.distances:
+                distance_schedule.extend([int(dv)] * reps)
+            if rem > 0:
+                tail = list(self.distances)
                 rng.shuffle(tail)
-                distance_schedule.extend(tail[:remainder])
+                distance_schedule.extend(tail[:rem])
             rng.shuffle(distance_schedule)
 
-        for d in distance_schedule:
+        from scipy.sparse import csr_matrix as _csr
+        from scipy.sparse.csgraph import connected_components as _cc
 
-            # Per-shot seed
-            shot_seed = int(rng.integers(0, 2**31 - 1))
+        edge_prune = float(getattr(self.args, "edge_prune_thresh", 1e-3))
 
-            # Per-sample p mixing: draw p from curriculum list each shot
-            if self.p_list is not None:
-                p_shot = float(rng.choice(self.p_list))
-            else:
-                p_shot = float(self.p_epoch)
+        for dist in distance_schedule:
+            p_shot = float(rng.choice(self.p_list)) if self.p_list else float(self.p_epoch)
+            n_rounds = int(getattr(self.args, "rounds", 0)) or dist
 
-            sample = sample_round(
-                d=d,
-                p=p_shot,
-                seed=shot_seed,
-                profile_path=self.args.qpu_profile if self.args.qpu_profile else None,
+            info = _get_dem_info(dist, n_rounds, p_shot, self.noise_model, edge_prune)
+
+            # ── Sample one shot ───────────────────────────────────────
+            det_bits_all, obs_all = info["sampler"].sample(
+                shots=1, separate_observables=True
+            )
+            det_bits = det_bits_all[0].astype(np.uint8)
+
+            # ── Teacher: PyMatching → per-edge-node labels ────────────
+            y_bits = _teacher_labels_from_matching(
+                det_bits, info["matching"],
+                info["det_pair_to_edge"], info["n_edges"],
             )
 
-            # Get or create teachers for this distance
-            if d not in _WORKER_TEACHERS_CACHE:
-                _WORKER_TEACHERS_CACHE[d] = self._init_teachers_for_d(d)
+            # ── Decompose into active components ──────────────────────
+            component_scope = str(getattr(self.args, "component_scope", "active")).lower()
 
-            # Handle erasure
-            erase_local = None
-            if self.args.erasure_frac > 0:
-                n_q = len(sample["coords_q"])
-                # Generate erasure mask (1 if erased, 0 otherwise)
-                erase_mask = (rng.random(n_q) < self.args.erasure_frac).astype(np.uint8)
-
-                # Always set erase_local if erasure is enabled, to ensure consistent feature dim
-                erase_local = erase_mask
-
-                if np.any(erase_mask):
-                    # Inject erasure noise into syndromes
-                    # Erasure = random Pauli X/Y/Z/I.
-                    # We simulate this as random X flip (50%) and random Z flip (50%)
-                    # applied to the erased qubits.
-
-                    # Random errors on erased qubits
-                    erasure_err_x = (rng.random(n_q) < 0.5).astype(np.uint8) * erase_mask
-                    erasure_err_z = (rng.random(n_q) < 0.5).astype(np.uint8) * erase_mask
-
-                    # Update syndromes
-                    # synZ checks X errors
-                    # synX checks Z errors
-
-                    Hz = sample["Hz"]
-                    Hx = sample["Hx"]
-
-                    # synZ += Hz @ erasure_err_x
-                    additional_synZ = (Hz @ erasure_err_x) % 2
-                    sample["synZ"] = (sample["synZ"] ^ additional_synZ).astype(np.uint8)
-
-                    # synX += Hx @ erasure_err_z
-                    additional_synX = (Hx @ erasure_err_z) % 2
-                    sample["synX"] = (sample["synX"] ^ additional_synX).astype(np.uint8)
-
-            pending_by_d[d].append((sample, shot_seed, erase_local, p_shot))
-            if len(pending_by_d[d]) >= decode_bs:
-                yield from _flush_distance(d)
-
-        for d in list(pending_by_d.keys()):
-            if pending_by_d[d]:
-                yield from _flush_distance(d)
-
-    def _decode_teacher_batch(
-        self,
-        samples,
-        mwpf_teacher,
-        lsd_teacher,
-        nvqldpc_teacher,
-        mwpm_matcher_z,
-        mwpm_matcher_x,
-    ):
-        batch_size = len(samples)
-        out = [
-            {
-                "fault_ids_global": None,
-                "ex_lsd": None,
-                "ez_lsd": None,
-                "ex_nq": None,
-                "ez_nq": None,
-                "ex_mwpm": None,
-                "ez_mwpm": None,
-            }
-            for _ in range(batch_size)
-        ]
-        if batch_size == 0:
-            return out
-
-        if mwpf_teacher is not None:
-            det_rows = []
-            for sample in samples:
-                use_native_dets = (
-                    "detectors" in sample and sample.get("dem_meta", {}).get("backend") == "stim_native"
-                )
-                if use_native_dets:
-                    det_rows.append(np.asarray(sample["detectors"], dtype=np.uint8))
-                else:
-                    det_rows.append(
-                        np.concatenate(
-                            [
-                                np.asarray(sample["synZ"], dtype=np.uint8),
-                                np.asarray(sample["synX"], dtype=np.uint8),
-                            ],
-                            axis=0,
-                        )
-                    )
-            try:
-                dets_global = np.stack(det_rows, axis=0)
-                mwpf_scale = None
-                if hasattr(self, "llr_overrides") and self.llr_overrides is not None:
-                    probs = 1.0 / (1.0 + np.exp(self.llr_overrides))
-                    scale_full = np.clip(probs / 0.5, 0.1, 10.0)
-                    mwpf_scale = {int(i): float(s) for i, s in enumerate(scale_full)}
-                out_mwpf = mwpf_teacher.decode_batch(dets_global, mwpf_scale=mwpf_scale)
-                fid_arr = np.asarray(out_mwpf.get("fault_ids"), dtype=np.int32)
-                if fid_arr.ndim == 2:
-                    n = min(batch_size, int(fid_arr.shape[0]))
-                    for idx in range(n):
-                        out[idx]["fault_ids_global"] = fid_arr[idx]
-            except Exception:
-                pass
-
-        if lsd_teacher is not None:
-            synx = np.stack([np.asarray(s["synX"], dtype=np.uint8) for s in samples], axis=0)
-            synz = np.stack([np.asarray(s["synZ"], dtype=np.uint8) for s in samples], axis=0)
-            try:
-                ex_arr, ez_arr = lsd_teacher.decode_batch_xz(
-                    syndromes_x=synx,
-                    syndromes_z=synz,
-                    llr_overrides=self.llr_overrides if hasattr(self, "llr_overrides") else None,
-                )
-                n = min(batch_size, int(ex_arr.shape[0]), int(ez_arr.shape[0]))
-                for idx in range(n):
-                    out[idx]["ex_lsd"] = ex_arr[idx]
-                    out[idx]["ez_lsd"] = ez_arr[idx]
-            except Exception:
-                pass
-
-        if mwpm_matcher_z is not None and mwpm_matcher_x is not None:
-            synx = np.stack([np.asarray(s["synX"], dtype=np.uint8) for s in samples], axis=0)
-            synz = np.stack([np.asarray(s["synZ"], dtype=np.uint8) for s in samples], axis=0)
-
-            def _mwpm_decode_batch(matcher, syndromes: np.ndarray) -> np.ndarray:
-                synd = (np.asarray(syndromes, dtype=np.uint8) & 1)
-                if hasattr(matcher, "decode_batch"):
-                    out_bits = matcher.decode_batch(synd)
-                    return (np.asarray(out_bits, dtype=np.uint8) & 1)
-                return np.stack(
-                    [(np.asarray(matcher.decode(s), dtype=np.uint8) & 1) for s in synd],
-                    axis=0,
-                )
-
-            try:
-                # Side semantics:
-                # - synX / Hx corresponds to Z-error channel (output is Z correction; stored in ez_mwpm)
-                # - synZ / Hz corresponds to X-error channel (output is X correction; stored in ex_mwpm)
-                ez_arr = _mwpm_decode_batch(mwpm_matcher_z, synx)
-                ex_arr = _mwpm_decode_batch(mwpm_matcher_x, synz)
-                n = min(batch_size, int(ex_arr.shape[0]), int(ez_arr.shape[0]))
-                for idx in range(n):
-                    out[idx]["ex_mwpm"] = ex_arr[idx]
-                    out[idx]["ez_mwpm"] = ez_arr[idx]
-            except Exception:
-                pass
-
-        if nvqldpc_teacher is not None:
-            synx = np.stack([np.asarray(s["synX"], dtype=np.uint8) for s in samples], axis=0)
-            synz = np.stack([np.asarray(s["synZ"], dtype=np.uint8) for s in samples], axis=0)
-            ex_arr, ez_arr = nvqldpc_teacher.decode_batch_xz(
-                syndromes_x=synx,
-                syndromes_z=synz,
-            )
-            n = min(batch_size, int(ex_arr.shape[0]), int(ez_arr.shape[0]))
-            for idx in range(n):
-                out[idx]["ex_nq"] = ex_arr[idx]
-                out[idx]["ez_nq"] = ez_arr[idx]
-
-        return out
-
-    def _init_teachers_for_d(self, d):
-        # Build Hx/Hz directly from a sample so that
-        # - parity-check dimensions match the online sampler's syndromes, and
-        # - nvqldpc (and other teachers) see a consistent PCM.
-        base_p = float(getattr(self.args, "p", 0.005))
-        sample = sample_round(
-            d=d,
-            p=base_p,
-            seed=0,
-            profile_path=self.args.qpu_profile if getattr(self.args, "qpu_profile", None) else None,
-        )
-
-        Hx = np.asarray(sample["Hx"], dtype=np.uint8)
-        Hz = np.asarray(sample["Hz"], dtype=np.uint8)
-
-        mx = Hx.shape[0]
-        mz = Hz.shape[0]
-        dets_per_fault = []
-        for col in range(Hx.shape[1]):
-            dets = []
-            dets.extend(np.flatnonzero(Hx[:, col]).tolist())
-            dets.extend((mx + np.flatnonzero(Hz[:, col])).tolist())
-            dets_per_fault.append(dets)
-
-        code = SimpleNamespace(
-            Hx=Hx,
-            Hz=Hz,
-            detectors_per_fault=dets_per_fault,
-            fault_weights=[1.0] * Hx.shape[1],
-            num_detectors=mx + mz,
-            n=Hx.shape[1],
-        )
-
-        commutes = not np.any((Hx % 2) @ (Hz.T % 2) % 2)
-        use_mwpf = self.teacher_mix.get("mwpf", 0.0) > 0.0 and commutes
-        use_mwpm = self.teacher_mix.get("mwpm", 0.0) > 0.0
-        use_lsd = self.teacher_mix.get("lsd", 0.0) > 0.0
-        use_nvqldpc = self.teacher_mix.get("nvqldpc", 0.0) > 0.0
-
-        mwpf_teacher = None
-        if use_mwpf:
-            try:
-                mwpf_teacher = MWPFTeacher(code)
-            except Exception:
-                mwpf_teacher = None
-
-        mwpm_ctx = MWPMatchingContext() if use_mwpm else None
-        # Prebuild global MWPM matchers per distance for fast batched teacher decode.
-        mwpm_matcher_z = None  # Hx/synX (Z-error channel)
-        mwpm_matcher_x = None  # Hz/synZ (X-error channel)
-        if use_mwpm:
-            try:
-                import pymatching as _pm  # type: ignore
-
-                mwpm_matcher_z = _pm.Matching((Hx % 2).astype(np.uint8))
-                mwpm_matcher_x = _pm.Matching((Hz % 2).astype(np.uint8))
-            except Exception:
-                mwpm_matcher_z = None
-                mwpm_matcher_x = None
-
-        lsd_teacher = None
-        if use_lsd:
-            try:
-                lsd_teacher = LSDTeacher(code.Hx, code.Hz)
-            except Exception:
-                lsd_teacher = None
-
-        nvqldpc_teacher = None
-        if use_nvqldpc:
-            # For nvqldpc we enforce strict behavior: construction errors
-            # should propagate rather than silently disabling the teacher.
-            nvqldpc_teacher = NvQldpcTeacher(code.Hx, code.Hz)
-
-        return (
-            mwpf_teacher,
-            mwpm_ctx,
-            lsd_teacher,
-            nvqldpc_teacher,
-            mwpm_matcher_z,
-            mwpm_matcher_x,
-        )
-
-    def _process_sample(
-        self,
-        sample,
-        seed,
-        mwpf_teacher,
-        mwpm_ctx,
-        lsd_teacher,
-        rng,
-        d,
-        erase_local=None,
-        nvqldpc_teacher=None,
-        predecoded=None,
-        p_shot=None,
-    ):
-        if p_shot is None:
-            p_shot = self.p_epoch
-        # Logic extracted from the main loop
-        if predecoded is not None:
-            fault_ids_global = predecoded.get("fault_ids_global", None)
-            ex_lsd = predecoded.get("ex_lsd", None)
-            ez_lsd = predecoded.get("ez_lsd", None)
-            ex_nq = predecoded.get("ex_nq", None)
-            ez_nq = predecoded.get("ez_nq", None)
-            ex_mwpm = predecoded.get("ex_mwpm", None)
-            ez_mwpm = predecoded.get("ez_mwpm", None)
-        else:
-            use_native_dets = (
-                "detectors" in sample and sample.get("dem_meta", {}).get("backend") == "stim_native"
-            )
-            if use_native_dets:
-                dets_global = sample["detectors"][np.newaxis, :].astype(np.uint8)
-            else:
-                dets_global = np.concatenate(
-                    [
-                        sample["synZ"][np.newaxis, :].astype(np.uint8),
-                        sample["synX"][np.newaxis, :].astype(np.uint8),
-                    ],
-                    axis=1,
-                )
-
-            mwpf_scale = None
-            if hasattr(self, "llr_overrides") and self.llr_overrides is not None:
-                probs = 1.0 / (1.0 + np.exp(self.llr_overrides))
-                scale_full = np.clip(probs / 0.5, 0.1, 10.0)
-                mwpf_scale = {int(i): float(s) for i, s in enumerate(scale_full)}
-
-            fault_ids_global = None
-            if mwpf_teacher is not None:
-                try:
-                    out_mwpf = mwpf_teacher.decode_batch(dets_global, mwpf_scale=mwpf_scale)
-                    fid_arr = np.asarray(out_mwpf.get("fault_ids"), dtype=np.int32)
-                    if fid_arr.ndim == 2 and fid_arr.shape[0] >= 1:
-                        fault_ids_global = fid_arr[0]
-                except Exception:
-                    fault_ids_global = None
-
-            ex_lsd = ez_lsd = None
-            if lsd_teacher is not None:
-                try:
-                    ex_arr, ez_arr = lsd_teacher.decode_batch_xz(
-                        syndromes_x=sample["synX"][None, :],
-                        syndromes_z=sample["synZ"][None, :],
-                        llr_overrides=self.llr_overrides if hasattr(self, "llr_overrides") else None,
-                    )
-                    ex_lsd, ez_lsd = ex_arr[0], ez_arr[0]
-                except Exception:
-                    ex_lsd = ez_lsd = None
-
-            ex_nq = ez_nq = None
-            if nvqldpc_teacher is not None:
-                ex_arr, ez_arr = nvqldpc_teacher.decode_batch_xz(
-                    syndromes_x=sample["synX"][None, :],
-                    syndromes_z=sample["synZ"][None, :],
-                )
-                ex_nq, ez_nq = ex_arr[0], ez_arr[0]
-            ex_mwpm = ez_mwpm = None
-
-        oracle_enabled = self.teacher_mix.get("oracle", 0.0) > 0.0
-        oracle_ex = sample.get("ex_glob", None)
-        oracle_ez = sample.get("ez_glob", None)
-        oracle_meta = sample.get("dem_meta", {}) if isinstance(sample, dict) else {}
-        oracle_valid = bool(oracle_meta.get("oracle_labels_valid", False))
-        if oracle_enabled and not oracle_valid:
-            raise RuntimeError(
-                "Oracle supervision requested, but sampler did not provide validated "
-                "per-qubit oracle labels for this sample. "
-                "Use --sampler synthetic with oracle, or disable oracle for this run."
-            )
-        if oracle_enabled and (oracle_ex is None or oracle_ez is None):
-            raise RuntimeError(
-                "Oracle supervision requested but sampler did not return ex_glob/ez_glob."
-            )
-        oracle_label_mode = str(getattr(self.args, "oracle_label_mode", "channel_ml")).lower()
-        if oracle_label_mode not in {"raw", "channel_ml"}:
-            oracle_label_mode = "channel_ml"
-
-        component_scope = str(getattr(self.args, "component_scope", "active")).lower()
-        for side in ("Z", "X"):
             if component_scope == "full":
-                if side == "Z":
-                    H_sub = np.asarray(sample["Hz"], dtype=np.uint8)
-                    synd_bits_full = np.asarray(sample["synZ"], dtype=np.uint8)
-                    xy_check = np.asarray(sample["coords_c"][: len(synd_bits_full)], dtype=np.float32)
-                else:
-                    H_sub = np.asarray(sample["Hx"], dtype=np.uint8)
-                    synd_bits_full = np.asarray(sample["synX"], dtype=np.uint8)
-                    z_len = len(sample["synZ"])
-                    xy_check = np.asarray(
-                        sample["coords_c"][z_len : z_len + len(synd_bits_full)],
-                        dtype=np.float32,
-                    )
-
-                qubit_indices_full = np.arange(H_sub.shape[1], dtype=np.int32)
-                check_indices_full = np.arange(H_sub.shape[0], dtype=np.int32)
-                xy_qubit_full = np.asarray(sample["coords_q"][qubit_indices_full], dtype=np.float32)
-                all_coords = np.vstack([xy_qubit_full, xy_check])
-                x_min, y_min = all_coords.min(axis=0)
-                x_max, y_max = all_coords.max(axis=0)
-
-                comps = [
-                    {
-                        "H_sub": H_sub,
-                        "xy_qubit": xy_qubit_full,
-                        "xy_check": xy_check,
-                        "synd_bits": synd_bits_full,
-                        "bbox_xywh": [x_min, y_min, x_max - x_min + 1, y_max - y_min + 1],
-                        "k": int(H_sub.shape[0]),
-                        "r": int(H_sub.shape[1]),
-                        "kappa_stats": {
-                            "k": int(H_sub.shape[0]),
-                            "r": int(H_sub.shape[1]),
-                            "density": float(H_sub.shape[0]) / max(1, float(H_sub.shape[1])),
-                            "syndrome_weight": int(synd_bits_full.sum()),
-                            "component_id": 0,
-                            "scope": "full",
-                        },
-                        "qubit_indices": qubit_indices_full,
-                        "check_indices": check_indices_full,
-                    }
-                ]
-            else:
-                comps = split_components_for_side(
-                    side=side,
-                    Hx=sample["Hx"],
-                    Hz=sample["Hz"],
-                    synZ=sample["synZ"],
-                    synX=sample["synX"],
-                    coords_q=sample["coords_q"],
-                    coords_c=sample["coords_c"],
-                    halo=int(getattr(self.args, "cluster_halo", 0)),
+                pack = pack_dem_cluster(
+                    H_edge=info["H_edge"],
+                    det_coords=info["det_coords"],
+                    edge_coords=info["edge_coords"],
+                    det_bits=det_bits,
+                    y_bits_edge=y_bits,
+                    d=dist, rounds=n_rounds, p=p_shot,
+                    N_max=self.args.N_max,
+                    E_max=self.args.E_max,
+                    S_max=self.args.S_max,
                 )
-            for comp in comps:
-                H_sub = comp["H_sub"]
-                synd_bits = comp["synd_bits"]
-                qubit_indices = comp["qubit_indices"]
+                if pack is not None:
+                    yield pack
+                continue
 
-                outputs = {}
-                # MWPF
-                if fault_ids_global is not None:
-                    local_bits = np.zeros(H_sub.shape[1], dtype=np.uint8)
-                    valid_ids = fault_ids_global[fault_ids_global >= 0]
-                    if valid_ids.size:
-                        mask = np.isin(qubit_indices, valid_ids)
-                        local_bits[mask] = 1
-                    outputs["mwpf"] = (local_bits, int(local_bits.sum()))
+            # Active decomposition on the detector adjacency graph
+            fired = np.where(det_bits > 0)[0]
+            if len(fired) == 0:
+                continue
 
-                # MWPM
-                if ex_mwpm is not None and ez_mwpm is not None:
-                    bits_global = ex_mwpm if side == "Z" else ez_mwpm
-                    if qubit_indices.size and bits_global.size > qubit_indices.max():
-                        bits_local = bits_global[qubit_indices].astype(np.uint8)
-                        outputs["mwpm"] = (bits_local, int(bits_local.sum()))
-                elif mwpm_ctx is not None:
-                    bits_pm, w_pm = mwpm_ctx.decode(H_sub, synd_bits, side)
-                    outputs["mwpm"] = (bits_pm.astype(np.uint8), int(w_pm))
+            det_adj = info["det_adj"]
+            H_edge_full = info["H_edge"]
 
-                # LSD
-                if lsd_teacher is not None and (ex_lsd is not None and ez_lsd is not None):
-                    # decode_batch_xz(synX, synZ) returns:
-                    # - first output from Hx/synX branch (Z-error channel)
-                    # - second output from Hz/synZ branch (X-error channel)
-                    # split_components_for_side uses:
-                    # - side "Z" -> Hz/synZ (X-error channel)
-                    # - side "X" -> Hx/synX (Z-error channel)
-                    bits_global = ez_lsd if side == "Z" else ex_lsd
-                    if qubit_indices.size and bits_global.size > qubit_indices.max():
-                        bits_local = bits_global[qubit_indices].astype(np.uint8)
-                        outputs["lsd"] = (bits_local, int(bits_local.sum()))
+            # 1-hop expansion on detector graph
+            active_set = set(fired.tolist())
+            for f in fired:
+                active_set.update(np.where(det_adj[f] > 0)[0].tolist())
+            active_dets = np.array(sorted(active_set), dtype=np.intp)
 
-                # Oracle labels (true sampled errors), if provided by sampler
-                if oracle_enabled:
-                    if oracle_label_mode == "channel_ml":
-                        # Raw sampled ex/ez are not unique for a fixed syndrome.
-                        # Use a deterministic channel-ML representative so the
-                        # supervision target is stable across equivalent errors.
-                        p_prior = float(np.clip(p_shot, 1e-6, 1.0 - 1e-6))
-                        prior = np.full(H_sub.shape[1], p_prior, dtype=np.float64)
-                        try:
-                            bits_local = cc.ml_parity_project(
-                                np.asarray(H_sub, dtype=np.uint8),
-                                np.asarray(synd_bits, dtype=np.uint8),
-                                probs_local=prior,
-                            ).astype(np.uint8)
-                        except Exception:
-                            bits_local = cc.greedy_parity_project(
-                                sp.csr_matrix(np.asarray(H_sub, dtype=np.uint8)),
-                                np.asarray(synd_bits, dtype=np.uint8),
-                                prior,
-                            ).astype(np.uint8)
-                        outputs["oracle"] = (bits_local, int(bits_local.sum()))
-                    else:
-                        bits_global = oracle_ex if side == "Z" else oracle_ez
-                        if (
-                            bits_global is not None
-                            and qubit_indices.size
-                            and bits_global.size > qubit_indices.max()
-                        ):
-                            bits_local = bits_global[qubit_indices].astype(np.uint8)
-                            outputs["oracle"] = (bits_local, int(bits_local.sum()))
+            # Connected components among active detectors
+            adj_sub = det_adj[np.ix_(active_dets, active_dets)]
+            n_comp, labels = _cc(_csr(adj_sub.astype(np.float32)), directed=False)
 
-                # NvQldpc (GPU BP+OSD)
-                if nvqldpc_teacher is not None and (ex_nq is not None and ez_nq is not None):
-                    bits_global = ez_nq if side == "Z" else ex_nq
-                    if qubit_indices.size and bits_global.size > qubit_indices.max():
-                        bits_local = bits_global[qubit_indices].astype(np.uint8)
-                        outputs["nvqldpc"] = (bits_local, int(bits_local.sum()))
+            for comp_id in range(n_comp):
+                comp_det_local = np.where(labels == comp_id)[0]
+                comp_dets = active_dets[comp_det_local]
+                comp_det_set = set(comp_dets.tolist())
 
-                # Choose teacher
-                weighted = []
-                for name, (bits, w) in outputs.items():
-                    if self.teacher_mix.get(name, 0.0) > 0:
-                        weighted.append((name, bits, w, self.teacher_mix[name]))
-
-                chosen_bits = None
-                if weighted:
-                    mode = str(getattr(self.args, "teacher_selection", "stochastic")).lower()
-                    if mode == "min_weight":
-                        preferred = {"oracle": 0, "nvqldpc": 1, "lsd": 2, "mwpm": 3, "mwpf": 4}
-                        chosen_bits = min(
-                            weighted,
-                            key=lambda item: (
-                                int(item[2]),
-                                -float(item[3]),
-                                preferred.get(item[0], 99),
-                            ),
-                        )[1]
-                    elif mode == "consensus":
-                        total_tw = max(sum(float(tw) for *_, tw in weighted), 1e-9)
-                        vote = np.zeros_like(weighted[0][1], dtype=np.float64)
-                        for _, bits, _, tw in weighted:
-                            vote += float(tw) * bits.astype(np.float64)
-                        probs = np.clip(vote / total_tw, 1e-6, 1.0 - 1e-6)
-                        try:
-                            chosen_bits = cc.ml_parity_project(
-                                np.asarray(H_sub, dtype=np.uint8),
-                                np.asarray(synd_bits, dtype=np.uint8),
-                                probs,
-                            )
-                        except Exception:
-                            chosen_bits = (probs >= 0.5).astype(np.uint8)
-                    else:
-                        total_w = sum(w for *_, w in weighted)
-                        r = float(rng.random() * max(total_w, 1e-9))
-                        acc = 0.0
-                        for _, bits, _, tw in weighted:
-                            acc += tw
-                            if r <= acc:
-                                chosen_bits = bits
-                                break
-
-                if chosen_bits is None:
+                # TIGHT: only edge-nodes where ALL connected detectors
+                # are within this component (avoids pulling in distant edges)
+                H_comp = H_edge_full[comp_dets, :]
+                candidate_edges = np.where(H_comp.sum(axis=0) > 0)[0]
+                tight_edges = []
+                for eidx in candidate_edges:
+                    all_dets_of_edge = set(np.where(H_edge_full[:, eidx] > 0)[0].tolist())
+                    if all_dets_of_edge.issubset(comp_det_set):
+                        tight_edges.append(eidx)
+                if len(tight_edges) == 0:
                     continue
+                comp_edges = np.array(tight_edges, dtype=np.intp)
 
-                # Extract local erasure if present
-                local_erasure = None
-                if erase_local is not None:
-                    # erase_local is full array of size n_qubits
-                    # we need to extract the subset for this component
-                    if qubit_indices.size > 0 and qubit_indices.max() < erase_local.size:
-                        local_erasure = erase_local[qubit_indices]
-                    else:
-                        local_erasure = np.zeros(len(qubit_indices), dtype=np.uint8)
-                elif self.args.erasure_frac > 0:
-                    # Force zero erasure if not provided but expected
-                    local_erasure = np.zeros(len(qubit_indices), dtype=np.uint8)
-
-                pack = pack_cluster(
-                    H_sub=H_sub,
-                    xy_qubit=comp["xy_qubit"],
-                    xy_check=comp["xy_check"],
-                    synd_Z_then_X_bits=synd_bits,
-                    k=int(comp["k"]),
-                    r=int(comp["r"]),
-                    bbox_xywh=tuple(int(v) for v in comp["bbox_xywh"]),
-                    kappa_stats=comp.get("kappa_stats", {}),
-                    y_bits_local=chosen_bits,
-                    side=side,
-                    d=d,
-                    p=p_shot,
-                    seed=seed,
-                    N_max=self.args.N_max if hasattr(self.args, "N_max") else 512,
-                    E_max=self.args.E_max if hasattr(self.args, "E_max") else 4096,
-                    S_max=self.args.S_max if hasattr(self.args, "S_max") else 512,
-                    g_extra=self.ctx_vec if hasattr(self, "ctx_vec") else None,
-                    erase_local=local_erasure,
-                    add_jump_edges=False,
-                    jump_k=1,
+                pack = pack_dem_cluster(
+                    H_edge=H_edge_full,
+                    det_coords=info["det_coords"],
+                    edge_coords=info["edge_coords"],
+                    det_bits=det_bits,
+                    y_bits_edge=y_bits,
+                    edge_indices=comp_edges,
+                    det_indices=comp_dets,
+                    d=dist, rounds=n_rounds, p=p_shot,
+                    N_max=self.args.N_max,
+                    E_max=self.args.E_max,
+                    S_max=self.args.S_max,
                 )
-                # We don't validate contract here to save time, or we can.
-                # _validate_packed_contract(pack, self.args.node_feat_dim, self.args.edge_feat_dim)
-                yield pack
+                if pack is not None:
+                    yield pack
 
 
 def main():

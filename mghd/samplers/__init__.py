@@ -1,17 +1,11 @@
 """
 Sampler backends for generating detection events.
 
-Priority order:
-  1) CudaQSampler (primary, uses true circuit-level noise via CUDA-Q trajectories)
-  2) StimSampler (optional, Pauli/twirled approximation for benchmarks)
-
-Note:
-  CUDA-Q trajectories simulate general (Kraus/coherent) noise at circuit level.
-  Stim's fast path assumes Pauli channels + stabilizer ops; use only for A/B checks.
+Primary sampler: StimSampler (circuit-level DEM-based sampling via Stim).
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Callable
+from typing import Any, Dict, Callable
 
 import numpy as np
 
@@ -23,9 +17,6 @@ class SampleBatch:
     dets: np.ndarray  # uint8 [B, D]
     obs: np.ndarray  # uint8 [B, K]
     meta: dict[str, Any]
-    erase_data_mask: np.ndarray | None = None  # uint8/bool [B, n]
-    erase_det_mask: np.ndarray | None = None  # uint8/bool [B, D]
-    p_erase_data: np.ndarray | None = None  # float [B, n]
 
 
 _REGISTRY: Dict[str, Callable[..., object]] = {}
@@ -41,10 +32,8 @@ def get_sampler(name: str, **kwargs):
     return _REGISTRY[name](**kwargs)
 
 
-from .cudaq_sampler import CudaQSampler  # ensures availability and registers itself
-
 try:
-    from .stim_sampler import StimSampler  # optional
+    from .stim_sampler import StimSampler
 except Exception:
     StimSampler = None  # noqa: N816
 
@@ -52,7 +41,6 @@ except Exception:
 __all__ = [
     "get_sampler",
     "register_sampler",
-    "CudaQSampler",
     "StimSampler",
     "SampleBatch",
 ]

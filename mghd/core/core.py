@@ -190,7 +190,9 @@ class PackedCrop:
     idx_check_local: np.ndarray | None = None
 
 
-SYND_FEAT_IDX = 8  # after xy(2), type(1), degree(1), k/r/bw/bh(4) => 8 dims
+SYND_FEAT_IDX = 8  # code-capacity: xy(2),type(1),degree(1),k/r/bw/bh(4) => idx 8
+# circuit-level uses 10-dim features with syndrome at idx 9:
+# (x,y,t,type,degree,k,r,d_norm,rounds_norm,syndrome)
 
 
 def _degree_from_Hsub(H_sub: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
