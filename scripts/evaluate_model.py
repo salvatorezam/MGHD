@@ -1380,12 +1380,13 @@ Key samplers:
         "--mghd-projection-mode",
         type=str,
         default="if_needed",
-        choices=["always", "if_needed", "none"],
+        choices=["always", "if_needed", "none", "mwpm"],
         help=(
             "Parity projection mode inside MGHD clustered decode: "
             "'if_needed' (default; only if raw bits violate parity), "
             "'always' (force projection), "
-            "or 'none' (raw thresholded bits)."
+            "'none' (raw thresholded bits), "
+            "or 'mwpm' (model priors → pymatching global MWPM)."
         ),
     )
     parser.add_argument(

@@ -545,8 +545,7 @@ def train_inprocess(ns) -> str:
         type=int,
         default=16,
         help="Shots per distance bucket to decode together in online teacher path",
-    )
-    parser.add_argument(
+        parser.add_argument(
         "--workers",
         type=int,
         default=4,

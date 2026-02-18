@@ -13,6 +13,14 @@ try:  # Optional GPU acceleration
 except Exception:  # pragma: no cover
     _TORCH_OK = False
 
+try:
+    import pymatching as _pm  # type: ignore
+
+    _PYMATCHING_OK = True
+except Exception:  # pragma: no cover
+    _pm = None  # type: ignore[assignment]
+    _PYMATCHING_OK = False
+
 
 @dataclass
 class Cluster:
@@ -239,7 +247,7 @@ def greedy_parity_project(
         cols = Hc.indices[lo:hi]
         if cols.size == 0:
             break
-        j = cols[np.argmax(g[cols])]
+        j = cols[np.argmin(g[cols])]
         e[j] ^= 1
         r = (r ^ (Hc[:, j].toarray().ravel().astype(np.uint8))).astype(np.uint8)
     return e
@@ -591,20 +599,21 @@ class MGHDPrimaryClustered:
         self.temp = float(temp)
         self.r_cap = int(r_cap)
         mode = str(projection_mode).strip().lower()
-        if mode not in {"always", "if_needed", "none"}:
+        if mode not in {"always", "if_needed", "none", "mwpm"}:
             mode = "if_needed"
         self.projection_mode = mode
         self.mb_mode = "batched" if batched else "unbatched"
         self.side = self._infer_side(side)
         self.tier0_enable = bool(tier0_enable)
         self.model_version = getattr(self.mghd, "model_version", "v2")
+        self._mwpm_matcher: Any = None  # lazy-init pymatching.Matching
         self.distance = self._infer_distance()
         self.coords_qubit = self._compute_qubit_coords(self.distance)
         self.coords_check = self._compute_check_coords()
 
         if tier0_k_max is None and tier0_r_max is None:
             if tier0_mode in ("mixed", "mixed_tight", "aggressive"):
-                self.tier0_k_max, self.tier0_r_max = 2, 1
+                self.tier0_k_max, self.tier0_r_max = 6, 6
             elif tier0_mode == "off":
                 self.tier0_k_max, self.tier0_r_max = 0, 0
             else:
@@ -677,9 +686,114 @@ class MGHDPrimaryClustered:
             raise ValueError(f"Invalid side='{side}'. Expected 'X' or 'Z'.")
         return value
 
+    # ------------------------------------------------------------------ #
+    #  MWPM-projection decode: run model on full code → pymatching MWPM  #
+    # ------------------------------------------------------------------ #
+
+    def _decode_mwpm(self, s: np.ndarray) -> Dict[str, Any]:
+        """Run model on the full code, use per-qubit priors as pymatching weights.
+
+        This avoids per-component decomposition entirely; the model provides
+        learned priors and MWPM handles global matching + boundary effects.
+        """
+        if not _PYMATCHING_OK:
+            raise RuntimeError("pymatching is required for projection_mode='mwpm'")
+
+        H = self.H
+        n_q = H.shape[1]
+
+        # If syndrome is all-zero, no correction needed
+        if s.sum() == 0:
+            return {
+                "e": np.zeros(n_q, dtype=np.uint8),
+                "sizes_hist": {},
+                "mghd_invoked": 0.0,
+                "proj_us": 0.0,
+                "mghd_clusters": 0,
+                "tier0_clusters": 0,
+            }
+
+        # Build a single full-code subproblem
+        q_l2g = np.arange(n_q, dtype=np.int64)
+        c_l2g = np.arange(H.shape[0], dtype=np.int64)
+        xy_qubit = self.coords_qubit[q_l2g]
+        xy_check = self.coords_check[c_l2g]
+        all_coords = np.vstack([xy_qubit, xy_check]) if xy_check.size else xy_qubit
+        mins = all_coords.min(axis=0) if all_coords.size else np.zeros(2, dtype=np.float32)
+        maxs = all_coords.max(axis=0) if all_coords.size else np.zeros(2, dtype=np.float32)
+        bbox_xywh = (
+            int(mins[0]), int(mins[1]),
+            int(maxs[0] - mins[0] + 1), int(maxs[1] - mins[1] + 1),
+        )
+        k_local = int(H.shape[0])
+        r_local = int(H.shape[1])
+        extra_meta = {
+            "xy_qubit": xy_qubit,
+            "xy_check": xy_check,
+            "k": k_local,
+            "r": r_local,
+            "bbox_xywh": bbox_xywh,
+            "kappa_stats": {
+                "k": k_local, "r": r_local,
+                "density": float(k_local / max(1, r_local)),
+                "syndrome_weight": int(s.sum()),
+                "scope": "full",
+            },
+            "side": self.side,
+            "d": self.distance,
+            "p": float(self.default_p or self.p_channel or 0.01),
+            "seed": 0,
+            "add_jump_edges": False,
+            "jump_k": 1,
+        }
+
+        # Run model on the full code
+        self._sync_cuda()
+        t0 = self._time.perf_counter()
+        probs_list, _ = self.mghd.priors_from_subgraphs_batched(
+            [(H, s, q_l2g, c_l2g, extra_meta)],
+            temp=self.temp,
+            bucket=self.side,
+            bucket_spec=self.bucket_spec,
+            microbatch=self.microbatch,
+            flush_ms=self.flush_ms,
+            use_graphs=False,
+        )
+        self._sync_cuda()
+        t_mghd = (self._time.perf_counter() - t0) * 1e6
+
+        priors = np.asarray(probs_list[0], dtype=np.float64)
+        assert priors.shape == (n_q,), f"Expected ({n_q},), got {priors.shape}"
+
+        # Build MWPM matcher with model priors as edge weights
+        t1 = self._time.perf_counter()
+        eps = 1e-8
+        priors_clipped = np.clip(priors, eps, 1.0 - eps)
+        weights = np.log((1.0 - priors_clipped) / priors_clipped)  # log-likelihood ratio
+
+        matcher = _pm.Matching(
+            H.toarray().astype(np.uint8), weights=weights
+        )
+
+        e = matcher.decode(s)
+        t_proj = (self._time.perf_counter() - t1) * 1e6
+
+        return {
+            "e": np.asarray(e, dtype=np.uint8),
+            "sizes_hist": {},
+            "mghd_invoked": t_mghd,
+            "proj_us": t_proj,
+            "mghd_clusters": 1,
+            "tier0_clusters": 0,
+        }
+
     def decode(self, s: np.ndarray, perf_only: bool = False) -> Dict[str, Any]:
         s = np.asarray(s, dtype=np.uint8).ravel()
         H = self.H
+
+        # ── MWPM projection mode: run model on full code, decode globally ──
+        if self.projection_mode == "mwpm":
+            return self._decode_mwpm(s)
 
         subproblems: List[Dict[str, Any]] = []
         if self.component_scope == "full":
@@ -786,14 +900,40 @@ class MGHDPrimaryClustered:
         sizes = [len(x["q_l2g"]) for x in subproblems]
         sizes_hist = self._histogram_from_sizes(sizes)
 
+        # ── Tier-0: solve small clusters exactly (no model) ──
+        model_subproblems: List[Dict[str, Any]] = []
+        tier0_solved = 0
+        if self.tier0_enable and subproblems:
+            p_ch = float(self.p_channel or self.default_p or 0.01)
+            for entry in subproblems:
+                try:
+                    e_exact = solve_small_cluster_channel_ml(
+                        entry["H_sub"],
+                        entry["s_sub"],
+                        p_channel=p_ch,
+                        k_max=self.tier0_k_max,
+                        r_cap=self.tier0_r_max,
+                    )
+                except (ValueError, AssertionError):
+                    # Locally inconsistent subproblem — fall back to model
+                    e_exact = None
+                if e_exact is not None:
+                    e[entry["q_l2g"]] ^= e_exact
+                    tier0_solved += 1
+                else:
+                    model_subproblems.append(entry)
+        else:
+            model_subproblems = subproblems
+
+        # ── Model inference on remaining (larger) clusters ──
         mb_report: Dict[str, Any]
         probs_list: List[np.ndarray]
-        if self.mb_mode == "batched" and subproblems:
+        if self.mb_mode == "batched" and model_subproblems:
             self._sync_cuda()
             t1 = self._time.perf_counter()
             items = [
                 (entry["H_sub"], entry["s_sub"], entry["q_l2g"], entry["c_l2g"], entry["extra"])
-                for entry in subproblems
+                for entry in model_subproblems
             ]
             probs_list, mb_report = self.mghd.priors_from_subgraphs_batched(
                 items,
@@ -817,7 +957,7 @@ class MGHDPrimaryClustered:
                 "graph_used": False,
                 "device": {"device": str(getattr(self.mghd, "device", "cpu"))},
             }
-            for entry in subproblems:
+            for entry in model_subproblems:
                 H_sub = entry["H_sub"]
                 s_sub = entry["s_sub"]
                 q_l2g = entry["q_l2g"]
@@ -848,7 +988,7 @@ class MGHDPrimaryClustered:
                 probs_list.append(probs)
 
         t_proj = 0.0
-        for entry, probs in zip(subproblems, probs_list):
+        for entry, probs in zip(model_subproblems, probs_list):
             H_sub = entry["H_sub"]
             s_sub = entry["s_sub"]
             q_l2g = entry["q_l2g"]
@@ -886,7 +1026,8 @@ class MGHDPrimaryClustered:
             "sizes_hist": sizes_hist,
             "mghd_invoked": t_mghd,
             "proj_us": t_proj,
-            "mghd_clusters": int(len(subproblems)),
+            "mghd_clusters": int(len(model_subproblems)),
+            "tier0_clusters": tier0_solved,
         }
 
 
